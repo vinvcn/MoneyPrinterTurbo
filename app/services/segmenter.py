@@ -16,10 +16,10 @@ segment-first 流水线的第一步：脚本的每个片段将独立配音、独
 from dataclasses import dataclass
 import re
 
-from app.utils import utils
-
 # 语速常数：CJK 约 4.2 字/秒，英文/数字约 2.7 词/秒。与 voice 服务中
-# 无配音模式的估算保持同一套数字，避免分段时长与音频时长系统性偏离。
+# 无配音模式（estimate_no_voice_duration）的估算保持同一套数字，避免
+# 分段时长与音频时长系统性偏离。刻意不导入 voice 模块：segmenter 是
+# 纯文本处理，保持零重量级依赖，便于单测和未来独立复用。
 _CJK_CHARS_PER_SECOND = 4.2
 _WORDS_PER_SECOND = 2.7
 
