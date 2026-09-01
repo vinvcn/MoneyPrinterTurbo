@@ -756,6 +756,39 @@ def _search_videos_with_cache(
         return items
 
 
+def search_videos_with_cache_for_source(source: str) -> Callable[..., List[MaterialInfo]]:
+    """
+    返回按指定素材源缓存的搜索函数，供 segment-first 流程复用。
+
+    返回的函数签名与 provider 无关：search_term / minimum_duration /
+    video_aspect 三个参数在内部路由到对应的远端搜索，并继承 24 小时
+    搜索缓存和缓存锁，避免同一关键词被多个片段重复请求。
+    """
+    provider = "pexels"
+    remote_search_videos = search_videos_pexels
+    if source == "pixabay":
+        provider = "pixabay"
+        remote_search_videos = search_videos_pixabay
+    elif source == "coverr":
+        provider = "coverr"
+        remote_search_videos = search_videos_coverr
+
+    def search_videos(
+        search_term: str,
+        minimum_duration: int,
+        video_aspect: VideoAspect,
+    ) -> List[MaterialInfo]:
+        return _search_videos_with_cache(
+            provider=provider,
+            search_videos=remote_search_videos,
+            search_term=search_term,
+            minimum_duration=minimum_duration,
+            video_aspect=video_aspect,
+        )
+
+    return search_videos
+
+
 def download_videos(
     task_id: str,
     search_terms: List[str],
