@@ -627,9 +627,21 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
         return downloaded_videos
 
 
-def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
+def _generate_final_videos(
+    task_id,
+    params: VideoParams,
+    combine_kwargs: dict,
+    audio_file: str,
+    subtitle_path: str,
+    audio_duration: float,
 ):
+    """
+    逐个输出视频：先按传入参数拼接素材，再合成旁白/字幕/BGM。
+
+    旧流程与 segment-first 流程的差异只在拼接输入，由调用方通过
+    ``combine_kwargs`` 决定；BGM 生成、混音降级和进度推进完全共用，
+    避免两条流水线各自维护一份供应商降级语义。
+    """
     final_video_paths = []
     combined_video_paths = []
     warnings = []
@@ -638,15 +650,6 @@ def generate_final_videos(
         video_music_provider is not None
         and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
     )
-    # 多视频生成默认会打散素材以增加差异；但“按文案顺序匹配素材”追求的是
-    # 时间线稳定性和可解释性，所以开启后所有输出都使用顺序拼接。
-    if params.match_materials_to_script:
-        video_concat_mode = VideoConcatMode.sequential
-    elif params.video_count == 1:
-        video_concat_mode = params.video_concat_mode
-    else:
-        video_concat_mode = VideoConcatMode.random
-    video_transition_mode = params.video_transition_mode
 
     _progress = 50
     for i in range(params.video_count):
@@ -657,14 +660,13 @@ def generate_final_videos(
         logger.info(f"\n\n## combining video: {index} => {combined_video_path}")
         video.combine_videos(
             combined_video_path=combined_video_path,
-            video_paths=downloaded_videos,
             audio_file=audio_file,
             video_aspect=params.video_aspect,
-            video_concat_mode=video_concat_mode,
-            video_transition_mode=video_transition_mode,
+            video_transition_mode=params.video_transition_mode,
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
+            **combine_kwargs,
         )
 
         _progress += 50 / params.video_count / 2
@@ -742,22 +744,7 @@ def _generate_final_videos_segment_first(
     subtitle_path: str,
     audio_duration: float,
 ):
-    """
-    segment-first 输出阶段：按段拼接 + 合成。
-
-    BGM 生成、混音降级与进度推进逻辑与旧流程一致；差异只在拼接输入：
-    每个输出视频使用同一批按段对齐的素材（素材下载在任务层已按段缓存），
-    顺序由 segment 顺序决定，`video_count` 只是重复输出。
-    """
-    final_video_paths = []
-    combined_video_paths = []
-    warnings = []
-    video_music_provider = _VIDEO_MUSIC_PROVIDERS.get(params.bgm_type)
-    video_music_requested = (
-        video_music_provider is not None
-        and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
-    )
-
+    """segment-first 输出阶段：把按段对齐的素材交给共用的输出循环。"""
     segment_clips = [
         {
             "index": m.index,
@@ -773,84 +760,17 @@ def _generate_final_videos_segment_first(
         }
         for m in materials
     ]
-
-    _progress = 50
-    for i in range(params.video_count):
-        index = i + 1
-        combined_video_path = path.join(
-            utils.task_dir(task_id), f"combined-{index}.mp4"
-        )
-        logger.info(f"\n\n## combining video: {index} => {combined_video_path}")
-        video.combine_videos(
-            combined_video_path=combined_video_path,
-            video_paths=[],
-            audio_file=audio_result.audio_file,
-            video_aspect=params.video_aspect,
-            video_transition_mode=params.video_transition_mode,
-            max_clip_duration=params.video_clip_duration,
-            threads=params.n_threads,
-            clip_speed=params.video_clip_speed,
-            segments=segment_clips,
-        )
-
-        _progress += 50 / params.video_count / 2
-        sm.state.update_task(task_id, progress=_progress)
-
-        final_video_path = path.join(utils.task_dir(task_id), f"final-{index}.mp4")
-
-        bgm_file_override = "" if video_music_provider else None
-        if video_music_requested:
-            service = video_music_provider["service"]
-            display_name = video_music_provider["display_name"]
-            warning_code = video_music_provider["warning_code"]
-            generated_bgm_path = path.join(
-                utils.task_dir(task_id),
-                (f"{params.bgm_type}-bgm-{index}{video_music_provider['suffix']}"),
-            )
-            try:
-                service.generate_bgm(
-                    video_path=combined_video_path,
-                    output_path=generated_bgm_path,
-                    video_duration=audio_duration,
-                    prompt=_get_video_music_prompt(params),
-                )
-                bgm_file_override = generated_bgm_path
-            except video_music_provider["error_type"] as exc:
-                logger.warning(
-                    f"{display_name} BGM generation failed: task_id={task_id}, "
-                    f"video_index={index}, error={exc}"
-                )
-                bgm_file_override = ""
-                warnings.append({"code": warning_code, "video_index": index})
-
-        logger.info(f"\n\n## generating video: {index} => {final_video_path}")
-        bgm_mix_succeeded = video.generate_video(
-            video_path=combined_video_path,
-            audio_path=audio_result.audio_file,
-            subtitle_path=subtitle_path,
-            output_file=final_video_path,
-            params=params,
-            bgm_file_override=bgm_file_override,
-        )
-        if (
-            video_music_provider is not None
-            and bgm_file_override
-            and not bgm_mix_succeeded
-        ):
-            warnings.append(
-                {
-                    "code": video_music_provider["warning_code"],
-                    "video_index": index,
-                }
-            )
-
-        _progress += 50 / params.video_count / 2
-        sm.state.update_task(task_id, progress=_progress)
-
-        final_video_paths.append(final_video_path)
-        combined_video_paths.append(combined_video_path)
-
-    return final_video_paths, combined_video_paths, warnings
+    return _generate_final_videos(
+        task_id,
+        params,
+        combine_kwargs={
+            "video_paths": [],
+            "segments": segment_clips,
+        },
+        audio_file=audio_result.audio_file,
+        subtitle_path=subtitle_path,
+        audio_duration=audio_duration,
+    )
 
 
 def _patch_cross_post_state(task_id: str, **kwargs) -> bool | None:
@@ -1227,7 +1147,6 @@ def _run_segment_first_pipeline(
     audio_result = segment_audio.prepare_segment_audio(
         segments=segment_records,
         task_id=task_id,
-        tts=segment_audio._default_tts,
         voice_name=params.voice_name,
         voice_rate=params.voice_rate,
         voice_volume=params.voice_volume,
@@ -1503,13 +1422,26 @@ def _run_pipeline(
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
 
     # 6. Generate final videos
-    final_video_paths, combined_video_paths, generation_warnings = generate_final_videos(
-        task_id,
-        params,
-        downloaded_videos,
-        audio_file,
-        subtitle_path,
-        audio_duration,
+    # 多视频生成默认会打散素材以增加差异；但“按文案顺序匹配素材”追求的是
+    # 时间线稳定性和可解释性，所以开启后所有输出都使用顺序拼接。
+    if params.match_materials_to_script:
+        video_concat_mode = VideoConcatMode.sequential
+    elif params.video_count == 1:
+        video_concat_mode = params.video_concat_mode
+    else:
+        video_concat_mode = VideoConcatMode.random
+    final_video_paths, combined_video_paths, generation_warnings = (
+        _generate_final_videos(
+            task_id,
+            params,
+            combine_kwargs={
+                "video_paths": downloaded_videos,
+                "video_concat_mode": video_concat_mode,
+            },
+            audio_file=audio_file,
+            subtitle_path=subtitle_path,
+            audio_duration=audio_duration,
+        )
     )
 
     if not final_video_paths:

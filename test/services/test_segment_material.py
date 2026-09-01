@@ -140,19 +140,6 @@ class TestPrepareSegmentMaterials(unittest.TestCase):
         self.assertEqual(results[0].clips, [])
 
 
-class TestNeighborFallbackHelper(unittest.TestCase):
-    def test_prefers_previous(self):
-        self.assertEqual(
-            sm.find_neighbor_fallback_term(1, {0: "prev", 2: "next"}), "prev"
-        )
-
-    def test_uses_next_when_no_previous(self):
-        self.assertEqual(sm.find_neighbor_fallback_term(0, {1: "next"}), "next")
-
-    def test_returns_none_without_neighbors(self):
-        self.assertIsNone(sm.find_neighbor_fallback_term(5, {}))
-
-
 class TestRecordsConversion(unittest.TestCase):
     def test_segments_to_records_is_json_safe(self):
         materials = [

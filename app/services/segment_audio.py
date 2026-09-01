@@ -1,17 +1,15 @@
 """
-Per-segment TTS generation and frame-accurate narration assembly.
+逐段 TTS 生成与毫秒级旁白合并。
 
-The segment-first pipeline needs one audio file per narration segment plus a
-single merged narration track whose segment offsets are known to the
-millisecond — subtitle timing and clip assembly both derive from it.
+segment-first 流水线需要每个旁白片段独立的音频文件，以及一条合并后的
+旁白轨道——字幕时间轴和素材组装都依赖每段在合并轨道上的偏移量。
 
-Why pydub (already a project dependency) instead of ffmpeg concat or MoviePy:
-- mp3 concat (`-c copy`) reports container durations with ~35ms padding per
-  file, which drifts across many segments;
-- MoviePy re-encodes and adds similar per-clip padding;
-- pydub decodes to raw frames, so `len(segment)` is exact in milliseconds and
-  offsets stay aligned with real audio content. Exporting to a single MP3
-  keeps the downstream `generate_video()` path unchanged.
+选择 pydub（项目既有依赖）而不是 ffmpeg concat 或 MoviePy 的原因：
+- mp3 concat（``-c copy``）每个文件会引入约 35ms 的容器填充，片段一多
+  偏移就漂移；
+- MoviePy 会重编码并引入类似的单片段填充；
+- pydub 解码到原始帧，``len(segment)`` 以毫秒为单位精确，偏移量与真实
+  音频内容对齐。导出单个 MP3 保持下游 ``generate_video()`` 路径不变。
 """
 
 from dataclasses import dataclass, field
@@ -27,10 +25,10 @@ from app.utils import utils
 
 @dataclass
 class SegmentAudioResult:
-    """Result of preparing per-segment narration audio."""
+    """逐段配音结果：包含每段偏移量与合并后的旁白文件路径。"""
 
     segments: List[dict] = field(default_factory=list)
-    # Merged narration file (MP3) covering all segments in order.
+    # 覆盖全部片段、按顺序合并后的旁白文件（MP3）。
     audio_file: str = ""
     total_duration_ms: int = 0
     ok: bool = True
@@ -39,7 +37,7 @@ class SegmentAudioResult:
 
 
 def ms_to_srt_timestamp(duration_ms: int) -> str:
-    """Convert milliseconds to an SRT timestamp (HH:MM:SS,mmm)."""
+    """把毫秒转换为 SRT 时间戳（HH:MM:SS,mmm）。"""
     hours = duration_ms // 3_600_000
     minutes = (duration_ms % 3_600_000) // 60_000
     seconds = (duration_ms % 60_000) // 1000
@@ -50,31 +48,31 @@ def ms_to_srt_timestamp(duration_ms: int) -> str:
 def prepare_segment_audio(
     segments: List[dict],
     task_id: str,
-    tts: Callable[..., Optional[object]],
-    voice_name: Optional[str] = None,
+    voice_name: str = "",
     voice_rate: float = 1.0,
     voice_volume: float = 1.0,
     sample_audio_base64: Optional[str] = None,
+    tts: Optional[Callable[..., Optional[object]]] = None,
 ) -> SegmentAudioResult:
     """
-    Run TTS per segment and merge the outputs into one narration track.
+    逐段调用 TTS 并合并为一条旁白轨道。
 
     Args:
-        segments: segment dicts with at least {"index", "text"}.
-        task_id: task directory owner for segment audio files.
-        tts: TTS callable; defaults to `voice.tts` and receives
-            text/voice_name/voice_rate/voice_file/voice_volume plus
-            sample_audio_base64. Returning None marks the segment failed.
-        voice_name/rate/volume/sample_audio_base64: forwarded to `tts`
-            when the default is used.
+        segments: 至少包含 {"index", "text"} 的片段记录。
+        task_id: 片段音频文件所属的任务目录。
+        voice_name/rate/volume/sample_audio_base64: 转发给 ``voice.tts``。
+        tts: 可注入的 TTS 函数；缺省使用 ``voice.tts``，返回 None 表示
+            该片段配音失败。
 
     Returns:
-        SegmentAudioResult with per-segment start/duration offsets (ms),
-        the merged audio path, and total duration. `ok=False` on the first
-        segment whose TTS failed; the task layer converts that to failure.
+        SegmentAudioResult，包含每段的 start/duration 偏移（毫秒）、合并
+        音频路径与总时长。任一片段 TTS 失败时 ``ok=False``，由任务层转换
+        为任务失败状态。
     """
     task_dir = Path(utils.task_dir(task_id))
     result = SegmentAudioResult()
+    # 测试需要替换 TTS 时注入；生产路径始终走 voice.tts。
+    tts_callable = tts if tts is not None else voice_service.tts
 
     merged = AudioSegment.empty()
     offset_ms = 0
@@ -84,37 +82,9 @@ def prepare_segment_audio(
         text = str(segment.get("text") or "").strip()
         segment_audio_path = str(task_dir / f"audio-segment-{index}.mp3")
 
-        if text:
-            kwargs = {
-                "text": text,
-                "voice_file": segment_audio_path,
-                "voice_rate": voice_rate,
-                "voice_volume": voice_volume,
-            }
-            if tts is _default_tts:
-                kwargs.update(
-                    {
-                        "voice_name": voice_service.parse_voice_name(
-                            voice_name or ""
-                        ),
-                        "sample_audio_base64": sample_audio_base64,
-                    }
-                )
-            sub_maker = tts(**kwargs)
-            if sub_maker is None:
-                logger.error(
-                    f"segment TTS failed: task_id={task_id}, segment={index}"
-                )
-                result.ok = False
-                result.failed_index = index
-                result.error = f"segment {index} TTS failed"
-                return result
-        else:
-            # Empty segment text: keep the timeline but add silence instead
-            # of calling TTS with nothing.
-            merged += AudioSegment.silent(duration=500)
-
         if not text:
+            # 空片段保留时间轴占位（500ms 静音），不向 TTS 传空文本。
+            merged += AudioSegment.silent(duration=500)
             result.segments.append(
                 {
                     "index": index,
@@ -126,6 +96,23 @@ def prepare_segment_audio(
             )
             offset_ms += 500
             continue
+
+        sub_maker = tts_callable(
+            text=text,
+            voice_name=voice_service.parse_voice_name(voice_name or ""),
+            voice_rate=voice_rate,
+            voice_file=segment_audio_path,
+            voice_volume=voice_volume,
+            sample_audio_base64=sample_audio_base64,
+        )
+        if sub_maker is None:
+            logger.error(
+                f"segment TTS failed: task_id={task_id}, segment={index}"
+            )
+            result.ok = False
+            result.failed_index = index
+            result.error = f"segment {index} TTS failed"
+            return result
 
         try:
             segment_audio = AudioSegment.from_file(segment_audio_path)
@@ -161,7 +148,7 @@ def prepare_segment_audio(
         return result
 
     merged_path = task_dir / "audio.mp3"
-    # 192k matches the final video audio bitrate; mono keeps TTS output shape.
+    # 192k 与成片音频码率一致；单声道保持 TTS 输出形态。
     merged.export(str(merged_path), format="mp3", bitrate="192k")
 
     result.audio_file = str(merged_path)
@@ -171,7 +158,3 @@ def prepare_segment_audio(
         f"segments={len(result.segments)}, duration_ms={offset_ms}"
     )
     return result
-
-
-def _default_tts(**kwargs) -> Optional[object]:
-    return voice_service.tts(**kwargs)

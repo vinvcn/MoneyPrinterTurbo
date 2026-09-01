@@ -176,9 +176,8 @@ def segment_script(
     max_duration = max(float(max_duration), 0.1)
     min_duration = max(float(min_duration), 0.0)
 
-    # 先拆超长单元，再合并过短单元；合并不会重新超过上限，因为相邻
-    # 单元合并只在两个都低于 min_duration 时发生，而每个都低于 min
-    # 必然低于 max（min <= max 已在下方归一化）。
+    # 先拆超长单元，再合并过短单元。合并只在合并结果仍不超过 max_duration
+    # 时进行，避免"两个都低于 min 的片段合并后反而超过 max"的回退。
     normalized_units: list[str] = []
     for unit in units:
         normalized_units.extend(_split_unit_by_max_duration(unit, max_duration))
@@ -192,9 +191,12 @@ def segment_script(
             estimate_duration_seconds(merged[-1]) < min_duration
             or estimate_duration_seconds(unit) < min_duration
         ):
-            merged[-1] = f"{merged[-1]} {unit}".strip()
-        else:
-            merged.append(unit)
+            candidate = f"{merged[-1]} {unit}".strip()
+            if estimate_duration_seconds(candidate) <= max_duration:
+                merged[-1] = candidate
+                continue
+            # 合并会突破上限时放弃合并，让短片段独立成段。
+        merged.append(unit)
 
     return [
         ScriptSegment(

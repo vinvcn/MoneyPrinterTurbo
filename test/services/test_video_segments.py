@@ -87,8 +87,16 @@ class TestCombineSegmentVideos(unittest.TestCase):
         # come after segment 0's.
         self.assertLess(written.index("temp-clip-1.mp4"), written.index("temp-clip-3.mp4"))
 
-    def test_empty_clips_do_not_crash(self):
+    def test_empty_clips_get_black_placeholder(self):
+        """无素材片段用黑屏占位，保证后续片段不前移、旁白保持对齐。"""
         segments = [{"index": 0, "clips": [], "duration": 10.0}]
+        concat_calls = self._run_combine_segments(segments, {})
+        self.assertEqual(len(concat_calls), 1)
+        # 占位片段也被拼接（这里 concat 与写出都被 mock，只验证时间线包含它）。
+        self.assertEqual(concat_calls[0][0].split("/")[-1], "temp-clip-1.mp4")
+
+    def test_empty_clips_without_duration_are_skipped(self):
+        segments = [{"index": 0, "clips": [], "duration": 0}]
         concat_calls = self._run_combine_segments(segments, {})
         self.assertEqual(concat_calls, [])
 

@@ -653,59 +653,18 @@ def combine_videos(
             # 浮点误差或异常素材时长的安全兜底，保证最终片段不突破配置上限。
             if normalized_clip_speed != 1.0:
                 clip = clip.with_speed_scaled(normalized_clip_speed)
+            # 缩放/转场/时长兜底与 segment-first 路径共用同一实现，
+            # 避免两条流水线的画面行为出现差异。
+            clip = _normalize_segment_clip(
+                clip,
+                video_width,
+                video_height,
+                max_clip_duration,
+                transition_value,
+            )
             clip_duration = clip.duration
-            # Not all videos are same size, so we need to resize them
             clip_w, clip_h = clip.size
-            if clip_w != video_width or clip_h != video_height:
-                clip_ratio = clip.w / clip.h
-                video_ratio = video_width / video_height
-                logger.debug(f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, target: {video_width}x{video_height}, ratio: {video_ratio:.2f}")
-                
-                if clip_ratio == video_ratio:
-                    clip = clip.resized(new_size=(video_width, video_height))
-                else:
-                    if clip_ratio > video_ratio:
-                        scale_factor = video_width / clip_w
-                    else:
-                        scale_factor = video_height / clip_h
 
-                    new_width = int(clip_w * scale_factor)
-                    new_height = int(clip_h * scale_factor)
-
-                    background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
-                    clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
-                    clip = CompositeVideoClip([background, clip_resized])
-                    
-            shuffle_side = random.choice(["left", "right", "top", "bottom"])
-            if transition_value in (None, VideoTransitionMode.none.value):
-                clip = clip
-            elif transition_value == VideoTransitionMode.fade_in.value:
-                clip = video_effects.fadein_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.fade_out.value:
-                clip = video_effects.fadeout_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.slide_in.value:
-                clip = video_effects.slidein_transition(clip, 1, shuffle_side)
-            elif transition_value == VideoTransitionMode.slide_out.value:
-                clip = video_effects.slideout_transition(clip, 1, shuffle_side)
-            elif transition_value == VideoTransitionMode.zoom_in.value:
-                clip = video_effects.zoomin_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.zoom_out.value:
-                clip = video_effects.zoomout_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.shuffle.value:
-                transition_funcs = [
-                    lambda c: video_effects.fadein_transition(c, 1),
-                    lambda c: video_effects.fadeout_transition(c, 1),
-                    lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.zoomin_transition(c, 1),
-                    lambda c: video_effects.zoomout_transition(c, 1),
-                ]
-                shuffle_transition = random.choice(transition_funcs)
-                clip = shuffle_transition(clip)
-
-            if clip.duration > max_clip_duration:
-                clip = clip.subclipped(0, max_clip_duration)
-                
             # wirte clip to temp file
             clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
             _write_videofile_with_codec_fallback(
@@ -886,9 +845,34 @@ def _combine_videos_segment_first(
         segment_index = segment.get("index")
         clip_paths = segment.get("clips") or []
         if not clip_paths:
+            # 时间线对齐要求每段的画面时长覆盖该段旁白时长。没有素材时用
+            # 黑屏占位而不是跳过，否则后续片段整体前移，旁白与画面对不上。
+            placeholder_duration = float(segment.get("duration") or 0)
+            if placeholder_duration <= 0:
+                logger.warning(
+                    f"segment {segment_index} has no clips and no duration, "
+                    "skipping in timeline"
+                )
+                continue
             logger.warning(
-                f"segment {segment_index} has no clips, skipping in timeline"
+                f"segment {segment_index} has no clips, using a black "
+                f"placeholder ({placeholder_duration:.2f}s) to keep alignment"
             )
+            placeholder = ColorClip(
+                size=(video_width, video_height), color=(0, 0, 0)
+            ).with_duration(placeholder_duration)
+            clip_file = f"{output_dir}/temp-clip-{clip_sequence + 1}.mp4"
+            placeholder.write_videofile(clip_file, fps=fps, logger=None)
+            processed_clips.append(
+                SubClippedVideoClip(
+                    file_path=clip_file,
+                    duration=placeholder_duration,
+                    width=video_width,
+                    height=video_height,
+                    source_file_path="",
+                )
+            )
+            clip_sequence += 1
             continue
 
         # 每个片段最多占用 max_clip_duration 秒；同一个 segment 的多个

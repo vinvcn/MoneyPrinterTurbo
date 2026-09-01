@@ -101,10 +101,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video"),
             patch.object(tm.sm.state, "update_task"),
         ):
-            tm.generate_final_videos(
+            tm._generate_final_videos(
                 task_id="clip-speed-task",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -131,10 +134,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video") as generate_video,
             patch.object(tm.sm.state, "update_task"),
         ):
-            _, _, warnings = tm.generate_final_videos(
+            _, _, warnings = tm._generate_final_videos(
                 task_id="sonilo-task",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -168,10 +174,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video") as generate_video,
             patch.object(tm.sm.state, "update_task"),
         ):
-            _, _, warnings = tm.generate_final_videos(
+            _, _, warnings = tm._generate_final_videos(
                 task_id="elevenlabs-task",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -204,10 +213,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video") as generate_video,
             patch.object(tm.sm.state, "update_task"),
         ):
-            final_paths, _, warnings = tm.generate_final_videos(
+            final_paths, _, warnings = tm._generate_final_videos(
                 task_id="elevenlabs-fallback",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -234,10 +246,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video") as generate_video,
             patch.object(tm.sm.state, "update_task"),
         ):
-            final_paths, _, warnings = tm.generate_final_videos(
+            final_paths, _, warnings = tm._generate_final_videos(
                 task_id="sonilo-fallback",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -264,10 +279,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video", return_value=True) as generate,
             patch.object(tm.sm.state, "update_task"),
         ):
-            final_paths, _, warnings = tm.generate_final_videos(
+            final_paths, _, warnings = tm._generate_final_videos(
                 task_id="sonilo-zero-volume",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -292,10 +310,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video", return_value=False) as generate,
             patch.object(tm.sm.state, "update_task"),
         ):
-            final_paths, _, warnings = tm.generate_final_videos(
+            final_paths, _, warnings = tm._generate_final_videos(
                 task_id="sonilo-mix-fallback",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -741,7 +762,7 @@ class TestTaskService(unittest.TestCase):
                         "get_video_materials",
                         return_value=["clip.mp4"],
                     ),
-                    patch.object(tm, "generate_final_videos") as generate_final,
+                    patch.object(tm, "_generate_final_videos") as generate_final,
                     patch.object(tm.sm.state, "update_task"),
                 ):
                     result = tm.start(
@@ -776,7 +797,7 @@ class TestTaskService(unittest.TestCase):
             ),
             patch.object(
                 tm,
-                "generate_final_videos",
+                "_generate_final_videos",
                 return_value=(["final.mp4"], ["combined.mp4"], []),
             ),
             patch.object(
@@ -838,7 +859,7 @@ class TestTaskService(unittest.TestCase):
                     ),
                     patch.object(
                         tm,
-                        "generate_final_videos",
+                        "_generate_final_videos",
                         return_value=videos_result,
                     ),
                     patch.object(tm.sm, "state", state),
@@ -919,7 +940,7 @@ class TestTaskService(unittest.TestCase):
             ),
             patch.object(
                 tm,
-                "generate_final_videos",
+                "_generate_final_videos",
                 return_value=(
                     ["final-1.mp4", "final-2.mp4"],
                     ["combined-1.mp4", "combined-2.mp4"],
@@ -1013,7 +1034,7 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm, "get_video_materials", return_value=["clip.mp4"]),
             patch.object(
                 tm,
-                "generate_final_videos",
+                "_generate_final_videos",
                 return_value=(["final.mp4"], ["combined.mp4"], []),
             ),
             patch.object(service, "is_configured", return_value=True),
@@ -1111,7 +1132,7 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm, "get_video_materials", return_value=["clip.mp4"]),
             patch.object(
                 tm,
-                "generate_final_videos",
+                "_generate_final_videos",
                 return_value=(["final.mp4"], ["combined.mp4"], []),
             ),
             patch.object(service, "is_configured", return_value=True),

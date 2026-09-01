@@ -20,7 +20,7 @@ which term actually produced the visuals.
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List
 
 from loguru import logger
 
@@ -242,29 +242,3 @@ def segments_to_records(materials: List[SegmentMaterials]) -> List[dict[str, Any
         }
         for m in materials
     ]
-
-
-def find_neighbor_fallback_term(
-    index: int,
-    segment_terms: dict[int, str],
-) -> Optional[str]:
-    """
-    Return the nearest available neighbor term for a failed segment search.
-
-    Preference: previous segment first (narratively closer), then next.
-    Pure helper so orchestration code stays testable without provider stubs.
-    """
-    previous_term = segment_terms.get(index - 1, "")
-    if previous_term:
-        return previous_term
-    return segment_terms.get(index + 1) or None
-
-
-if __name__ == "__main__":
-    prepare_segment_materials(
-        segments=[{"index": 0, "text": "money"}],
-        video_subject="money",
-        search_videos=lambda **_: [],
-        save_video=lambda **_: "",
-        video_aspect=VideoAspect.portrait,
-    )
