@@ -28,7 +28,13 @@ from app.services import (
 )
 from app.services import upload_post
 from app.services import state as sm
-from app.services import segment_audio, segment_material, segment_subtitle, segmenter
+from app.services import (
+    segment_audio,
+    segment_material,
+    segment_subtitle,
+    segment_terms,
+    segmenter,
+)
 from app.utils import file_security, utils
 
 
@@ -1132,6 +1138,15 @@ def _run_segment_first_pipeline(
     logger.info(
         f"segmented script: task_id={task_id}, segments={len(segment_records)}"
     )
+
+    # 用 LLM 把每段文本提炼成 1-3 词的英文搜索词（generate_terms 的同构提示词）。
+    # 提炼失败的分段不出现在映射里，prepare_segment_materials 会回退用原文搜索。
+    segment_term_map = segment_terms.extract_terms_for_segments(
+        segment_records,
+        video_subject=params.video_subject,
+    )
+    for record in segment_records:
+        record["search_term"] = segment_term_map.get(record["index"], "")
 
     save_script_data(
         task_id,
