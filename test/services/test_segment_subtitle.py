@@ -41,6 +41,24 @@ class TestBuildSegmentSubtitles(unittest.TestCase):
             self.assertIn("00:00:02,000 --> 00:00:03,000", content)
             self.assertIn("00:00:03,000 --> 00:00:06,500", content)
 
+    def test_output_is_parseable_by_moviepy_subtitlesclip(self):
+        """写入的 SRT 必须能被 MoviePy 的 SubtitlesClip 直接解析。"""
+        from moviepy.video.tools.subtitles import file_to_subtitles
+
+        segments = [
+            {"index": 0, "text": "First.", "start_ms": 0, "duration_ms": 2000},
+            {"index": 1, "text": "Second.", "start_ms": 2000, "duration_ms": 1000},
+        ]
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "subtitle.srt")
+            segment_subtitle.build_segment_subtitles(segments, out)
+            items = file_to_subtitles(out, encoding="utf-8")
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[1][1], "Second.")
+
     def test_empty_text_segments_are_skipped(self):
         segments = [
             {"index": 0, "text": "", "start_ms": 0, "duration_ms": 500},

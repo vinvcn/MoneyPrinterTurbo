@@ -50,7 +50,9 @@ def build_segment_subtitles(segments: list[dict], subtitle_file: str) -> str:
 
     output_path = Path(subtitle_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text("\n".join(lines), encoding="utf-8")
+    # MoviePy 的 SubtitlesClip 按空行分块解析 SRT；每个字幕块后必须补一个
+    # 空行，否则最后一个（或全部）字幕块会被丢弃，最终 max() 空序列崩溃。
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     logger.info(
         f"segment subtitles created: {subtitle_file}, lines={subtitle_index}"
     )
