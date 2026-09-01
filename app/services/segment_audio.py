@@ -23,6 +23,19 @@ from app.services import voice as voice_service
 from app.utils import utils
 
 
+def _pydub_segment() -> AudioSegment:
+    """
+    返回已配置 FFmpeg 路径的 AudioSegment。
+
+    pydub 解码依赖外部 FFmpeg。CI/Windows 环境 PATH 里往往没有 ffmpeg，
+    项目已通过 imageio-ffmpeg 提供内置二进制；这里在每次解码前复用
+    voice 服务的同一套路径解析，避免 segment 音频在 CI/便携包环境
+    "ffmpeg not found" 失败。
+    """
+    voice_service._configure_pydub_ffmpeg(AudioSegment)
+    return AudioSegment
+
+
 @dataclass
 class SegmentAudioResult:
     """逐段配音结果：包含每段偏移量与合并后的旁白文件路径。"""
@@ -115,7 +128,7 @@ def prepare_segment_audio(
             return result
 
         try:
-            segment_audio = AudioSegment.from_file(segment_audio_path)
+            segment_audio = _pydub_segment().from_file(segment_audio_path)
         except Exception as exc:
             logger.error(
                 "failed to decode segment audio: "
