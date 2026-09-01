@@ -64,6 +64,14 @@ twelvelabs_rerank_terms = false
 # 默认关闭，开启后会减少随机性，使素材顺序更贴近文案结构。
 match_materials_to_script = false
 
+# Segment-first pipeline: split the script into narration segments and give
+# each segment its own TTS audio and material search, so visuals align with
+# the narration by construction. Set to false to restore the legacy
+# random-shuffle assembly. Local materials always use the legacy path.
+# Can also be toggled per-process with the MPT_SEGMENT_FIRST_PIPELINE
+# environment variable (takes priority over this value).
+segment_first_pipeline = true
+
 # Optional Sonilo video-matched original background music.
 # Create a key at https://platform.sonilo.com/dashboard. The WebUI can also save
 # this value, or you can set the SONILO_API_KEY environment variable instead.
