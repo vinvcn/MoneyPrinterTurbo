@@ -32,6 +32,9 @@ jobs:
       MPT_TEST_REDIS_HOST: 127.0.0.1
       MPT_TEST_REDIS_PORT: 6379
       MPT_TEST_REDIS_DB: 15
+      # segment-first 流水线的行为由独立测试覆盖；CI 主套件固定走旧流水线，
+      # 保证存量用例不依赖配置开关的环境差异。
+      MPT_SEGMENT_FIRST_PIPELINE: "0"
 
     steps:
       - name: Check out repository

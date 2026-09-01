@@ -10,12 +10,14 @@ from app.services import segment_audio
 
 class TestPrepareSegmentAudio(unittest.TestCase):
     def _write_real_tone(self, path, duration=1.0, freq="440"):
-        """Generate a real decodable mp3 via ffmpeg so pydub can read it."""
+        """Generate a real decodable mp3 via the project-resolved ffmpeg."""
         import subprocess
+
+        from app.utils import utils
 
         subprocess.run(
             [
-                "ffmpeg", "-y", "-f", "lavfi",
+                utils.get_ffmpeg_binary(), "-y", "-f", "lavfi",
                 "-i", f"sine=frequency={freq}:sample_rate=24000:duration={duration}",
                 "-codec:a", "libmp3lame", "-q:a", "4", str(path),
             ],

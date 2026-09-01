@@ -192,8 +192,11 @@ def prepare_segment_audio(
         return result
 
     merged_path = task_dir / "audio.mp3"
-    # 192k 与成片音频码率一致；单声道保持 TTS 输出形态。
-    merged.export(str(merged_path), format="mp3", bitrate="192k")
+    # 192k 与成片音频码率一致；单声道保持 TTS 输出形态。导出使用项目解析的
+    # FFmpeg，CI/便携包环境 PATH 里没有 ffmpeg 也能写出。
+    merged_path_str = str(merged_path)
+    voice_service._configure_pydub_ffmpeg(AudioSegment)
+    merged.export(merged_path_str, format="mp3", bitrate="192k")
 
     result.audio_file = str(merged_path)
     result.total_duration_ms = offset_ms
