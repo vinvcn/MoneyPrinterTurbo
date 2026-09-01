@@ -10,8 +10,15 @@ segment-first 流水线需要每个旁白片段独立的音频文件，以及一
 - MoviePy 会重编码并引入类似的单片段填充；
 - pydub 解码到原始帧，``len(segment)`` 以毫秒为单位精确，偏移量与真实
   音频内容对齐。导出单个 MP3 保持下游 ``generate_video()`` 路径不变。
+
+解码细节：pydub 的 ``from_file`` 需要 ffprobe 探测容器信息，而
+Windows 便携包和部分 CI 环境只有 ffmpeg 没有 ffprobe。这里统一先把
+片段音频转成 WAV 流（Frame-accurate、无容器填充），再用 pydub 的纯
+Python WAV 解析读取，两条环境约束都不破坏。
 """
 
+import io
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -34,6 +41,30 @@ def _pydub_segment() -> AudioSegment:
     """
     voice_service._configure_pydub_ffmpeg(AudioSegment)
     return AudioSegment
+
+
+def _decode_audio_frames(audio_path: str) -> AudioSegment:
+    """
+    用 ffmpeg 把任意音频解码为 WAV 帧流，交给 pydub 解析。
+
+    不经过 ffprobe，也不重新引入容器填充；WAV 路径的 ``len()`` 与源
+    音频帧数完全一致，保证逐段偏移量在所有环境都可复现。
+    """
+    ffmpeg_binary = utils.get_ffmpeg_binary()
+    command = [
+        ffmpeg_binary,
+        "-nostdin",
+        "-v", "error",
+        "-i", audio_path,
+        "-f", "wav",
+        "-acodec", "pcm_s16le",
+        "-",
+    ]
+    result = subprocess.run(command, capture_output=True, check=False)
+    if result.returncode != 0 or not result.stdout:
+        detail = (result.stderr or b"").decode("utf-8", "ignore").strip()
+        raise ValueError(f"ffmpeg decode failed: {detail[:200]}")
+    return AudioSegment.from_wav(io.BytesIO(result.stdout))
 
 
 @dataclass
@@ -128,7 +159,7 @@ def prepare_segment_audio(
             return result
 
         try:
-            segment_audio = _pydub_segment().from_file(segment_audio_path)
+            segment_audio = _decode_audio_frames(segment_audio_path)
         except Exception as exc:
             logger.error(
                 "failed to decode segment audio: "
