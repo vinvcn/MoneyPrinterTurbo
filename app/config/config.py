@@ -465,6 +465,7 @@ def save_config():
         config_to_save["siliconflow"] = dict(siliconflow)
         config_to_save["elevenlabs"] = dict(elevenlabs)
         config_to_save["chatterbox"] = dict(chatterbox)
+        config_to_save["vlm"] = dict(vlm)
         config_to_save["ui"] = dict(ui)
         serialized_config = toml.dumps(config_to_save)
 
@@ -519,6 +520,16 @@ azure = _SynchronizedConfig(_cfg.get("azure", {}))
 siliconflow = _SynchronizedConfig(_cfg.get("siliconflow", {}))
 elevenlabs = _SynchronizedConfig(_cfg.get("elevenlabs", {}))
 chatterbox = _SynchronizedConfig(_cfg.get("chatterbox", {}))
+vlm = _SynchronizedConfig(
+    _cfg.get(
+        "vlm",
+        {
+            # [vlm] 段缺失时按"未启用"处理：segment-first 素材流程不发起
+            # 任何 VLM 请求，行为与引入过滤器之前完全一致。
+            "enabled": False,
+        },
+    )
+)
 ui = _SynchronizedConfig(
     _cfg.get(
         "ui",

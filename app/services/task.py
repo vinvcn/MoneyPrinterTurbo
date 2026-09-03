@@ -28,6 +28,14 @@ from app.services import (
 )
 from app.services import upload_post
 from app.services import state as sm
+from app.services import (
+    segment_audio,
+    segment_material,
+    segment_subtitle,
+    segment_terms,
+    segmenter,
+    vlm_judge,
+)
 from app.utils import file_security, utils
 
 
@@ -87,6 +95,23 @@ def _get_video_music_prompt(params: VideoParams) -> str:
     if params.bgm_type == "sonilo" and not prompt:
         prompt = str(params.sonilo_bgm_prompt or "").strip()
     return prompt
+
+
+def segment_pipeline_enabled(params: VideoParams) -> bool:
+    """
+    判断当前任务是否走 segment-first 流水线。
+
+    segment-first 模式把脚本切成片段，逐段配音并按段搜索素材，使画面与
+    旁白按构造对齐。本地素材由用户显式提供画面，没有搜索环节，因此不
+    参与 segment-first；配置开关允许用户回退到旧的随机拼接行为。
+    """
+    if params.video_source == "local":
+        return False
+    # 环境变量优先，其次 config.toml；两者都未设置时默认启用 segment-first。
+    env_value = os.environ.get("MPT_SEGMENT_FIRST_PIPELINE")
+    if env_value is not None:
+        return env_value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(config.app.get("segment_first_pipeline", True))
 
 
 def is_task_busy(task: dict | None) -> bool:
@@ -328,12 +353,14 @@ def generate_terms(task_id, params, video_script):
     return video_terms
 
 
-def save_script_data(task_id, video_script, video_terms, params):
+def save_script_data(task_id, video_script, video_terms, params, segments=None):
     script_data = {
         "script": video_script,
         "search_terms": video_terms,
         "params": params,
     }
+    if segments:
+        script_data["segments"] = segments
     task_artifacts.write_script_data(task_id, script_data)
 
 
@@ -607,9 +634,21 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
         return downloaded_videos
 
 
-def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
+def _generate_final_videos(
+    task_id,
+    params: VideoParams,
+    combine_kwargs: dict,
+    audio_file: str,
+    subtitle_path: str,
+    audio_duration: float,
 ):
+    """
+    逐个输出视频：先按传入参数拼接素材，再合成旁白/字幕/BGM。
+
+    旧流程与 segment-first 流程的差异只在拼接输入，由调用方通过
+    ``combine_kwargs`` 决定；BGM 生成、混音降级和进度推进完全共用，
+    避免两条流水线各自维护一份供应商降级语义。
+    """
     final_video_paths = []
     combined_video_paths = []
     warnings = []
@@ -618,15 +657,6 @@ def generate_final_videos(
         video_music_provider is not None
         and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
     )
-    # 多视频生成默认会打散素材以增加差异；但“按文案顺序匹配素材”追求的是
-    # 时间线稳定性和可解释性，所以开启后所有输出都使用顺序拼接。
-    if params.match_materials_to_script:
-        video_concat_mode = VideoConcatMode.sequential
-    elif params.video_count == 1:
-        video_concat_mode = params.video_concat_mode
-    else:
-        video_concat_mode = VideoConcatMode.random
-    video_transition_mode = params.video_transition_mode
 
     _progress = 50
     for i in range(params.video_count):
@@ -637,14 +667,13 @@ def generate_final_videos(
         logger.info(f"\n\n## combining video: {index} => {combined_video_path}")
         video.combine_videos(
             combined_video_path=combined_video_path,
-            video_paths=downloaded_videos,
             audio_file=audio_file,
             video_aspect=params.video_aspect,
-            video_concat_mode=video_concat_mode,
-            video_transition_mode=video_transition_mode,
+            video_transition_mode=params.video_transition_mode,
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
+            **combine_kwargs,
         )
 
         _progress += 50 / params.video_count / 2
@@ -712,6 +741,43 @@ def generate_final_videos(
         combined_video_paths.append(combined_video_path)
 
     return final_video_paths, combined_video_paths, warnings
+
+
+def _generate_final_videos_segment_first(
+    task_id,
+    params: VideoParams,
+    materials,
+    audio_result,
+    subtitle_path: str,
+    audio_duration: float,
+):
+    """segment-first 输出阶段：把按段对齐的素材交给共用的输出循环。"""
+    segment_clips = [
+        {
+            "index": m.index,
+            "clips": list(m.clips),
+            "duration": next(
+                (
+                    s["duration_ms"] / 1000
+                    for s in audio_result.segments
+                    if s["index"] == m.index
+                ),
+                0.0,
+            ),
+        }
+        for m in materials
+    ]
+    return _generate_final_videos(
+        task_id,
+        params,
+        combine_kwargs={
+            "video_paths": [],
+            "segments": segment_clips,
+        },
+        audio_file=audio_result.audio_file,
+        subtitle_path=subtitle_path,
+        audio_duration=audio_duration,
+    )
 
 
 def _patch_cross_post_state(task_id: str, **kwargs) -> bool | None:
@@ -1042,6 +1108,176 @@ def _schedule_cross_post(
     return None
 
 
+def _run_segment_first_pipeline(
+    task_id,
+    params: VideoParams,
+    video_script: str,
+    stop_at: str = "video",
+):
+    """
+    segment-first 视频生成流程：脚本 → 分段 → 逐段 TTS + 素材 → 按序组装。
+
+    与旧流程的差异：
+    1. 每个片段独立调用 TTS，音频偏移量精确到毫秒；
+    2. 每个片段用自己的文本（搜索失败时用邻近片段词，最后用主题词）搜索素材，
+       画面与旁白按构造对齐；
+    3. 字幕直接按片段音频偏移量生成；
+    4. 视频拼接严格按片段顺序，不打乱。
+
+    中间 stop_at 语义与旧流程一致；segment-first 模式没有全局关键词阶段，
+    "terms" 停止点直接返回空关键词列表。
+    """
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
+
+    segments = segmenter.segment_script(video_script)
+    if not segments:
+        return _mark_task_failed(task_id, "script", "script produced no segments")
+
+    segment_records = [
+        {"index": segment.index, "text": segment.text} for segment in segments
+    ]
+    logger.info(
+        f"segmented script: task_id={task_id}, segments={len(segment_records)}"
+    )
+
+    # 用 LLM 把每段文本提炼成 1-3 词的英文搜索词（generate_terms 的同构提示词）。
+    # 提炼失败的分段不出现在映射里，prepare_segment_materials 会回退用原文搜索。
+    segment_term_map = segment_terms.extract_terms_for_segments(
+        segment_records,
+        video_subject=params.video_subject,
+    )
+    for record in segment_records:
+        record["search_term"] = segment_term_map.get(record["index"], "")
+
+    save_script_data(
+        task_id,
+        video_script,
+        [],
+        params,
+        segments=segment_records,
+    )
+
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=15)
+
+    # 1. Per-segment TTS + merged narration track
+    audio_result = segment_audio.prepare_segment_audio(
+        segments=segment_records,
+        task_id=task_id,
+        voice_name=params.voice_name,
+        voice_rate=params.voice_rate,
+        voice_volume=params.voice_volume,
+        sample_audio_base64=params.sample_audio_base64,
+    )
+    if not audio_result.ok or not audio_result.audio_file:
+        error = audio_result.error or "failed to prepare segment narration audio"
+        return _mark_task_failed(task_id, "audio", error)
+
+    audio_file = audio_result.audio_file
+    audio_duration = math.ceil(audio_result.total_duration_ms / 1000) or 1
+
+    if stop_at == "audio":
+        sm.state.update_task(
+            task_id,
+            state=const.TASK_STATE_COMPLETE,
+            progress=100,
+            audio_file=audio_file,
+        )
+        return {"audio_file": audio_file, "audio_duration": audio_duration}
+
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
+
+    # 2. Subtitles from segment offsets
+    subtitle_path = ""
+    if params.subtitle_enabled:
+        subtitle_path = segment_subtitle.build_segment_subtitles(
+            audio_result.segments,
+            path.join(utils.task_dir(task_id), "subtitle.srt"),
+        )
+
+    if stop_at == "subtitle":
+        sm.state.update_task(
+            task_id,
+            state=const.TASK_STATE_COMPLETE,
+            progress=100,
+            subtitle_path=subtitle_path,
+        )
+        return {"subtitle_path": subtitle_path}
+
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
+
+    # 3. Per-segment material search with fallback chain
+    # VLM 下载前相关性过滤（issue #9）：[vlm] enabled=true 时逐候选判定，
+    # 不相关素材在下载完整 mp4 之前被拒收。
+    segment_judge = None
+    if vlm_judge.is_enabled():
+        segment_judge = vlm_judge.make_default_judge()
+        logger.info("vlm pre-download material filter enabled")
+    materials = segment_material.prepare_segment_materials(
+        segments=segment_records,
+        video_subject=params.video_subject,
+        search_videos=material.search_videos_with_cache_for_source(
+            params.video_source
+        ),
+        save_video=material.save_video,
+        video_aspect=params.video_aspect,
+        clip_duration=params.video_clip_duration,
+        save_dir=utils.task_dir(task_id),
+        judge_candidate=segment_judge,
+    )
+    segment_material.persist_segment_material_sources(task_id, materials)
+
+    downloaded_count = sum(len(m.clips) for m in materials)
+    if not downloaded_count:
+        return _mark_task_failed(
+            task_id,
+            "materials",
+            f"failed to download video materials from {params.video_source}",
+        )
+
+    if stop_at == "materials":
+        materials_payload = segment_material.segments_to_records(materials)
+        sm.state.update_task(
+            task_id,
+            state=const.TASK_STATE_COMPLETE,
+            progress=100,
+            materials=materials_payload,
+        )
+        return {"materials": materials_payload}
+
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=50)
+
+    if type(params.video_concat_mode) is str:
+        params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
+
+    # 4. Assemble + composite per output video
+    final_video_paths, combined_video_paths, generation_warnings = (
+        _generate_final_videos_segment_first(
+            task_id, params, materials, audio_result, subtitle_path, audio_duration
+        )
+    )
+    if not final_video_paths:
+        return _mark_task_failed(task_id, "video", "failed to generate final video")
+
+    logger.success(
+        f"segment-first task {task_id} finished, generated {len(final_video_paths)} videos."
+    )
+
+    return _complete_task_with_cross_post(
+        task_id=task_id,
+        params=params,
+        video_script=video_script,
+        video_terms=[],
+        final_video_paths=final_video_paths,
+        combined_video_paths=combined_video_paths,
+        audio_file=audio_file,
+        audio_duration=audio_duration,
+        subtitle_path=subtitle_path,
+        materials=segment_material.segments_to_records(materials),
+        segments=audio_result.segments,
+        generation_warnings=generation_warnings,
+    )
+
+
 def _run_pipeline(
     task_id,
     params: VideoParams,
@@ -1107,6 +1343,17 @@ def _run_pipeline(
             task_id, state=const.TASK_STATE_COMPLETE, progress=100, script=video_script
         )
         return {"script": video_script}
+
+    # segment-first 分支：脚本文本同时驱动每段的配音和素材搜索。
+    # terms 停止点在 segment-first 模式没有独立含义，直接按完整流程继续，
+    # 由 audio/materials 停止点返回中间产物。
+    if segment_pipeline_enabled(params) and stop_at not in {"terms", "subtitle"}:
+        return _run_segment_first_pipeline(
+            task_id,
+            params,
+            video_script,
+            stop_at=stop_at,
+        )
 
     # 2. Generate terms
     video_terms = ""
@@ -1198,13 +1445,26 @@ def _run_pipeline(
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
 
     # 6. Generate final videos
-    final_video_paths, combined_video_paths, generation_warnings = generate_final_videos(
-        task_id,
-        params,
-        downloaded_videos,
-        audio_file,
-        subtitle_path,
-        audio_duration,
+    # 多视频生成默认会打散素材以增加差异；但“按文案顺序匹配素材”追求的是
+    # 时间线稳定性和可解释性，所以开启后所有输出都使用顺序拼接。
+    if params.match_materials_to_script:
+        video_concat_mode = VideoConcatMode.sequential
+    elif params.video_count == 1:
+        video_concat_mode = params.video_concat_mode
+    else:
+        video_concat_mode = VideoConcatMode.random
+    final_video_paths, combined_video_paths, generation_warnings = (
+        _generate_final_videos(
+            task_id,
+            params,
+            combine_kwargs={
+                "video_paths": downloaded_videos,
+                "video_concat_mode": video_concat_mode,
+            },
+            audio_file=audio_file,
+            subtitle_path=subtitle_path,
+            audio_duration=audio_duration,
+        )
     )
 
     if not final_video_paths:
@@ -1218,7 +1478,43 @@ def _run_pipeline(
         f"task {task_id} finished, generated {len(final_video_paths)} videos."
     )
 
-    # 7. 先完成视频生成任务，再按需提交跨平台发布。第三方上传可能耗时
+    return _complete_task_with_cross_post(
+        task_id=task_id,
+        params=params,
+        video_script=video_script,
+        video_terms=video_terms,
+        final_video_paths=final_video_paths,
+        combined_video_paths=combined_video_paths,
+        audio_file=audio_file,
+        audio_duration=audio_duration,
+        subtitle_path=subtitle_path,
+        materials=downloaded_videos,
+        segments=None,
+        generation_warnings=generation_warnings,
+    )
+
+
+def _complete_task_with_cross_post(
+    task_id,
+    params: VideoParams,
+    video_script: str,
+    video_terms,
+    final_video_paths: list[str],
+    combined_video_paths: list[str],
+    audio_file: str,
+    audio_duration: float,
+    subtitle_path: str,
+    materials,
+    segments: list[dict] | None,
+    generation_warnings: list[dict],
+) -> dict:
+    """
+    写入任务完成状态并按需提交跨平台发布。
+
+    旧流程与 segment-first 流程的收尾完全一致，只提取一次避免两条流水线
+    各自维护跨平台发布的字段语义。
+    """
+    # 先完成视频生成任务，再按需提交跨平台发布。第三方上传可能耗时
     # 数分钟，不应阻塞视频结果返回，也不能反向影响已经生成的成片。
     cross_post_enabled = (
         upload_post.upload_post_service.is_configured()
@@ -1244,13 +1540,15 @@ def _run_pipeline(
         "audio_file": audio_file,
         "audio_duration": audio_duration,
         "subtitle_path": subtitle_path,
-        "materials": downloaded_videos,
+        "materials": materials,
         "cross_post_state": cross_post_state,
         "cross_post_results": None,
         "cross_post_error": None,
         "cross_post_owner": _cross_post_process_owner if should_cross_post else None,
         "warnings": generation_warnings or None,
     }
+    if segments is not None:
+        kwargs["segments"] = segments
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )

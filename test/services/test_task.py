@@ -5,6 +5,7 @@ import sys
 import tempfile
 from concurrent.futures import Future
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -100,10 +101,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video"),
             patch.object(tm.sm.state, "update_task"),
         ):
-            tm.generate_final_videos(
+            tm._generate_final_videos(
                 task_id="clip-speed-task",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -130,10 +134,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video") as generate_video,
             patch.object(tm.sm.state, "update_task"),
         ):
-            _, _, warnings = tm.generate_final_videos(
+            _, _, warnings = tm._generate_final_videos(
                 task_id="sonilo-task",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -167,10 +174,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video") as generate_video,
             patch.object(tm.sm.state, "update_task"),
         ):
-            _, _, warnings = tm.generate_final_videos(
+            _, _, warnings = tm._generate_final_videos(
                 task_id="elevenlabs-task",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -203,10 +213,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video") as generate_video,
             patch.object(tm.sm.state, "update_task"),
         ):
-            final_paths, _, warnings = tm.generate_final_videos(
+            final_paths, _, warnings = tm._generate_final_videos(
                 task_id="elevenlabs-fallback",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -233,10 +246,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video") as generate_video,
             patch.object(tm.sm.state, "update_task"),
         ):
-            final_paths, _, warnings = tm.generate_final_videos(
+            final_paths, _, warnings = tm._generate_final_videos(
                 task_id="sonilo-fallback",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -263,10 +279,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video", return_value=True) as generate,
             patch.object(tm.sm.state, "update_task"),
         ):
-            final_paths, _, warnings = tm.generate_final_videos(
+            final_paths, _, warnings = tm._generate_final_videos(
                 task_id="sonilo-zero-volume",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -291,10 +310,13 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.video, "generate_video", return_value=False) as generate,
             patch.object(tm.sm.state, "update_task"),
         ):
-            final_paths, _, warnings = tm.generate_final_videos(
+            final_paths, _, warnings = tm._generate_final_videos(
                 task_id="sonilo-mix-fallback",
                 params=params,
-                downloaded_videos=["material.mp4"],
+                combine_kwargs={
+                    "video_paths": ["material.mp4"],
+                    "video_concat_mode": tm.VideoConcatMode.random,
+                },
                 audio_file="audio.mp3",
                 subtitle_path="",
                 audio_duration=5,
@@ -740,7 +762,7 @@ class TestTaskService(unittest.TestCase):
                         "get_video_materials",
                         return_value=["clip.mp4"],
                     ),
-                    patch.object(tm, "generate_final_videos") as generate_final,
+                    patch.object(tm, "_generate_final_videos") as generate_final,
                     patch.object(tm.sm.state, "update_task"),
                 ):
                     result = tm.start(
@@ -775,7 +797,7 @@ class TestTaskService(unittest.TestCase):
             ),
             patch.object(
                 tm,
-                "generate_final_videos",
+                "_generate_final_videos",
                 return_value=(["final.mp4"], ["combined.mp4"], []),
             ),
             patch.object(
@@ -837,7 +859,7 @@ class TestTaskService(unittest.TestCase):
                     ),
                     patch.object(
                         tm,
-                        "generate_final_videos",
+                        "_generate_final_videos",
                         return_value=videos_result,
                     ),
                     patch.object(tm.sm, "state", state),
@@ -918,7 +940,7 @@ class TestTaskService(unittest.TestCase):
             ),
             patch.object(
                 tm,
-                "generate_final_videos",
+                "_generate_final_videos",
                 return_value=(
                     ["final-1.mp4", "final-2.mp4"],
                     ["combined-1.mp4", "combined-2.mp4"],
@@ -1012,7 +1034,7 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm, "get_video_materials", return_value=["clip.mp4"]),
             patch.object(
                 tm,
-                "generate_final_videos",
+                "_generate_final_videos",
                 return_value=(["final.mp4"], ["combined.mp4"], []),
             ),
             patch.object(service, "is_configured", return_value=True),
@@ -1110,7 +1132,7 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm, "get_video_materials", return_value=["clip.mp4"]),
             patch.object(
                 tm,
-                "generate_final_videos",
+                "_generate_final_videos",
                 return_value=(["final.mp4"], ["combined.mp4"], []),
             ),
             patch.object(service, "is_configured", return_value=True),
@@ -1536,6 +1558,151 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(task["videos"], ["final.mp4"])
         self.assertEqual(task["cross_post_state"], tm.const.CROSS_POST_STATE_FAILED)
         self.assertIn("queue is full", task["cross_post_error"])
+
+    def test_segment_first_task_completes_with_aligned_manifest(self):
+        """
+        segment-first 任务必须按片段编排：每段独立 TTS、按段搜索素材，
+        并把片段清单写入任务记录，供 API 调用方核对画面与旁白的对齐关系。
+        """
+        task_id = "segment-first-complete"
+        params = VideoParams(
+            video_subject="Coffee",
+            video_script="First coffee sentence. Second coffee sentence.",
+        )
+        state = MemoryState()
+
+        fake_audio_result = SimpleNamespace(
+            segments=[
+                {
+                    "index": 0,
+                    "text": "First coffee sentence.",
+                    "audio_file": "audio-segment-0.mp3",
+                    "start_ms": 0,
+                    "duration_ms": 2000,
+                },
+                {
+                    "index": 1,
+                    "text": "Second coffee sentence.",
+                    "audio_file": "audio-segment-1.mp3",
+                    "start_ms": 2000,
+                    "duration_ms": 1800,
+                },
+            ],
+            audio_file="audio.mp3",
+            total_duration_ms=3800,
+            ok=True,
+            failed_index=None,
+            error="",
+        )
+        fake_materials = [
+            SimpleNamespace(
+                index=0,
+                search_term="First coffee sentence.",
+                resolved_term="First coffee sentence.",
+                fallback_level="self",
+                clips=["/m/clip-a.mp4", "/m/clip-b.mp4"],
+                search_attempts=[
+                    {"level": "self", "term": "First coffee sentence.", "found": True}
+                ],
+                clip_sources=[
+                    {"url": "https://v.example/a.mp4", "local_file": "clip-a.mp4"},
+                    {"url": "https://v.example/b.mp4", "local_file": "clip-b.mp4"},
+                ],
+                vlm_filter=[],
+            ),
+            SimpleNamespace(
+                index=1,
+                search_term="Second coffee sentence.",
+                resolved_term="Second coffee sentence.",
+                fallback_level="self",
+                clips=["/m/clip-c.mp4"],
+                search_attempts=[
+                    {"level": "self", "term": "Second coffee sentence.", "found": True}
+                ],
+                clip_sources=[
+                    {"url": "https://v.example/c.mp4", "local_file": "clip-c.mp4"}
+                ],
+                vlm_filter=[],
+            ),
+        ]
+        recorded_segments = {}
+
+        def fake_combine(**kwargs):
+            recorded_segments.update({s["index"]: s for s in kwargs["segments"]})
+            return kwargs["combined_video_path"]
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(tm, "segment_pipeline_enabled", return_value=True),
+            patch.object(tm.segmenter, "segment_script") as segment_script,
+            patch.object(tm.segment_audio, "prepare_segment_audio", return_value=fake_audio_result),
+            patch.object(
+                tm.segment_material,
+                "prepare_segment_materials",
+                return_value=fake_materials,
+            ),
+            patch.object(tm, "generate_terms", return_value=["coffee"]),
+            patch.object(tm, "save_script_data"),
+            patch.object(tm, "generate_subtitle", return_value="subtitle.srt"),
+            patch.object(tm.video, "combine_videos", side_effect=fake_combine),
+            patch.object(tm.video, "generate_video") as generate_video,
+            patch.object(
+                tm.upload_post.upload_post_service,
+                "is_configured",
+                return_value=False,
+            ),
+        ):
+            segment_script.return_value = [
+                SimpleNamespace(index=0, text="First coffee sentence.", estimated_duration=2.0),
+                SimpleNamespace(index=1, text="Second coffee sentence.", estimated_duration=1.8),
+            ]
+            generate_video.return_value = True
+            result = tm.start(task_id, params)
+
+        self.assertTrue(result["videos"])
+        self.assertEqual(result["audio_file"], "audio.mp3")
+        self.assertEqual(result["audio_duration"], 4)  # ceil(3.8s)
+        # 第 0 段的两个 clip 顺序进入时间线，第 1 段的 clip 排在其后。
+        self.assertEqual(
+            [c for c in recorded_segments[0]["clips"]],
+            ["/m/clip-a.mp4", "/m/clip-b.mp4"],
+        )
+        self.assertEqual(recorded_segments[1]["clips"], ["/m/clip-c.mp4"])
+        task = state.get_task(task_id)
+        self.assertEqual(task["state"], tm.const.TASK_STATE_COMPLETE)
+        self.assertEqual(len(task["segments"]), 2)
+        self.assertEqual(task["segments"][0]["start_ms"], 0)
+        self.assertEqual(task["segments"][1]["start_ms"], 2000)
+
+    def test_segment_first_task_fails_when_segment_tts_fails(self):
+        """某一段 TTS 失败时任务必须以明确的 failed_stage 结束。"""
+        params = VideoParams(
+            video_subject="Coffee",
+            video_script="One. Two.",
+        )
+        state = MemoryState()
+        failed_audio = SimpleNamespace(
+            segments=[], audio_file="", total_duration_ms=0,
+            ok=False, failed_index=1, error="segment 1 TTS failed",
+        )
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(tm, "segment_pipeline_enabled", return_value=True),
+            patch.object(tm.segmenter, "segment_script") as segment_script,
+            patch.object(
+                tm.segment_audio, "prepare_segment_audio", return_value=failed_audio
+            ),
+            patch.object(tm, "save_script_data"),
+        ):
+            segment_script.return_value = [
+                SimpleNamespace(index=0, text="One.", estimated_duration=1.0),
+                SimpleNamespace(index=1, text="Two.", estimated_duration=1.0),
+            ]
+            result = tm.start("segment-tts-failed", params)
+
+        self.assertEqual(result["failed_stage"], "audio")
+        self.assertIn("segment 1", result["error"])
 
     @unittest.skipUnless(
         RUN_INTEGRATION_TESTS,

@@ -64,6 +64,14 @@ twelvelabs_rerank_terms = false
 # 默认关闭，开启后会减少随机性，使素材顺序更贴近文案结构。
 match_materials_to_script = false
 
+# Segment-first pipeline: split the script into narration segments and give
+# each segment its own TTS audio and material search, so visuals align with
+# the narration by construction. Set to false to restore the legacy
+# random-shuffle assembly. Local materials always use the legacy path.
+# Can also be toggled per-process with the MPT_SEGMENT_FIRST_PIPELINE
+# environment variable (takes priority over this value).
+segment_first_pipeline = true
+
 # Optional Sonilo video-matched original background music.
 # Create a key at https://platform.sonilo.com/dashboard. The WebUI can also save
 # this value, or you can set the SONILO_API_KEY environment variable instead.
@@ -332,6 +340,30 @@ api_key = ""
 model_id = "chatterbox"
 # Voice names exposed by the configured Chatterbox server.
 voices = ["default-Female"]
+
+# =============================================================================
+# VLM Material Filter / VLM 素材相关性过滤
+# =============================================================================
+
+[vlm]
+# VLM pre-download relevance filter (segment-first pipeline): a vision model
+# looks at each candidate's thumbnail (or first frame) and rejects visually
+# irrelevant candidates before the full mp4 is downloaded.
+# VLM 下载前相关性过滤：视觉模型检查候选缩略图/首帧，在下载完整 mp4 之前
+# 拒收画面与旁白无关的候选（uncertain 判定放行；VLM 失败重试 3 次后放行）。
+enabled = false
+# OpenAI-compatible chat/completions endpoint. Defaults target SiliconFlow's
+# hosted Qwen3.5-4B vision model; point base_url at your own vLLM server to
+# self-host (any OpenAI-compatible multimodal endpoint works).
+# base_url = "https://api.siliconflow.cn/v1"
+api_key = ""
+model = "Qwen/Qwen3.5-4B"
+# Per-request timeout in seconds.
+timeout = 30
+# Minimum thumbnail resolution in pixels; smaller thumbnails fall back to
+# ffmpeg first-frame extraction from the candidate mp4.
+min_thumbnail_width = 640
+min_thumbnail_height = 320
 
 # =============================================================================
 # WebUI Preferences / WebUI 偏好
