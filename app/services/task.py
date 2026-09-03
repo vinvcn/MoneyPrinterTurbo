@@ -34,6 +34,7 @@ from app.services import (
     segment_subtitle,
     segment_terms,
     segmenter,
+    vlm_judge,
 )
 from app.utils import file_security, utils
 
@@ -1205,6 +1206,12 @@ def _run_segment_first_pipeline(
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 3. Per-segment material search with fallback chain
+    # VLM 下载前相关性过滤（issue #9）：[vlm] enabled=true 时逐候选判定，
+    # 不相关素材在下载完整 mp4 之前被拒收。
+    segment_judge = None
+    if vlm_judge.is_enabled():
+        segment_judge = vlm_judge.make_default_judge()
+        logger.info("vlm pre-download material filter enabled")
     materials = segment_material.prepare_segment_materials(
         segments=segment_records,
         video_subject=params.video_subject,
@@ -1215,6 +1222,7 @@ def _run_segment_first_pipeline(
         video_aspect=params.video_aspect,
         clip_duration=params.video_clip_duration,
         save_dir=utils.task_dir(task_id),
+        judge_candidate=segment_judge,
     )
     segment_material.persist_segment_material_sources(task_id, materials)
 

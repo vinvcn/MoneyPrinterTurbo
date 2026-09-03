@@ -1601,6 +1601,14 @@ class TestTaskService(unittest.TestCase):
                 resolved_term="First coffee sentence.",
                 fallback_level="self",
                 clips=["/m/clip-a.mp4", "/m/clip-b.mp4"],
+                search_attempts=[
+                    {"level": "self", "term": "First coffee sentence.", "found": True}
+                ],
+                clip_sources=[
+                    {"url": "https://v.example/a.mp4", "local_file": "clip-a.mp4"},
+                    {"url": "https://v.example/b.mp4", "local_file": "clip-b.mp4"},
+                ],
+                vlm_filter=[],
             ),
             SimpleNamespace(
                 index=1,
@@ -1608,6 +1616,13 @@ class TestTaskService(unittest.TestCase):
                 resolved_term="Second coffee sentence.",
                 fallback_level="self",
                 clips=["/m/clip-c.mp4"],
+                search_attempts=[
+                    {"level": "self", "term": "Second coffee sentence.", "found": True}
+                ],
+                clip_sources=[
+                    {"url": "https://v.example/c.mp4", "local_file": "clip-c.mp4"}
+                ],
+                vlm_filter=[],
             ),
         ]
         recorded_segments = {}
