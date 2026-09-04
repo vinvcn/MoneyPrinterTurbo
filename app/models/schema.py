@@ -46,8 +46,35 @@ class VideoAspect(str, Enum):
         raise ValueError(f"unsupported video aspect: {self}")
 
 
-class _Config:
-    arbitrary_types_allowed = True
+class VideoFitMode(str, Enum):
+    """How source clips with a different aspect ratio fill the output canvas."""
+
+    cover = "cover"
+    contain = "contain"
+
+
+SubtitleDisplayMode = Literal["sentence", "word_by_word"]
+SubtitleAnimation = Literal["none", "pop_spring"]
+_SUBTITLE_DISPLAY_MODES = ("sentence", "word_by_word")
+_SUBTITLE_ANIMATIONS = ("none", "pop_spring")
+
+
+def _get_valid_ui_choice(key: str, allowed_values: tuple[str, ...], default: str) -> str:
+    """
+    读取经过校验的 WebUI 枚举配置，兼容旧用户可能残留的无效值。
+
+    请求体由 Pydantic 的 Literal 严格校验，拼写错误会返回明确的字段校验错误；
+    配置文件则需要宽容处理，避免用户升级后因为历史手工配置错误导致整个服务
+    无法启动。HTTP 状态码由应用统一的校验异常处理器决定，这里不绑定具体数值。
+    """
+    configured_value = config.ui.get(key, default)
+    return configured_value if configured_value in allowed_values else default
+
+
+_Config = ConfigDict(
+    arbitrary_types_allowed=True,
+    # Note: ensure your key names match renamed V2 parameters if needed
+)
 
 
 @pydantic.dataclasses.dataclass(config=_Config)
@@ -80,6 +107,7 @@ class VideoParams(BaseModel):
     video_script: str = ""  # Script used to generate the video
     video_terms: Optional[str | list] = None  # Keywords used to generate the video
     video_aspect: Optional[VideoAspect] = VideoAspect.portrait.value
+    video_fit_mode: VideoFitMode = VideoFitMode.cover
     video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random.value
     video_transition_mode: Optional[VideoTransitionMode] = None
     video_clip_duration: int = Field(default=5, ge=1)
@@ -91,9 +119,13 @@ class VideoParams(BaseModel):
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
     )
-    
-    custom_audio_file: Optional[str] = None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
-    sample_audio_base64: Optional[str] = None  # base64-encoded audio sample for MiMo inline voiceclone TTS
+
+    custom_audio_file: Optional[str] = (
+        None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
+    )
+    sample_audio_base64: Optional[str] = (
+        None  # base64-encoded audio sample for MiMo inline voiceclone TTS
+    )
     video_language: Optional[str] = ""  # auto detect
 
     voice_name: Optional[str] = ""
@@ -108,7 +140,15 @@ class VideoParams(BaseModel):
     sonilo_bgm_prompt: str = Field(default="", max_length=2000)
 
     subtitle_enabled: Optional[bool] = True
-    subtitle_position: Optional[str] = config.ui.get("subtitle_position", "bottom")  # top, bottom, center, custom
+    subtitle_position: Optional[str] = config.ui.get(
+        "subtitle_position", "bottom"
+    )  # top, bottom, center, custom, two_thirds_bottom
+    subtitle_display_mode: SubtitleDisplayMode = _get_valid_ui_choice(
+        "subtitle_display_mode", _SUBTITLE_DISPLAY_MODES, "sentence"
+    )
+    subtitle_animation: SubtitleAnimation = _get_valid_ui_choice(
+        "subtitle_animation", _SUBTITLE_ANIMATIONS, "none"
+    )
     custom_position: float = config.ui.get("custom_position", 70.0)
     font_name: Optional[str] = "STHeitiMedium.ttc"
     text_fore_color: Optional[str] = "#FFFFFF"
@@ -134,6 +174,12 @@ class SubtitleRequest(BaseModel):
     bgm_file: Optional[str] = ""
     bgm_volume: Optional[float] = 0.2
     subtitle_position: Optional[str] = config.ui.get("subtitle_position", "bottom")
+    subtitle_display_mode: SubtitleDisplayMode = _get_valid_ui_choice(
+        "subtitle_display_mode", _SUBTITLE_DISPLAY_MODES, "sentence"
+    )
+    subtitle_animation: SubtitleAnimation = _get_valid_ui_choice(
+        "subtitle_animation", _SUBTITLE_ANIMATIONS, "none"
+    )
     font_name: Optional[str] = "STHeitiMedium.ttc"
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = False
@@ -210,12 +256,6 @@ class VideoSocialMetadataParams:
     platform: Optional[str] = Field(default="tiktok", max_length=64)
 
 
-class BaseResponse(BaseModel):
-    status: int = 200
-    message: Optional[str] = "success"
-    data: Any = None
-
-
 class TaskVideoRequest(VideoParams, BaseModel):
     idempotency_key: Optional[str] = Field(
         default=None,
@@ -242,24 +282,18 @@ class VideoSocialMetadataRequest(VideoSocialMetadataParams, BaseModel):
     pass
 
 
-######################################################################################################
-######################################################################################################
-######################################################################################################
-######################################################################################################
-class TaskResponse(BaseResponse):
-    class TaskResponseData(BaseModel):
-        task_id: str
+# ---------------------------
+# ----- RESPONSE MODELS -----
+# ---------------------------
+class BaseResponse(BaseModel):
+    status: int = 200
+    message: Optional[str] = "success"
+    data: Any = None
 
-    data: TaskResponseData
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "status": 200,
-                "message": "success",
-                "data": {"task_id": "6c85c8cc-a77a-42b9-bc30-947815aa0558"},
-            },
-        }
+# ---- DATA MODELS ----
+class TaskResponseData(BaseModel):
+    task_id: str
 
 
 class TaskStatusData(BaseModel):
@@ -288,6 +322,59 @@ class TaskListData(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class VideoScriptData(BaseModel):
+    video_script: str
+
+
+class VideoTermsData(BaseModel):
+    video_terms: List[str]
+
+
+class VideoSocialMetadataData(BaseModel):
+    title: str
+    caption: str
+    hashtags: List[str]
+
+
+class FileData(BaseModel):
+    name: str
+    size: int
+    file: str
+
+
+class BgmRetrieveData(BaseModel):
+    files: List[FileData]
+
+
+class BgmUploadData(BaseModel):
+    file: str
+
+
+class VideoMaterialRetrieveData(BaseModel):
+    files: List[FileData]
+
+
+class VideoMaterialUploadData(BaseModel):
+    file: str
+
+
+# ---- RESPONSE MODELS ----
+class TaskResponse(BaseResponse):
+    data: TaskResponseData
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "status": 200,
+                "message": "success",
+                "data": {
+                    "task_id": "6c85c8cc-a77a-42b9-bc30-947815aa0558",
+                },
+            },
+        }
+    )
 
 
 class TaskQueryResponse(BaseResponse):
@@ -359,28 +446,24 @@ class TaskListResponse(BaseResponse):
 
 
 class TaskDeletionResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    data: None = None
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
-                "data": {
-                    "state": 1,
-                    "progress": 100,
-                    "videos": [
-                        "http://127.0.0.1:8080/tasks/6c85c8cc-a77a-42b9-bc30-947815aa0558/final-1.mp4"
-                    ],
-                    "combined_videos": [
-                        "http://127.0.0.1:8080/tasks/6c85c8cc-a77a-42b9-bc30-947815aa0558/combined-1.mp4"
-                    ],
-                },
+                "data": None,
             },
         }
+    )
 
 
 class VideoScriptResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    data: VideoScriptData
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
@@ -389,22 +472,28 @@ class VideoScriptResponse(BaseResponse):
                 },
             },
         }
+    )
 
 
 class VideoTermsResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    data: VideoTermsData
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
                 "data": {"video_terms": ["sky", "tree"]},
             },
         }
+    )
 
 
 class VideoSocialMetadataResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    data: VideoSocialMetadataData
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
@@ -415,11 +504,14 @@ class VideoSocialMetadataResponse(BaseResponse):
                 },
             },
         }
+    )
 
 
 class BgmRetrieveResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    data: BgmRetrieveData
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
@@ -434,21 +526,28 @@ class BgmRetrieveResponse(BaseResponse):
                 },
             },
         }
+    )
 
 
 class BgmUploadResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    data: BgmUploadData
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
                 "data": {"file": "4fca18fce7344f3aa824777a40d45c8c.mp3"},
             },
         }
+    )
+
 
 class VideoMaterialRetrieveResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    data: VideoMaterialRetrieveData
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
@@ -463,10 +562,14 @@ class VideoMaterialRetrieveResponse(BaseResponse):
                 },
             },
         }
+    )
+
 
 class VideoMaterialUploadResponse(BaseResponse):
-    class Config:
-        json_schema_extra = {
+    data: VideoMaterialUploadData
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": 200,
                 "message": "success",
@@ -475,3 +578,4 @@ class VideoMaterialUploadResponse(BaseResponse):
                 },
             },
         }
+    )

@@ -113,3 +113,4 @@ jobs:
           test/services/test_controller_video.py
           test/services/test_idempotency.py
           test/services/test_idempotent_submission.py
+          test/services/test_webui_task.py
