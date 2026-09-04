@@ -68,6 +68,33 @@ class TestVoiceService(unittest.TestCase):
             all(v.startswith(("zh-CN", "en-US")) for v in filtered)
         )
 
+    def test_get_gemini_voices_matches_documented_catalog(self):
+        voices = vs.get_gemini_voices()
+
+        self.assertEqual(len(voices), 30)
+        self.assertEqual(
+            [name for name, _style in vs.GEMINI_TTS_VOICES],
+            [
+                "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda",
+                "Orus", "Aoede", "Callirrhoe", "Autonoe", "Enceladus",
+                "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome",
+                "Algenib", "Rasalgethi", "Laomedeia", "Achernar", "Alnilam",
+                "Schedar", "Gacrux", "Pulcherrima", "Achird",
+                "Zubenelgenubi", "Vindemiatrix", "Sadachbia", "Sadaltager",
+                "Sulafat",
+            ],
+        )
+        self.assertIn("gemini:Achernar-Soft", voices)
+        self.assertIn("gemini:Sulafat-Warm", voices)
+        self.assertFalse(any("Atlas" in voice for voice in voices))
+
+    def test_parse_gemini_voice_name_supports_new_and_legacy_labels(self):
+        self.assertEqual(
+            vs.parse_gemini_voice_name("gemini:Achernar-Soft"), "Achernar"
+        )
+        self.assertEqual(vs.parse_gemini_voice_name("gemini:Charon-Male"), "Charon")
+        self.assertEqual(vs.parse_gemini_voice_name("Charon-Male"), "")
+
     def test_no_voice_tts_generates_silent_audio_and_subtitle_timeline(self):
         """
         无配音模式不调用任何外部 TTS provider，只生成静音音频作为时间轴占位。
@@ -398,6 +425,28 @@ class TestVoiceService(unittest.TestCase):
             voice_rate=1.8,
         )
 
+    def test_tts_strips_gemini_style_metadata_before_dispatch(self):
+        """Gemini 下拉框的官方风格描述不能成为 API voice_name 的一部分。"""
+        sentinel = object()
+
+        with patch.object(vs, "gemini_tts", return_value=sentinel) as gemini_tts:
+            result = vs.tts(
+                text="Test the updated voice catalog.",
+                voice_name="gemini:Achernar-Soft",
+                voice_rate=1.0,
+                voice_file="/tmp/gemini-achernar.mp3",
+                voice_volume=1.0,
+            )
+
+        self.assertIs(result, sentinel)
+        gemini_tts.assert_called_once_with(
+            "Test the updated voice catalog.",
+            "Achernar",
+            1.0,
+            "/tmp/gemini-achernar.mp3",
+            1.0,
+        )
+
     def test_gemini_tts_uses_google_genai_and_compatible_submaker_fields(self):
         """
         验证 Gemini TTS 在 edge_tts 7.x 环境下仍会返回项目兼容的字幕结构，
@@ -707,6 +756,202 @@ class TestVoiceService(unittest.TestCase):
         self.assertIsNotNone(sub_maker)
         self.assertTrue(getattr(sub_maker, "subs", []))
 
+    def test_minimax_tts_uses_regional_endpoint_and_hex_audio(self):
+        class _Response:
+            status_code, text = 200, ""
+
+            @staticmethod
+            def json():
+                return {"data": {"audio": b"audio".hex(), "status": 2}, "base_resp": {"status_code": 0}}
+
+        class _Clip:
+            duration = 2.5
+
+            def close(self):
+                pass
+
+        captured = {}
+
+        def _post(url, json=None, headers=None, timeout=None):
+            captured.update(url=url, json=json, headers=headers, timeout=timeout)
+            return _Response()
+
+        settings = {
+            "api_key": "test-key", "base_url": vs.MINIMAX_TTS_CN_URL,
+            "model_id": "speech-2.8-turbo", "voice_id": "male-qn-qingse",
+            "sample_rate": 32000, "bitrate": 128000, "audio_format": "mp3", "channel": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.config, "minimax_tts", settings
+        ), patch.object(vs.requests, "post", side_effect=_post), patch.object(
+            vs, "AudioFileClip", return_value=_Clip()
+        ):
+            voice_file = str(Path(tmp_dir) / "minimax.mp3")
+            result = vs.minimax_tts("Speech test.", "male-qn-qingse", 1.2, voice_file, 1.5)
+            self.assertEqual(Path(voice_file).read_bytes(), b"audio")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(captured["url"], "https://api.minimaxi.com/v1/t2a_v2")
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer test-key")
+        self.assertEqual(captured["json"]["model"], "speech-2.8-turbo")
+        self.assertEqual(captured["json"]["text"], "Speech test.")
+        self.assertEqual(captured["json"]["voice_setting"]["voice_id"], "male-qn-qingse")
+        self.assertEqual(captured["json"]["audio_setting"]["format"], "mp3")
+
+    def test_minimax_tts_reuses_cn_llm_key_and_endpoint(self):
+        """TTS 未单独配置时，应复用同区域的 MiniMax LLM 凭证和地址。"""
+        class _Response:
+            status_code, text = 200, ""
+
+            @staticmethod
+            def json():
+                return {"data": {"audio": b"audio".hex(), "status": 2}, "base_resp": {"status_code": 0}}
+
+        class _Clip:
+            duration = 1.25
+
+            def close(self):
+                pass
+
+        captured = {}
+
+        def _post(url, json=None, headers=None, timeout=None):
+            captured.update(url=url, headers=headers)
+            return _Response()
+
+        settings = {
+            "api_key": "", "base_url": vs.MINIMAX_TTS_GLOBAL_URL,
+            "model_id": vs.MINIMAX_TTS_DEFAULT_MODEL, "audio_format": "mp3",
+        }
+        app_settings = {
+            "minimax_api_key": "shared-cn-key",
+            "minimax_base_url": "https://api.minimaxi.com/v1",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.config, "minimax_tts", settings
+        ), patch.object(vs.config, "app", app_settings), patch.object(
+            vs.requests, "post", side_effect=_post
+        ), patch.object(vs, "AudioFileClip", return_value=_Clip()):
+            voice_file = str(Path(tmp_dir) / "minimax.mp3")
+            result = vs.minimax_tts("测试。", "male-qn-qingse", 1.0, voice_file)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(captured["url"], vs.MINIMAX_TTS_CN_URL)
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer shared-cn-key")
+
+    def test_get_minimax_voice_catalog_normalizes_all_voice_types(self):
+        """音色查询应统一不同来源的响应结构，并忽略重复或空 Voice ID。"""
+
+        class _Response:
+            status_code, text = 200, ""
+
+            @staticmethod
+            def json():
+                return {
+                    "system_voice": [
+                        {"voice_id": "system-1", "voice_name": "系统音色"},
+                        {"voice_id": "", "voice_name": "无效音色"},
+                    ],
+                    "voice_cloning": [
+                        {"voice_id": "clone-1", "voice_name": "我的克隆音色"},
+                        {"voice_id": "system-1", "voice_name": "重复音色"},
+                    ],
+                    "voice_generation": [{"voice_id": "generated-1"}],
+                    "base_resp": {"status_code": "0"},
+                }
+
+        with patch.object(vs.requests, "post", return_value=_Response()) as post:
+            catalog = vs.get_minimax_voice_catalog(
+                api_key="test-key",
+                endpoint=vs.MINIMAX_TTS_CN_URL,
+            )
+
+        post.assert_called_once_with(
+            "https://api.minimaxi.com/v1/get_voice",
+            json={"voice_type": "all"},
+            headers={
+                "Authorization": "Bearer test-key",
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+        self.assertEqual(
+            catalog,
+            [
+                {
+                    "voice_id": "system-1",
+                    "voice_name": "系统音色",
+                    "voice_type": "system",
+                },
+                {
+                    "voice_id": "clone-1",
+                    "voice_name": "我的克隆音色",
+                    "voice_type": "voice_cloning",
+                },
+                {
+                    "voice_id": "generated-1",
+                    "voice_name": "generated-1",
+                    "voice_type": "voice_generation",
+                },
+            ],
+        )
+
+    def test_get_minimax_voice_catalog_exposes_provider_error(self):
+        """远端业务错误应明确抛出，不能被伪装成账号没有可用音色。"""
+
+        class _Response:
+            status_code, text = 200, ""
+
+            @staticmethod
+            def json():
+                return {
+                    "base_resp": {
+                        "status_code": 1004,
+                        "status_msg": "invalid api key",
+                    }
+                }
+
+        with patch.object(vs.requests, "post", return_value=_Response()):
+            with self.assertRaisesRegex(RuntimeError, "invalid api key"):
+                vs.get_minimax_voice_catalog(api_key="invalid-key")
+
+    def test_minimax_tts_does_not_leave_invalid_audio_output(self):
+        """响应音频无法解析时，不应覆盖已有文件或留下临时文件。"""
+        class _Response:
+            status_code, text = 200, ""
+
+            @staticmethod
+            def json():
+                return {"data": {"audio": b"invalid-audio".hex(), "status": 2}, "base_resp": {"status_code": 0}}
+
+        settings = {
+            "api_key": "test-key", "base_url": vs.MINIMAX_TTS_GLOBAL_URL,
+            "model_id": vs.MINIMAX_TTS_DEFAULT_MODEL, "audio_format": "mp3",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.config, "minimax_tts", settings
+        ), patch.object(vs.requests, "post", return_value=_Response()), patch.object(
+            vs, "AudioFileClip", side_effect=OSError("invalid audio")
+        ):
+            voice_path = Path(tmp_dir) / "minimax.mp3"
+            voice_path.write_bytes(b"existing-audio")
+            result = vs.minimax_tts("Speech test.", "English_expressive_narrator", 1.0, str(voice_path))
+
+            self.assertIsNone(result)
+            self.assertEqual(voice_path.read_bytes(), b"existing-audio")
+            self.assertEqual([path.name for path in Path(tmp_dir).iterdir()], ["minimax.mp3"])
+
+    def test_minimax_voice_helpers_and_dispatch(self):
+        with patch.object(vs.config, "minimax_tts", {"voice_id": "narrator"}):
+            self.assertEqual(vs.get_minimax_voices(), ["minimax:narrator"])
+        self.assertEqual(vs.get_minimax_voices("custom-voice"), ["minimax:custom-voice"])
+        self.assertTrue(vs.is_minimax_voice("minimax:narrator"))
+        sentinel = object()
+        with patch.object(vs, "minimax_tts", return_value=sentinel) as implementation:
+            result = vs.tts("test", "minimax:narrator", 1.0, "voice.mp3", 1.0)
+        self.assertIs(result, sentinel)
+        implementation.assert_called_once_with("test", "narrator", 1.0, "voice.mp3", 1.0)
+
     def test_chatterbox_voice_helpers(self):
         """is_chatterbox_voice / get_chatterbox_voices basics and normalisation."""
         self.assertTrue(vs.is_chatterbox_voice("chatterbox:default-Female"))
@@ -827,6 +1072,109 @@ class TestVoiceService(unittest.TestCase):
             )
         self.assertIsNone(result)
         self.assertEqual(post.call_count, 3)
+
+    def _make_broken_clip_class(self, close_calls: list):
+        """Return a clip class whose .duration raises and whose .close() records calls."""
+
+        class _BrokenClip:
+            @property
+            def duration(self):
+                raise RuntimeError("FFmpeg probe failed")
+
+            def close(self):
+                close_calls.append(True)
+
+        return _BrokenClip
+
+    def test_elevenlabs_tts_audio_clip_closed_on_duration_error(self):
+        """AudioFileClip.close() must be called even when reading .duration raises."""
+        close_calls: list = []
+        BrokenClip = self._make_broken_clip_class(close_calls)
+
+        class _OkResponse:
+            status_code = 200
+            content = b"fake-mp3"
+            text = ""
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            out = f.name
+        try:
+            with (
+                patch.object(
+                    vs.config,
+                    "elevenlabs",
+                    {"api_key": "test-key", "model_id": "eleven_multilingual_v2"},
+                ),
+                patch.object(vs.requests, "post", return_value=_OkResponse()),
+                patch.object(vs, "AudioFileClip", side_effect=lambda _: BrokenClip()),
+            ):
+                result = vs.elevenlabs_tts("Hello world.", "voice-id", out)
+        finally:
+            if os.path.exists(out):
+                os.remove(out)
+
+        self.assertIsNone(result)
+        self.assertTrue(close_calls, "AudioFileClip.close() was never called")
+
+    def test_chatterbox_tts_audio_clip_closed_on_duration_error(self):
+        """AudioFileClip.close() must be called even when reading .duration raises."""
+        close_calls: list = []
+        BrokenClip = self._make_broken_clip_class(close_calls)
+
+        class _OkResponse:
+            status_code = 200
+            content = b"fake-mp3"
+            text = ""
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            out = f.name
+        try:
+            with (
+                patch.object(
+                    vs.config,
+                    "chatterbox",
+                    {"base_url": "http://localhost:4123", "api_key": "", "model_id": "chatterbox"},
+                ),
+                patch.object(vs.requests, "post", return_value=_OkResponse()),
+                patch.object(vs, "AudioFileClip", side_effect=lambda _: BrokenClip()),
+            ):
+                result = vs.chatterbox_tts("Hello world.", "default", out)
+        finally:
+            if os.path.exists(out):
+                os.remove(out)
+
+        self.assertIsNone(result)
+        self.assertTrue(close_calls, "AudioFileClip.close() was never called")
+
+    def test_fish_audio_tts_audio_clip_closed_on_duration_error(self):
+        """AudioFileClip.close() must be called even when reading .duration raises."""
+        close_calls: list = []
+        BrokenClip = self._make_broken_clip_class(close_calls)
+
+        class _OkResponse:
+            status_code = 200
+            content = b"x" * 200
+            text = ""
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            out = f.name
+        try:
+            with (
+                patch.object(
+                    vs.config,
+                    "fish_audio",
+                    {"api_key": "test-key", "model": "s2.1-pro-free"},
+                ),
+                patch.object(vs.requests, "post", return_value=_OkResponse()),
+                patch.object(vs, "AudioFileClip", side_effect=lambda _: BrokenClip()),
+            ):
+                result = vs.fish_audio_tts("Hello world.", out)
+        finally:
+            if os.path.exists(out):
+                os.remove(out)
+
+        self.assertIsNone(result)
+        self.assertTrue(close_calls, "AudioFileClip.close() was never called")
 
     def test_generate_subtitle_keeps_edge_provider_for_gemini_legacy_submaker(self):
         """
@@ -1017,6 +1365,66 @@ class TestVoiceService(unittest.TestCase):
         self.assertNotIn("---", subtitle_content)
         self.assertNotIn("00:00:00,000 --> 00:00:00,000", subtitle_content)
 
+    def test_create_subtitle_word_level_preserves_edge_cue_timing(self):
+        """Edge TTS 的细粒度 cue 应逐项写入，不能再被按标点聚合。"""
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="人工智能",
+                    start=timedelta(seconds=0.1),
+                    end=timedelta(seconds=0.8),
+                ),
+                SimpleNamespace(
+                    content="正在",
+                    start=timedelta(seconds=0.9),
+                    end=timedelta(seconds=1.2),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "word-level.srt"
+            vs.create_subtitle(
+                sub_maker=sub_maker,
+                text="人工智能正在发展。",
+                subtitle_file=str(subtitle_file),
+                word_level=True,
+            )
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertIn("00:00:00,100 --> 00:00:00,800", subtitle_content)
+        self.assertIn("人工智能", subtitle_content)
+        self.assertIn("00:00:00,900 --> 00:00:01,200", subtitle_content)
+        self.assertIn("正在", subtitle_content)
+
+    def test_create_subtitle_word_level_falls_back_to_provider_granularity(self):
+        """
+        旧版 SubMaker 没有 cue 时，应保留语音服务返回的原始时间粒度。
+
+        ElevenLabs、Fish Audio 等服务可能只返回短语或整句时间轴。此时不能
+        按字符平均拆分并伪造逐词精度，否则字幕会逐渐偏离真实语音。
+        """
+        sub_maker = SimpleNamespace(
+            cues=[],
+            subs=["Hello world"],
+            # 旧版 SubMaker 的 offset 使用 100 纳秒为单位的整数时间戳。
+            offset=[(2_000_000, 11_000_000)],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "word-level-fallback.srt"
+            vs.create_subtitle(
+                sub_maker=sub_maker,
+                text="Hello world",
+                subtitle_file=str(subtitle_file),
+                word_level=True,
+            )
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertEqual(subtitle_content.count(" --> "), 1)
+        self.assertIn("00:00:00,200 --> 00:00:01,100", subtitle_content)
+        self.assertIn("Hello world", subtitle_content)
+
     def test_create_subtitle_ignores_markdown_underscore_marks(self):
         """
         `_` 常被用户用作 Markdown 强调标记，但 TTS 返回的 cue 通常不包含
@@ -1193,7 +1601,57 @@ class TestElevenLabsVoice(unittest.TestCase):
                     )
 
 
+    def test_siliconflow_subtitle_spans_full_audio_duration(self):
+        """Last subtitle entry must end at the actual audio end, not truncated early.
+
+        The old ad-hoc loop applied integer division independently to every
+        sentence, so accumulated truncation meant the final subtitle always
+        ended a few units before the real audio end. Every other TTS provider
+        already delegates to populate_legacy_submaker_with_full_text, which
+        anchors the last entry to the full duration; this test verifies
+        siliconflow_tts now does the same.
+        """
+        audio_duration_seconds = 7.3
+        expected_end_100ns = int(audio_duration_seconds * 10_000_000)
+
+        fake_response = SimpleNamespace(status_code=200, content=b"fake-mp3")
+        fake_clip = SimpleNamespace(
+            duration=audio_duration_seconds, close=lambda: None
+        )
+
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            patch.object(vs.requests, "post", return_value=fake_response),
+            patch.object(vs, "AudioFileClip", return_value=fake_clip),
+            patch.object(vs.config, "siliconflow", {"api_key": "test-key"}),
+        ):
+            voice_file = str(Path(tmp_dir) / "test.mp3")
+            sub_maker = vs.siliconflow_tts(
+                text=(
+                    "First sentence. Second sentence. "
+                    "Third sentence. Fourth sentence."
+                ),
+                model="FunAudioLLM/CosyVoice2-0.5B",
+                voice="FunAudioLLM/CosyVoice2-0.5B:alex",
+                voice_rate=1.0,
+                voice_file=voice_file,
+            )
+
+        self.assertIsNotNone(sub_maker)
+        offsets = getattr(sub_maker, "offset", [])
+        self.assertGreater(
+            len(offsets), 1, "multi-sentence text must produce multiple subtitles"
+        )
+        last_end = offsets[-1][1]
+        self.assertEqual(
+            last_end,
+            expected_end_100ns,
+            f"last subtitle end ({last_end}) must equal the full audio duration "
+            f"({expected_end_100ns} units = {audio_duration_seconds}s)",
+        )
+
+
 if __name__ == "__main__":
     # python -m unittest test.services.test_voice.TestVoiceService.test_azure_tts_v1
     # python -m unittest test.services.test_voice.TestVoiceService.test_azure_tts_v2
-    unittest.main() 
+    unittest.main()
