@@ -1704,6 +1704,36 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(result["failed_stage"], "audio")
         self.assertIn("segment 1", result["error"])
 
+    def test_segment_first_fails_early_when_no_english_search_terms(self):
+        """LLM 提炼失败且旁白/主题词均为中文时，任务必须在 terms 阶段提前失败，
+        而不是白跑 TTS 后以误导性的 materials 报错终止（UAT 任务 2ad59248）。"""
+        params = VideoParams(
+            video_subject="黑洞",
+            video_script="宇宙中存在着一种天体，它的引力强大到连光都无法逃脱，这就是黑洞。",
+        )
+        state = MemoryState()
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(tm, "segment_pipeline_enabled", return_value=True),
+            patch.object(tm.segmenter, "segment_script") as segment_script,
+            patch.object(
+                tm.segment_terms, "extract_terms_for_segments", return_value={}
+            ),
+            patch.object(tm, "save_script_data"),
+            patch.object(
+                tm.segment_material, "prepare_segment_materials"
+            ) as prepare_materials,
+        ):
+            segment_script.return_value = [
+                SimpleNamespace(index=0, text="宇宙中存在着一种天体。", estimated_duration=1.0),
+            ]
+            result = tm.start("no-english-terms", params)
+
+        prepare_materials.assert_not_called()
+        self.assertEqual(result["failed_stage"], "terms")
+        self.assertIn("英文搜索词", result["error"])
+
     @unittest.skipUnless(
         RUN_INTEGRATION_TESTS,
         "MPT_RUN_INTEGRATION_TESTS not set",

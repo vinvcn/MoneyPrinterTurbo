@@ -1164,6 +1164,28 @@ def _run_segment_first_pipeline(
         segments=segment_records,
     )
 
+    # 早期失败守卫：LLM 词条提炼失败且旁白/主题词均为中文时，全部搜索词会被
+    # CJK 过滤清空，素材层零搜索、任务白跑 TTS 后才以误导性的 materials 报错
+    # 终止。无任何可用英文搜索来源时提前在 terms 阶段失败（对齐经典路径）。
+    english_subject = segment_material.english_search_term(str(params.video_subject or ""))
+    has_usable_search_source = english_subject or any(
+        segment_material.english_search_term(candidate)
+        for record in segment_records
+        for candidate in (
+            *(record.get("search_terms") or []),
+            str(record.get("search_term") or ""),
+            str(record.get("text") or ""),
+        )
+    )
+    if not has_usable_search_source:
+        return _mark_task_failed(
+            task_id,
+            "terms",
+            "无可用英文搜索词：LLM 词条提炼失败或为空，且旁白文本与主题词均为中文"
+            "（CJK 无法直接用于英文素材搜索）。请检查 LLM provider 配置与余额，"
+            "或提供英文视频主题词/脚本。",
+        )
+
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=15)
 
     # 1. Per-segment TTS + merged narration track

@@ -67,6 +67,16 @@ def _english_search_term(term: str) -> str:
     return candidate
 
 
+def english_search_term(term: str) -> str:
+    """
+    `_english_search_term` 的公开包装。
+
+    供任务编排层（task.py 的早期失败守卫）复用同一条 CJK 过滤规则，
+    避免跨模块引用私有实现或在两处重复正则逻辑。
+    """
+    return _english_search_term(term)
+
+
 @dataclass
 class SegmentMaterials:
     """Structured material result for one narration segment."""
