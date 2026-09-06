@@ -1140,14 +1140,21 @@ def _run_segment_first_pipeline(
         f"segmented script: task_id={task_id}, segments={len(segment_records)}"
     )
 
-    # 用 LLM 把每段文本提炼成 1-3 词的英文搜索词（generate_terms 的同构提示词）。
+    # 用 LLM 把每段文本提炼成最多 3 个英文搜索词（generate_terms 的同构提示词）：
+    # 主词在前、备用词在后，主词搜索失败时素材层用备用词重试。
     # 提炼失败的分段不出现在映射里，prepare_segment_materials 会回退用原文搜索。
     segment_term_map = segment_terms.extract_terms_for_segments(
         segment_records,
         video_subject=params.video_subject,
     )
     for record in segment_records:
-        record["search_term"] = segment_term_map.get(record["index"], "")
+        terms = segment_term_map.get(record["index"])
+        if terms:
+            # search_terms 供素材层按序重试；search_term 保留主词，兼容旧消费方。
+            record["search_terms"] = terms
+            record["search_term"] = terms[0]
+        else:
+            record["search_term"] = ""
 
     save_script_data(
         task_id,

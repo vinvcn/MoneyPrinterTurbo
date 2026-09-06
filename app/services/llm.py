@@ -389,6 +389,17 @@ def _generate_response(prompt: str, app_config=None) -> str:
         return f"Error: {_sanitize_error_message(e)}"
 
 
+def generate_response(prompt: str) -> str:
+    """
+    向当前配置的 LLM Provider 发送一次性提示词并返回原始文本。
+
+    这是 `_generate_response()` 的公开入口，供不进入脚本/关键词生成
+    重试逻辑的调用方（如逐段搜索词提炼）使用；错误语义不变——失败时
+    返回以 "Error: " 开头的字符串，由调用方自行决定重试策略。
+    """
+    return _generate_response(prompt)
+
+
 def test_connection() -> tuple[bool, str, float]:
     """
     使用当前 Provider 配置发起一次最小请求，验证实际生成链路是否可用。

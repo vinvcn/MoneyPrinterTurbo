@@ -336,7 +336,12 @@ def concat_video_clips_with_ffmpeg(
     output_dir: str,
     max_duration: float | None = None,
 ):
-    concat_list_file = os.path.join(output_dir, "ffmpeg-concat-list.txt")
+    output_stem = os.path.splitext(os.path.basename(output_file))[0]
+    # concat 列表按成片命名并保留在任务目录中，作为时间线拼装顺序的审计记录；
+    # 与临时片段一样不再清理，任务删除时随任务目录一起回收。
+    concat_list_file = os.path.join(
+        output_dir, f"ffmpeg-concat-list-{output_stem}.txt"
+    )
     with open(concat_list_file, "w", encoding="utf-8") as fp:
         for clip_file in clip_files:
             fp.write(f"file '{_format_ffmpeg_concat_path(clip_file)}'\n")
@@ -378,18 +383,16 @@ def concat_video_clips_with_ffmpeg(
             raise RuntimeError(error_message or "ffmpeg concat failed")
         return codec
 
+    # concat 列表文件按成片命名保留，作为时间线拼装顺序的审计记录，不再清理。
+    effective_codec = _get_effective_video_codec()
     try:
-        effective_codec = _get_effective_video_codec()
-        try:
-            return run_concat(effective_codec)
-        except Exception as exc:
-            if effective_codec == _DEFAULT_VIDEO_CODEC:
-                raise
-            result_codec = run_concat(_DEFAULT_VIDEO_CODEC)
-            _disable_runtime_video_codec(effective_codec, str(exc))
-            return result_codec
-    finally:
-        delete_files(concat_list_file)
+        return run_concat(effective_codec)
+    except Exception as exc:
+        if effective_codec == _DEFAULT_VIDEO_CODEC:
+            raise
+        result_codec = run_concat(_DEFAULT_VIDEO_CODEC)
+        _disable_runtime_video_codec(effective_codec, str(exc))
+        return result_codec
 
 
 def _sanitize_image_file(image_path: str) -> str:
@@ -546,6 +549,8 @@ def combine_videos(
     threads: int = 2,
     clip_speed: float = 1.0,
     segments: List[dict] | None = None,
+    advance_clip_window: bool = True,
+    dedupe_clips_across_segments: bool = True,
 ) -> str:
     if segments:
         return _combine_videos_segment_first(
@@ -557,6 +562,8 @@ def combine_videos(
             max_clip_duration=max_clip_duration,
             threads=threads,
             clip_speed=clip_speed,
+            advance_clip_window=advance_clip_window,
+            dedupe_clips_across_segments=dedupe_clips_across_segments,
         )
 
     audio_clip = AudioFileClip(audio_file)
@@ -727,8 +734,9 @@ def combine_videos(
         max_duration=audio_duration,
     )
 
-    # clean temp files
-    delete_files(clip_files)
+    # 临时片段（temp-clip-*.mp4）保留在任务目录中供审计时间线来源，不再清理；
+    # 任务删除时随任务目录一起回收。
+    logger.info(f"preserved {len(clip_files)} intermediate clip files for audit")
 
     logger.info("video combining completed")
     return combined_video_path
@@ -811,6 +819,8 @@ def _combine_videos_segment_first(
     max_clip_duration: int = 5,
     threads: int = 2,
     clip_speed: float = 1.0,
+    advance_clip_window: bool = True,
+    dedupe_clips_across_segments: bool = True,
 ) -> str:
     """
     按 segment 顺序拼接已对齐的素材片段（segment-first 路径）。
@@ -819,6 +829,14 @@ def _combine_videos_segment_first(
     每个片段来源都由任务编排层按 segment 搜索得到，因此拼接结果天然与
     旁白对齐。单个 segment 缺少素材时跳过（音频仍连续），整段缺失素材
     时仅记录警告，最终成片时长由旁白音频决定。
+
+    advance_clip_window（默认开启）：同一源视频被同一 segment 的轮播再次
+    选中时，截取窗口按 max_clip_duration 依次后移（0-3s、3-6s…），而不是
+    每次都取前 3 秒，消除同源内容的重复画面。
+
+    dedupe_clips_across_segments（默认开启）：segment 之间共享一个"本任务已
+    使用"的源视频集合，各 segment 优先选用未出现过的候选，候选全部用过
+    时才回退复用，避免热门素材在相邻 segment 反复出现。
     """
     audio_clip = AudioFileClip(audio_file)
     try:
@@ -834,6 +852,9 @@ def _combine_videos_segment_first(
     normalized_clip_speed = utils.normalize_clip_speed(clip_speed)
     if normalized_clip_speed != 1.0:
         logger.info(f"clip playback speed: {normalized_clip_speed:.2f}x")
+    # 与旧流程一致：窗口后移时按播放速度反推源时长，保证不同速度下
+    # 源时间线连续且无重叠。
+    source_clip_duration = max_clip_duration * normalized_clip_speed
 
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
@@ -841,9 +862,22 @@ def _combine_videos_segment_first(
 
     processed_clips: List[SubClippedVideoClip] = []
     clip_sequence = 0
+    # 跨 segment 去重：记录本任务已上过时间线的源视频路径。每个 segment
+    # 优先从"未用过"的候选中轮播；候选全部用过时才回退到复用。热门素材
+    # 常被相邻 segment 的搜索同时返回，不去重会让同一段画面反复出现。
+    used_clip_paths: set[str] = set()
     for segment in segments:
         segment_index = segment.get("index")
-        clip_paths = segment.get("clips") or []
+        clip_paths = list(segment.get("clips") or [])
+        if dedupe_clips_across_segments:
+            fresh = [p for p in clip_paths if p not in used_clip_paths]
+            reused = [p for p in clip_paths if p in used_clip_paths]
+            if fresh and reused:
+                logger.info(
+                    f"segment {segment_index}: deferring {len(reused)} already-used "
+                    f"clip(s) behind {len(fresh)} unused one(s)"
+                )
+            clip_paths = fresh + reused
         if not clip_paths:
             # 时间线对齐要求每段的画面时长覆盖该段旁白时长。没有素材时用
             # 黑屏占位而不是跳过，否则后续片段整体前移，旁白与画面对不上。
@@ -877,6 +911,9 @@ def _combine_videos_segment_first(
 
         # 每个片段最多占用 max_clip_duration 秒；同一个 segment 的多个
         # clip 依次轮播覆盖其旁白时长，保持视觉多样性且顺序确定。
+        # advance_clip_window 开启时，同一源视频再次被轮询选中，截取窗口
+        # 从上次结束处继续（0-3s、3-6s…），到结尾后回绕到 0；关闭时始终
+        # 取前 max_clip_duration 秒。
         segment_duration = float(segment.get("duration") or 0)
         segment_remaining = (
             segment_duration
@@ -884,10 +921,25 @@ def _combine_videos_segment_first(
             else max_clip_duration
         )
         clip_cycle = itertools.cycle(clip_paths)
+        # 每个源视频已消耗的窗口偏移（秒），用于窗口后移。
+        window_offset: dict[str, float] = {}
         while segment_remaining > 0:
             video_path = next(clip_cycle)
+            start_offset = (
+                window_offset.get(video_path, 0.0) if advance_clip_window else 0.0
+            )
             try:
                 clip = _open_video_clip_quietly(video_path)
+                source_duration = clip.duration
+                if advance_clip_window and source_duration > 0:
+                    # 窗口后移：跳过已用前缀；超出源时长时回绕到 0，保证
+                    # 短素材也能持续产出完整窗口。
+                    if start_offset >= source_duration:
+                        start_offset = 0.0
+                    clip = clip.subclipped(
+                        start_offset,
+                        min(start_offset + source_clip_duration, source_duration),
+                    )
                 if normalized_clip_speed != 1.0:
                     clip = clip.with_speed_scaled(normalized_clip_speed)
                 clip = _normalize_segment_clip(
@@ -897,6 +949,13 @@ def _combine_videos_segment_first(
                     min(max_clip_duration, max(clip.duration, 0.1)),
                     transition_value,
                 )
+                if advance_clip_window and source_duration > 0:
+                    # 记录下一窗口起点：窗口消耗到结尾则回绕到 0（由下次
+                    # 读取时的 >= source_duration 分支处理），否则顺延。
+                    next_offset = start_offset + clip.duration
+                    window_offset[video_path] = (
+                        0.0 if next_offset >= source_duration else next_offset
+                    )
             except Exception as exc:
                 logger.error(
                     "failed to process segment clip: "
@@ -926,6 +985,8 @@ def _combine_videos_segment_first(
                     source_file_path=video_path,
                 )
             )
+            if dedupe_clips_across_segments:
+                used_clip_paths.add(video_path)
             clip_sequence += 1
             segment_remaining -= clip_duration_saved
 
@@ -944,7 +1005,9 @@ def _combine_videos_segment_first(
         max_duration=audio_duration,
     )
 
-    delete_files(clip_files)
+    # 临时片段（temp-clip-*.mp4）保留在任务目录中供审计每段画面的实际拼装
+    # 顺序与来源，不再清理；任务删除时随任务目录一起回收。
+    logger.info(f"preserved {len(clip_files)} intermediate segment clip files for audit")
     logger.info("segment-first video combining completed")
     return combined_video_path
 
