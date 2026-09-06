@@ -151,7 +151,7 @@ class TestPaginationAwareSearch(unittest.TestCase):
 
 
 class TestFilterWiring(unittest.TestCase):
-    def _run(self, segments, search_results, verdict_fn, subject="money"):
+    def _run(self, segments, search_results, verdict_fn, subject="money", generate_image=None):
         searched_terms = []
 
         def fake_search(search_term, minimum_duration, video_aspect, page=1):
@@ -169,6 +169,7 @@ class TestFilterWiring(unittest.TestCase):
             video_aspect=VideoAspect.portrait,
             save_dir="/materials",
             judge_candidate=verdict_fn,
+            generate_image=generate_image,
         )
         return results, searched_terms
 
@@ -615,9 +616,9 @@ class TestFilterWiring(unittest.TestCase):
             [("term-one", True), ("term-two", True)],
         )
 
-    def test_partial_fill_uses_subject_after_own_terms(self):
-        """名额补足（修 5）：自有词条全部用尽仍不足时，由 subject 层补齐
-        剩余名额；fallback_level 仍记录首个贡献层。"""
+    def test_partial_fill_does_not_generate_image(self):
+        """图片兜底仅在自有词条产出 0 clip 时触发（G1 决策）：部分命中的
+        段保持视频短缺（装配器拉伸/裁切），不生成图片、不回调。"""
         def fake_search(search_term, minimum_duration, video_aspect, page=1):
             if page != 1:
                 return []
@@ -632,11 +633,6 @@ class TestFilterWiring(unittest.TestCase):
                     _video_item("https://v.example/bad3.mp4", "term-two"),
                     _video_item("https://v.example/bad4.mp4", "term-two"),
                 ]
-            if search_term == "money":
-                return [
-                    _video_item("https://v.example/subj1.mp4", "money"),
-                    _video_item("https://v.example/subj2.mp4", "money"),
-                ]
             return []
 
         def verdict_fn(item, segment_text="", search_term=""):
@@ -649,6 +645,12 @@ class TestFilterWiring(unittest.TestCase):
                 "page": 1,
                 "term": search_term,
             }
+
+        image_calls = []
+
+        def fake_image(segment_text, subject_term):
+            image_calls.append((segment_text, subject_term))
+            return "/saved/gen1.mp4", {"source": "kolors", "prompt": segment_text}
 
         results = sm.prepare_segment_materials(
             segments=[
@@ -664,86 +666,12 @@ class TestFilterWiring(unittest.TestCase):
             video_aspect=VideoAspect.portrait,
             save_dir="/materials",
             judge_candidate=verdict_fn,
+            generate_image=fake_image,
         )
-        self.assertEqual(
-            results[0].clips,
-            ["/saved/rel1.mp4", "/saved/subj1.mp4", "/saved/subj2.mp4"],
-        )
-        self.assertEqual(results[0].resolved_term, "term-one")
+        self.assertEqual(image_calls, [])
+        self.assertEqual(results[0].clips, ["/saved/rel1.mp4"])
         self.assertEqual(results[0].fallback_level, "self")
-        self.assertEqual(
-            [(a["level"], a["found"]) for a in results[0].search_attempts],
-            [("self", True), ("self", False), ("subject", True)],
-        )
-
-    def test_subject_level_skips_own_segments_earlier_clips(self):
-        """段内去重（修 6a）：subject 层复用门敞开，但本段先前层已下载的
-        URL 不得再次入槽（UAT 任务 a043f7bb mat1 同资产占两槽）。"""
-        def fake_search(search_term, minimum_duration, video_aspect, page=1):
-            if page != 1:
-                return []
-            if search_term == "term-one":
-                return [
-                    _video_item("https://v.example/rel1.mp4", "term-one"),
-                    _video_item("https://v.example/bad1.mp4", "term-one"),
-                ]
-            if search_term == "term-two":
-                return [_video_item("https://v.example/bad2.mp4", "term-two")]
-            if search_term == "money":
-                return [
-                    _video_item("https://v.example/rel1.mp4", "money"),
-                    _video_item("https://v.example/relZ.mp4", "money"),
-                ]
-            return []
-
-        def verdict_fn(item, segment_text="", search_term=""):
-            return {
-                "verdict": "irrelevant" if "bad" in item.url else "relevant",
-                "reason": "x",
-                "asset_id": item.source_info.get("asset_id"),
-                "image_source": "thumbnail",
-                "attempts": 1,
-                "page": 1,
-                "term": search_term,
-            }
-
-        downloaded = []
-
-        def fake_save(video_url, save_dir=""):
-            downloaded.append(video_url)
-            return f"/saved/{video_url.rsplit('/', 1)[-1]}"
-
-        results = sm.prepare_segment_materials(
-            segments=[
-                {
-                    "index": 0,
-                    "text": "narration",
-                    "search_terms": ["term-one", "term-two"],
-                }
-            ],
-            video_subject="money",
-            search_videos=fake_search,
-            save_video=fake_save,
-            video_aspect=VideoAspect.portrait,
-            save_dir="/materials",
-            judge_candidate=verdict_fn,
-        )
-        self.assertEqual(
-            results[0].clips,
-            ["/saved/rel1.mp4", "/saved/relZ.mp4"],
-        )
-        # rel1 只被下载一次：subject 池再次遇到它时段内去重直接跳过。
-        self.assertEqual(downloaded.count("https://v.example/rel1.mp4"), 1)
-        # 段内跳过发生在判定之前：重复候选不产生判定记录（省一次 VLM 调用）。
-        self.assertEqual(
-            [(r["term"], r["verdict"]) for r in results[0].vlm_filter],
-            [
-                ("term-one", "relevant"),
-                ("term-one", "irrelevant"),
-                ("term-two", "irrelevant"),
-                ("money", "relevant"),
-            ],
-        )
+        self.assertEqual(results[0].image_gen, [])
 
     def test_segment_text_passed_to_judge(self):
         """旁白文本必须传入判定回调（issue #9 D5）。"""

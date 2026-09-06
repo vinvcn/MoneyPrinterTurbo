@@ -10,13 +10,15 @@ per-segment flow on top of the shared search/cache/download primitives.
 Fallback chain per segment (in order):
 1. each of the segment's own search terms in order (the `search_terms`
    list, or the single `search_term`/text fallback when no list is given);
-2. the video subject as a shared last resort. Self levels are deduplicated
-   against clips already consumed by earlier segments (issue #10 finding 1);
-   the subject level may reuse them on purpose.
+2. when `generate_image` is provided and every own term came up empty, a
+   generated concept image (LLM-refined prompt → Kolors, provider photo
+   fallback) rendered as a single static clip covering the segment.
 
 Levels accumulate toward the per-segment clip quota: a partially filled
 level keeps its clips and later levels contribute the rest, instead of the
-segment settling for a shortfall (fix 5, UAT task c0044257 finding).
+segment settling for a shortfall (fix 5, UAT task c0044257 finding). The
+image fallback only fires on a fully empty segment (G1 decision), so
+partially filled segments keep their video shortfall.
 
 Every attempt is recorded on the segment record so the task manifest can show
 which term actually produced the visuals.
@@ -55,7 +57,7 @@ _CJK_PATTERN = re.compile(r"[一-鿿぀-ヿ가-힯]")
 
 # VLM 过滤审计记录条数上限。一个分段在 2 页 × 多候选的最坏情况下可能产生
 # 大量判定记录，截断到合理长度避免任务清单被单段撑爆。
-_MAX_FILTER_RECORDS = 64
+_MAX_FILTER_RECORDS = 12
 
 
 def _english_search_term(term: str) -> str:
@@ -106,6 +108,11 @@ class SegmentMaterials:
     # "reason", "image_source", "attempts", "page"} per judged candidate,
     # in judged order. Empty when the filter is disabled.
     vlm_filter: List[dict] = field(default_factory=list)
+    # Subject-level image generation audit trail: {"model", "prompt",
+    # "source", "image_size", "image", "clip", "attempts"} — exactly one
+    # record when the segment fell through to the generated concept image,
+    # empty otherwise.
+    image_gen: List[dict] = field(default_factory=list)
 
 
 def _download_clips_for_term(
@@ -120,8 +127,6 @@ def _download_clips_for_term(
     seen_urls: set[str] | None = None,
     used_urls: set[str] | None = None,
     accept_uncertain: bool = True,
-    enforce_used_urls: bool = True,
-    segment_urls: set[str] | None = None,
 ) -> tuple[List[str], List[dict]]:
     """
     Download up to `needed_count` unique clips; return paths and URL provenance.
@@ -133,20 +138,12 @@ def _download_clips_for_term(
     are not fetched or re-judged twice.
 
     `used_urls` carries every URL already accepted by an earlier segment in
-    this task (issue #10 finding 1). Enforcement is gated by
-    `enforce_used_urls`: self levels skip already-used candidates without
+    this task (issue #10 finding 1): such candidates are skipped without
     re-judging, so one universally on-topic asset cannot occupy several
-    segments' clip slots; the subject level passes False and may reuse an
-    already-used asset as a shared last resort. Registration is
-    unconditional — every successful download adds its URL to `used_urls`,
-    including subject-level downloads, so later segments' self levels still
-    exclude them.
-
-    `segment_urls` carries every URL this segment's earlier levels already
-    downloaded; the check applies at every level regardless of
-    `enforce_used_urls`, so a reuse-open level (subject) can still take
-    OTHER segments' clips but never re-takes this segment's own (UAT task
-    a043f7bb: mat1 ended with the same asset in two of its three slots).
+    segments' clip slots. Registration is unconditional — every successful
+    download adds its URL to the set. The former subject level no longer
+    searches videos (it generates a concept image instead), so the
+    enforcement applies uniformly at every level.
 
     Uncertain verdicts are deferred behind relevant ones (issue #10 finding 2,
     adopting the Q2 tightening): a page is first consumed accepting only
@@ -223,15 +220,9 @@ def _download_clips_for_term(
         if not item.url or item.url in seen_urls:
             continue
         seen_urls.add(item.url)
-        if enforce_used_urls and used_urls and item.url in used_urls:
+        if used_urls and item.url in used_urls:
             logger.info(
                 "skipping candidate already used by an earlier segment: "
-                f"url={item.url}"
-            )
-            continue
-        if segment_urls and item.url in segment_urls:
-            logger.info(
-                "skipping candidate already downloaded by this segment: "
                 f"url={item.url}"
             )
             continue
@@ -285,6 +276,7 @@ def prepare_segment_materials(
     clips_per_segment: int = CLIPS_PER_SEGMENT,
     save_dir: str = "",
     judge_candidate: Callable[..., dict] | None = None,
+    generate_image: Callable[..., tuple[str, dict]] | None = None,
 ) -> List[SegmentMaterials]:
     """
     Search and download clips for every segment using the fallback chain.
@@ -303,15 +295,19 @@ def prepare_segment_materials(
         judge_candidate: optional VLM filter callable (issue #9); receives
             (item=MaterialInfo, segment_text=str, search_term=str) and returns
             a verdict record dict. None = filter disabled.
+        generate_image: optional subject-fallback callable (UAT a043f7bb
+            follow-up); receives (segment_text=str, subject_term=str) and
+            returns (clip_path, audit_record). Called only when every own
+            term produced zero clips; returns clip_path="" on failure.
+            None = no image fallback (segment stays empty).
 
     Returns:
         One SegmentMaterials per input segment, in the same order.
     """
     subject = _english_search_term(str(video_subject or ""))
     # Cache search results across segments and across a segment's own terms
-    # so a repeated term (or the subject shared by all segments) does not hit
-    # the provider API again. Page-aware: page 1 must exist before page 2 is
-    # fetched (issue #9 D6).
+    # so a repeated term does not hit the provider API again. Page-aware:
+    # page 1 must exist before page 2 is fetched (issue #9 D6).
     search_cache: dict[tuple[str, int], List[MaterialInfo]] = {}
     def search_page_cached(term: str, page: int) -> List[MaterialInfo]:
         normalized = (term or "").strip()
@@ -369,11 +365,9 @@ def prepare_segment_materials(
 
     results: List[SegmentMaterials] = []
     # 任务级已用素材 URL（issue #10 finding 1）：前面的 segment 已经采纳的
-    # 候选不再进入后续 segment 的 self 层判定/下载，避免同一条"万能"素材
-    # 被多个 segment 各自判 relevant 后重复占用片段名额。跳过只在 self 层
-    # 生效（enforce_used_urls），subject 层作为共享兜底允许复用；但注册
-    # 无条件——subject 层下载的 URL 同样入册，后续 segment 的 self 层仍会
-    # 排除它。
+    # 候选不再进入后续 segment 的判定/下载，避免同一条"万能"素材被多个
+    # segment 各自判 relevant 后重复占用片段名额。所有层都是 self 层，
+    # 拦截无条件生效；注册无条件——每个成功下载都入册。
     used_urls_across_segments: set[str] = set()
     for position, segment in enumerate(segments):
         # 自有词条链：优先取上游给出的 search_terms 列表（与词条通道的冻结
@@ -388,8 +382,6 @@ def prepare_segment_materials(
             if english and english not in own_terms:
                 own_terms.append(english)
         candidates: List[tuple[str, str]] = [("self", t) for t in own_terms]
-        if subject:
-            candidates.append(("subject", subject))
         # 空词条的层不会参与尝试（下方 continue），真实的"最后一层"必须
         # 按非空层计算，否则唯一可用的层也拿不到 uncertain 兜底资格。
         non_empty_levels = sum(1 for _, t in candidates if (t or "").strip())
@@ -397,14 +389,11 @@ def prepare_segment_materials(
         segment_text = str(segment.get("text") or "")
         saved_paths: List[str] = []
         clip_sources: List[dict] = []
-        # 段内去重：本段先前层已下载的 URL。任何层（含复用门敞开的 subject
-        # 层）都不得再次入槽——否则同段出现同一镜头两次（UAT 任务 a043f7bb
-        # mat1 槽 1/槽 3 同资产）。与 used_urls（任务级、subject 层放行）互补。
-        segment_urls: set[str] = set()
         resolved_term = ""
         fallback_level = ""
         search_attempts: List[dict] = []
         vlm_filter_records: List[dict] = []
+        image_gen_records: List[dict] = []
         # 每层尝试时暂存本层被延期的 uncertain 候选（issue #10 finding 2）：
         # relevant 优先；仅当整条链的最后一层、最后一页仍未凑齐时，
         # _download_clips_for_term 才在层内回收 uncertain 兜底。
@@ -447,8 +436,6 @@ def prepare_segment_materials(
                     seen_urls=level_seen_urls,
                     used_urls=used_urls_across_segments,
                     accept_uncertain=False,
-                    enforce_used_urls=(level == "self"),
-                    segment_urls=segment_urls,
                 )
                 level_clips.extend(probe_clips)
                 level_sources.extend(probe_sources)
@@ -475,8 +462,6 @@ def prepare_segment_materials(
                     seen_urls=level_seen_urls,
                     used_urls=used_urls_across_segments,
                     accept_uncertain=is_last_level,
-                    enforce_used_urls=(level == "self"),
-                    segment_urls=segment_urls,
                 )
                 level_clips.extend(extra_clips)
                 level_sources.extend(extra_sources)
@@ -493,14 +478,26 @@ def prepare_segment_materials(
                 # search_attempts。
                 saved_paths.extend(level_clips)
                 clip_sources.extend(level_sources)
-                segment_urls.update(
-                    s["url"] for s in level_sources if s.get("url")
-                )
                 if not resolved_term:
                     resolved_term = term
                     fallback_level = level
                 if len(saved_paths) >= clips_per_segment:
                     break
+
+        # subject 图片生成（G1 决策）：仅当自有词条产出 0 clip 时触发，
+        # 生成单张覆盖整段时长的概念图替代视频；partial-fill 段保持视频
+        # 短缺现状（装配器可处理）。失败/未配置回调时段空手（原有语义）。
+        if not saved_paths and generate_image is not None:
+            image_clip, image_record = generate_image(segment_text, subject)
+            if image_clip:
+                saved_paths.append(image_clip)
+                clip_sources.append(
+                    {"url": "", "local_file": Path(image_clip).name}
+                )
+                resolved_term = subject
+                fallback_level = "subject"
+            if image_record:
+                image_gen_records.append(image_record)
 
         results.append(
             SegmentMaterials(
@@ -512,6 +509,7 @@ def prepare_segment_materials(
                 search_attempts=search_attempts,
                 clip_sources=clip_sources,
                 vlm_filter=vlm_filter_records[:_MAX_FILTER_RECORDS],
+                image_gen=image_gen_records,
             )
         )
         if not saved_paths:
@@ -545,6 +543,7 @@ def persist_segment_material_sources(
                 "search_attempts": segment_materials.search_attempts,
                 "clip_sources": segment_materials.clip_sources,
                 "vlm_filter": segment_materials.vlm_filter,
+                "image_gen": segment_materials.image_gen,
             }
         )
     try:
@@ -576,6 +575,7 @@ def segments_to_records(materials: List[SegmentMaterials]) -> List[dict[str, Any
             "search_attempts": [dict(a) for a in m.search_attempts],
             "clip_sources": [dict(s) for s in m.clip_sources],
             "vlm_filter": [dict(f) for f in m.vlm_filter],
+            "image_gen": [dict(g) for g in m.image_gen],
         }
         for m in materials
     ]

@@ -466,6 +466,7 @@ def save_config():
         config_to_save["elevenlabs"] = dict(elevenlabs)
         config_to_save["chatterbox"] = dict(chatterbox)
         config_to_save["vlm"] = dict(vlm)
+        config_to_save["image_gen"] = dict(image_gen)
         config_to_save["ui"] = dict(ui)
         serialized_config = toml.dumps(config_to_save)
 
@@ -527,6 +528,22 @@ vlm = _SynchronizedConfig(
             # [vlm] 段缺失时按"未启用"处理：segment-first 素材流程不发起
             # 任何 VLM 请求，行为与引入过滤器之前完全一致。
             "enabled": False,
+        },
+    )
+)
+image_gen = _SynchronizedConfig(
+    _cfg.get(
+        "image_gen",
+        {
+            # [image_gen] 段缺失时按默认 Kolors 参数处理：subject 层仍会
+            # 生成图片（api_key 缺省回落 [vlm] api_key，同一 SiliconFlow
+            # 账号无需重复填写）。
+            "api_key": "",
+            "model": "Kwai-Kolors/Kolors",
+            "image_size_portrait": "720x1280",
+            "image_size_landscape": "1280x720",
+            "num_inference_steps": 20,
+            "guidance_scale": 7.5,
         },
     )
 )

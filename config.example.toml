@@ -365,6 +365,23 @@ timeout = 30
 min_thumbnail_width = 640
 min_thumbnail_height = 320
 
+# -----------------------------------------------------------------------------
+# Subject-level image generation (segment-first pipeline).
+# subject 层图片生成：自有词条全部失败时，用 LLM 精炼的画面描述生成一张
+# 概念图并转成整段时长的静态 clip，替代原 subject 视频搜索。
+# Kolors 生成失败（重试 2 次）时退回 provider 图片搜索
+# （Pexels/Pixabay photos API，与素材搜索共用同一把 key）。
+# api_key 缺省回落 [vlm] api_key（同一 SiliconFlow 账号无需重复填写）。
+# 横屏尺寸不在 Kolors 官方推荐列表内，若 API 拒绝请改用 1024x1024。
+# -----------------------------------------------------------------------------
+[image_gen]
+model = "Kwai-Kolors/Kolors"
+api_key = ""
+image_size_portrait = "720x1280"
+image_size_landscape = "1280x720"
+num_inference_steps = 20
+guidance_scale = 7.5
+
 # =============================================================================
 # WebUI Preferences / WebUI 偏好
 # =============================================================================

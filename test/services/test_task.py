@@ -1609,6 +1609,7 @@ class TestTaskService(unittest.TestCase):
                     {"url": "https://v.example/b.mp4", "local_file": "clip-b.mp4"},
                 ],
                 vlm_filter=[],
+                image_gen=[],
             ),
             SimpleNamespace(
                 index=1,
@@ -1623,6 +1624,7 @@ class TestTaskService(unittest.TestCase):
                     {"url": "https://v.example/c.mp4", "local_file": "clip-c.mp4"}
                 ],
                 vlm_filter=[],
+                image_gen=[],
             ),
         ]
         recorded_segments = {}

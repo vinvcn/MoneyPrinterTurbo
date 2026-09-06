@@ -20,7 +20,7 @@ def _video_item(url, term, provider="pexels"):
 
 
 class TestPrepareSegmentMaterials(unittest.TestCase):
-    def _run(self, segments, search_results, subject="money", subject_results=None):
+    def _run(self, segments, search_results, subject="money", subject_results=None, generate_image=None):
         """Run prepare_segment_materials with deterministic stubs."""
         searched_terms = []
         saved_urls = []
@@ -40,6 +40,7 @@ class TestPrepareSegmentMaterials(unittest.TestCase):
             save_video=fake_save_video,
             video_aspect=VideoAspect.portrait,
             save_dir="/materials",
+            generate_image=generate_image,
         )
         return results, searched_terms, saved_urls
 
@@ -65,18 +66,16 @@ class TestPrepareSegmentMaterials(unittest.TestCase):
                 "term-two": [_video_item("https://v.example/t2.mp4", "term-two")],
             },
         )
-        # 名额补足（修 5）：t2 只贡献 1/3 名额，缺口会继续尝试 subject 层
-        # （此处 subject 池为空，最终 1/3）；t1 仍被搜索且零贡献。
-        self.assertEqual(searched, ["term-one", "term-two", "money"])
+        # subject 层不再搜索视频（图片化）：t2 只贡献 1/3 名额，段落保持
+        # 视频短缺（未注入 generate_image 回调时不触发图片兜底）。
+        self.assertEqual(searched, ["term-one", "term-two"])
         self.assertEqual(results[0].fallback_level, "self")
         self.assertEqual(results[0].resolved_term, "term-two")
         self.assertEqual(results[0].clips, ["/saved/t2.mp4"])
         attempts = results[0].search_attempts
-        self.assertEqual([a["level"] for a in attempts], ["self", "self", "subject"])
-        self.assertEqual(
-            [a["term"] for a in attempts], ["term-one", "term-two", "money"]
-        )
-        self.assertEqual([a["found"] for a in attempts], [False, True, False])
+        self.assertEqual([a["level"] for a in attempts], ["self", "self"])
+        self.assertEqual([a["term"] for a in attempts], ["term-one", "term-two"])
+        self.assertEqual([a["found"] for a in attempts], [False, True])
 
     def test_used_url_skipped_across_own_terms(self):
         """已下载 URL 在同任务后续 self 层被跳过：跨自有词条不重复下载。"""
@@ -121,34 +120,53 @@ class TestPrepareSegmentMaterials(unittest.TestCase):
         self.assertEqual(results[1].resolved_term, "term-two")
         self.assertEqual(results[1].clips, ["/saved/fresh.mp4"])
 
-    def test_own_terms_exhausted_falls_to_subject(self):
-        """自有词条全部失败后才落 subject 层（层级顺序：self×N → subject）。"""
+    def test_own_terms_exhausted_generates_subject_image(self):
+        """自有词条全部失败后触发 subject 图片生成（替代 subject 视频搜索）：
+        subject 词条不再到达搜索 API，图片 clip 占满整段，审计记录落盘。"""
+        image_calls = []
+
+        def fake_image(segment_text, subject_term):
+            image_calls.append((segment_text, subject_term))
+            return (
+                "/saved/gen1.mp4",
+                {"model": "Kwai-Kolors/Kolors", "source": "kolors",
+                 "prompt": segment_text, "clip": "gen1.mp4"},
+            )
+
         results, searched, _ = self._run(
             segments=[
                 {"index": 0, "text": "ignored", "search_terms": ["term-one", "term-two"]}
             ],
             search_results={},
             subject="generic money",
-            subject_results=[_video_item("https://v.example/s.mp4", "generic money")],
+            generate_image=fake_image,
         )
-        self.assertEqual(searched, ["term-one", "term-two", "generic money"])
+        self.assertEqual(searched, ["term-one", "term-two"])
+        self.assertEqual(image_calls, [("ignored", "generic money")])
         self.assertEqual(results[0].fallback_level, "subject")
         self.assertEqual(results[0].resolved_term, "generic money")
+        self.assertEqual(results[0].clips, ["/saved/gen1.mp4"])
+        self.assertEqual(results[0].image_gen[0]["source"], "kolors")
         attempts = results[0].search_attempts
         self.assertEqual(
             [(a["level"], a["found"]) for a in attempts],
-            [("self", False), ("self", False), ("subject", True)],
+            [("self", False), ("self", False)],
         )
 
-    def test_last_resort_uses_subject(self):
+    def test_subject_image_used_as_last_resort(self):
         results, _, _ = self._run(
             segments=[{"index": 0, "text": "nothing matches"}],
             search_results={},
             subject="generic money",
-            subject_results=[_video_item("https://v.example/s.mp4", "generic money")],
+            generate_image=lambda segment_text, subject_term: (
+                "/saved/gen1.mp4",
+                {"model": "Kwai-Kolors/Kolors", "source": "kolors",
+                 "prompt": segment_text, "clip": "gen1.mp4"},
+            ),
         )
         self.assertEqual(results[0].fallback_level, "subject")
         self.assertEqual(results[0].resolved_term, "generic money")
+        self.assertEqual(results[0].clips, ["/saved/gen1.mp4"])
 
     def test_all_levels_fail_returns_empty_clips(self):
         results, _, _ = self._run(
@@ -191,25 +209,44 @@ class TestPrepareSegmentMaterials(unittest.TestCase):
         self.assertEqual(results[0].resolved_term, "city skyline")
         self.assertEqual(searched, ["city skyline"])
 
-    def test_subject_search_cached_across_segments(self):
-        """subject 词全任务共享：跨 segment 只搜一次，且 subject 层允许复用已用素材。"""
-        results, searched, _ = self._run(
-            segments=[
-                {"index": 0, "text": "nothing here"},
-                {"index": 1, "text": "also nothing"},
-            ],
+    def test_image_generation_failure_leaves_segment_empty(self):
+        """Kolors 与 provider 图片回退全部失败（回调返回 ""）时段空手，
+        失败审计记录仍然落盘，任务不中断。"""
+        results, _, _ = self._run(
+            segments=[{"index": 0, "text": "nothing here"}],
             search_results={},
             subject="generic money",
-            subject_results=[_video_item("https://v.example/s.mp4", "generic money")],
+            generate_image=lambda segment_text, subject_term: (
+                "",
+                {"model": "Kwai-Kolors/Kolors", "source": "failed",
+                 "prompt": segment_text, "error": "all_sources_failed"},
+            ),
         )
-        # 两个 segment 的 self 层均无结果，先后落入 subject 层：subject 词
-        # 只真正搜索一次（缓存跨 segment 共享）；已用素材去重不在 subject
-        # 层生效，因此两个 segment 都拿到同一条兜底片段。
-        self.assertEqual(searched.count("generic money"), 1)
-        for result in results:
-            self.assertEqual(result.fallback_level, "subject")
-            self.assertEqual(result.resolved_term, "generic money")
-            self.assertEqual(result.clips, ["/saved/s.mp4"])
+        self.assertEqual(results[0].clips, [])
+        self.assertEqual(results[0].fallback_level, "")
+        self.assertEqual(results[0].image_gen[0]["source"], "failed")
+
+    def test_partial_fill_does_not_generate_image(self):
+        """图片兜底仅在自有词条产出 0 clip 时触发（G1 决策）：部分命中的
+        段保持视频短缺，不生成图片。"""
+        image_calls = []
+
+        def fake_image(segment_text, subject_term):
+            image_calls.append((segment_text, subject_term))
+            return "/saved/gen1.mp4", {"source": "kolors"}
+
+        results, _, _ = self._run(
+            segments=[{"index": 0, "text": "narration", "search_terms": ["term-one"]}],
+            search_results={
+                "term-one": [_video_item("https://v.example/t1.mp4", "term-one")],
+            },
+            subject="generic money",
+            generate_image=fake_image,
+        )
+        self.assertEqual(image_calls, [])
+        self.assertEqual(results[0].fallback_level, "self")
+        self.assertEqual(results[0].clips, ["/saved/t1.mp4"])
+        self.assertEqual(results[0].image_gen, [])
 
     def test_download_failure_skips_item_and_continues(self):
         """A failing download should not abort the whole segment."""

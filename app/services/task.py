@@ -29,6 +29,7 @@ from app.services import (
 from app.services import upload_post
 from app.services import state as sm
 from app.services import (
+    image_gen,
     segment_audio,
     segment_material,
     segment_subtitle,
@@ -1252,6 +1253,13 @@ def _run_segment_first_pipeline(
         clip_duration=params.video_clip_duration,
         save_dir=utils.task_dir(task_id),
         judge_candidate=segment_judge,
+        # subject 层图片生成（替代 subject 视频搜索）：回调绑定段宽高比与
+        # 任务素材目录，materials 层只拿 clip 路径与审计记录。
+        generate_image=partial(
+            image_gen.make_subject_clip,
+            video_aspect=params.video_aspect,
+            save_dir=utils.task_dir(task_id),
+        ),
     )
     segment_material.persist_segment_material_sources(task_id, materials)
 
