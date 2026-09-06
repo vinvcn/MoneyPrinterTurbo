@@ -55,7 +55,7 @@ _CJK_PATTERN = re.compile(r"[一-鿿぀-ヿ가-힯]")
 
 # VLM 过滤审计记录条数上限。一个分段在 2 页 × 多候选的最坏情况下可能产生
 # 大量判定记录，截断到合理长度避免任务清单被单段撑爆。
-_MAX_FILTER_RECORDS = 24
+_MAX_FILTER_RECORDS = 64
 
 
 def _english_search_term(term: str) -> str:
@@ -121,6 +121,7 @@ def _download_clips_for_term(
     used_urls: set[str] | None = None,
     accept_uncertain: bool = True,
     enforce_used_urls: bool = True,
+    segment_urls: set[str] | None = None,
 ) -> tuple[List[str], List[dict]]:
     """
     Download up to `needed_count` unique clips; return paths and URL provenance.
@@ -140,6 +141,12 @@ def _download_clips_for_term(
     unconditional — every successful download adds its URL to `used_urls`,
     including subject-level downloads, so later segments' self levels still
     exclude them.
+
+    `segment_urls` carries every URL this segment's earlier levels already
+    downloaded; the check applies at every level regardless of
+    `enforce_used_urls`, so a reuse-open level (subject) can still take
+    OTHER segments' clips but never re-takes this segment's own (UAT task
+    a043f7bb: mat1 ended with the same asset in two of its three slots).
 
     Uncertain verdicts are deferred behind relevant ones (issue #10 finding 2,
     adopting the Q2 tightening): a page is first consumed accepting only
@@ -219,6 +226,12 @@ def _download_clips_for_term(
         if enforce_used_urls and used_urls and item.url in used_urls:
             logger.info(
                 "skipping candidate already used by an earlier segment: "
+                f"url={item.url}"
+            )
+            continue
+        if segment_urls and item.url in segment_urls:
+            logger.info(
+                "skipping candidate already downloaded by this segment: "
                 f"url={item.url}"
             )
             continue
@@ -384,6 +397,10 @@ def prepare_segment_materials(
         segment_text = str(segment.get("text") or "")
         saved_paths: List[str] = []
         clip_sources: List[dict] = []
+        # 段内去重：本段先前层已下载的 URL。任何层（含复用门敞开的 subject
+        # 层）都不得再次入槽——否则同段出现同一镜头两次（UAT 任务 a043f7bb
+        # mat1 槽 1/槽 3 同资产）。与 used_urls（任务级、subject 层放行）互补。
+        segment_urls: set[str] = set()
         resolved_term = ""
         fallback_level = ""
         search_attempts: List[dict] = []
@@ -431,6 +448,7 @@ def prepare_segment_materials(
                     used_urls=used_urls_across_segments,
                     accept_uncertain=False,
                     enforce_used_urls=(level == "self"),
+                    segment_urls=segment_urls,
                 )
                 level_clips.extend(probe_clips)
                 level_sources.extend(probe_sources)
@@ -458,6 +476,7 @@ def prepare_segment_materials(
                     used_urls=used_urls_across_segments,
                     accept_uncertain=is_last_level,
                     enforce_used_urls=(level == "self"),
+                    segment_urls=segment_urls,
                 )
                 level_clips.extend(extra_clips)
                 level_sources.extend(extra_sources)
@@ -474,6 +493,9 @@ def prepare_segment_materials(
                 # search_attempts。
                 saved_paths.extend(level_clips)
                 clip_sources.extend(level_sources)
+                segment_urls.update(
+                    s["url"] for s in level_sources if s.get("url")
+                )
                 if not resolved_term:
                     resolved_term = term
                     fallback_level = level

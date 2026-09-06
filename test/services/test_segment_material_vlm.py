@@ -676,6 +676,75 @@ class TestFilterWiring(unittest.TestCase):
             [("self", True), ("self", False), ("subject", True)],
         )
 
+    def test_subject_level_skips_own_segments_earlier_clips(self):
+        """段内去重（修 6a）：subject 层复用门敞开，但本段先前层已下载的
+        URL 不得再次入槽（UAT 任务 a043f7bb mat1 同资产占两槽）。"""
+        def fake_search(search_term, minimum_duration, video_aspect, page=1):
+            if page != 1:
+                return []
+            if search_term == "term-one":
+                return [
+                    _video_item("https://v.example/rel1.mp4", "term-one"),
+                    _video_item("https://v.example/bad1.mp4", "term-one"),
+                ]
+            if search_term == "term-two":
+                return [_video_item("https://v.example/bad2.mp4", "term-two")]
+            if search_term == "money":
+                return [
+                    _video_item("https://v.example/rel1.mp4", "money"),
+                    _video_item("https://v.example/relZ.mp4", "money"),
+                ]
+            return []
+
+        def verdict_fn(item, segment_text="", search_term=""):
+            return {
+                "verdict": "irrelevant" if "bad" in item.url else "relevant",
+                "reason": "x",
+                "asset_id": item.source_info.get("asset_id"),
+                "image_source": "thumbnail",
+                "attempts": 1,
+                "page": 1,
+                "term": search_term,
+            }
+
+        downloaded = []
+
+        def fake_save(video_url, save_dir=""):
+            downloaded.append(video_url)
+            return f"/saved/{video_url.rsplit('/', 1)[-1]}"
+
+        results = sm.prepare_segment_materials(
+            segments=[
+                {
+                    "index": 0,
+                    "text": "narration",
+                    "search_terms": ["term-one", "term-two"],
+                }
+            ],
+            video_subject="money",
+            search_videos=fake_search,
+            save_video=fake_save,
+            video_aspect=VideoAspect.portrait,
+            save_dir="/materials",
+            judge_candidate=verdict_fn,
+        )
+        self.assertEqual(
+            results[0].clips,
+            ["/saved/rel1.mp4", "/saved/relZ.mp4"],
+        )
+        # rel1 只被下载一次：subject 池再次遇到它时段内去重直接跳过。
+        self.assertEqual(downloaded.count("https://v.example/rel1.mp4"), 1)
+        # 段内跳过发生在判定之前：重复候选不产生判定记录（省一次 VLM 调用）。
+        self.assertEqual(
+            [(r["term"], r["verdict"]) for r in results[0].vlm_filter],
+            [
+                ("term-one", "relevant"),
+                ("term-one", "irrelevant"),
+                ("term-two", "irrelevant"),
+                ("money", "relevant"),
+            ],
+        )
+
     def test_segment_text_passed_to_judge(self):
         """旁白文本必须传入判定回调（issue #9 D5）。"""
         seen_texts = []
