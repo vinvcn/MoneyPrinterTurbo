@@ -14,6 +14,10 @@ Fallback chain per segment (in order):
    against clips already consumed by earlier segments (issue #10 finding 1);
    the subject level may reuse them on purpose.
 
+Levels accumulate toward the per-segment clip quota: a partially filled
+level keeps its clips and later levels contribute the rest, instead of the
+segment settling for a shortfall (fix 5, UAT task c0044257 finding).
+
 Every attempt is recorded on the segment record so the task manifest can show
 which term actually produced the visuals.
 
@@ -85,9 +89,11 @@ class SegmentMaterials:
     search_term: str
     clips: List[str] = field(default_factory=list)
     # The term that actually produced the clips ("" when nothing was found).
+    # With quota-fill, this is the FIRST contributing term; later terms may
+    # have contributed the remainder — see search_attempts for the chain.
     resolved_term: str = ""
-    # Which fallback level produced the result: "self", "subject", or ""
-    # when all levels failed.
+    # Level of the first contributing term: "self", "subject", or "" when
+    # all levels failed.
     fallback_level: str = ""
     # Audit trail of every fallback attempt: {"level", "term", "found"} in
     # tried order, so the manifest shows what each search returned even when
@@ -386,10 +392,13 @@ def prepare_segment_materials(
         # relevant 优先；仅当整条链的最后一层、最后一页仍未凑齐时，
         # _download_clips_for_term 才在层内回收 uncertain 兜底。
         seen_non_empty_levels = 0
-        for level_index, (level, term) in enumerate(candidates):
+        for level, term in candidates:
             term = (term or "").strip()
             if not term:
                 continue
+            needed = clips_per_segment - len(saved_paths)
+            if needed <= 0:
+                break
             seen_non_empty_levels += 1
             is_last_level = seen_non_empty_levels == non_empty_levels
             # VLM 过滤启用时逐页尝试：当前页没有 relevant 片段才翻下一页，
@@ -399,7 +408,8 @@ def prepare_segment_materials(
             level_seen_urls: set[str] = set()
             # 收集阶段：逐页把候选聚到 level_page_items（共享 level_seen_urls
             # 去重）。probe 调用（accept_uncertain=False）只下载 relevant，
-            # used_urls 的跳过判断也在 probe 中生效——已用素材不会进名额。
+            # used_urls 的跳过判断也在 probe 中生效——已用素材不会进名额；
+            # 本层目标名额是 needed（全链剩余缺口），不是每层都重下满额。
             # 翻页条件沿用 issue #9 D6：本页连一个 relevant 片段都没凑出
             # 才继续翻。judge 未启用时 probe 一次即 break，保持旧行为。
             level_page_items: List[MaterialInfo] = []
@@ -408,9 +418,9 @@ def prepare_segment_materials(
                 if not page_items:
                     break
                 level_page_items.extend(page_items)
-                probe_clips, _ = _download_clips_for_term(
+                probe_clips, probe_sources = _download_clips_for_term(
                     items=page_items,
-                    needed_count=clips_per_segment,
+                    needed_count=needed,
                     save_video=save_video,
                     save_dir=material_directory,
                     judge_candidate=judge_candidate,
@@ -423,7 +433,8 @@ def prepare_segment_materials(
                     enforce_used_urls=(level == "self"),
                 )
                 level_clips.extend(probe_clips)
-                if len(level_clips) >= clips_per_segment:
+                level_sources.extend(probe_sources)
+                if len(level_clips) >= needed:
                     break
                 if probe_clips or not judge_candidate:
                     break
@@ -433,10 +444,10 @@ def prepare_segment_materials(
             # 的 URL，relevant 缺口只允许在最后一层由 uncertain 兜底补齐
             # （issue #10 finding 2）。judge 未启用时同样收尾一次，保证
             # 无过滤行为与旧版一致（候选顺序下载直到名额满）。
-            if len(level_clips) < clips_per_segment:
+            if len(level_clips) < needed:
                 extra_clips, extra_sources = _download_clips_for_term(
                     items=level_page_items,
-                    needed_count=clips_per_segment - len(level_clips),
+                    needed_count=needed - len(level_clips),
                     save_video=save_video,
                     save_dir=material_directory,
                     judge_candidate=judge_candidate,
@@ -458,11 +469,16 @@ def prepare_segment_materials(
                 }
             )
             if level_clips:
-                saved_paths = level_clips
-                clip_sources = level_sources
-                resolved_term = term
-                fallback_level = level
-                break
+                # 名额补足：部分命中的层保留已得片段，缺口由后续层继续填补。
+                # resolved_term/fallback_level 记录首个贡献层，完整贡献链见
+                # search_attempts。
+                saved_paths.extend(level_clips)
+                clip_sources.extend(level_sources)
+                if not resolved_term:
+                    resolved_term = term
+                    fallback_level = level
+                if len(saved_paths) >= clips_per_segment:
+                    break
 
         results.append(
             SegmentMaterials(

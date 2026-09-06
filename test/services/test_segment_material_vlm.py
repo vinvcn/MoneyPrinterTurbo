@@ -558,6 +558,124 @@ class TestFilterWiring(unittest.TestCase):
         self.assertEqual([r["term"] for r in records], ["term-one", "term-two"])
         self.assertEqual([r["verdict"] for r in records], ["irrelevant", "relevant"])
 
+    def test_partial_fill_fills_from_next_own_term(self):
+        """名额补足（修 5）：主词 relevant 部分命中时保留已得片段，下一个
+        自有词条补足缺口，而不是带着缺口过关（UAT 任务 c0044257 mat0）。"""
+        def fake_search(search_term, minimum_duration, video_aspect, page=1):
+            if page != 1:
+                return []
+            if search_term == "term-one":
+                return [
+                    _video_item("https://v.example/rel1.mp4", "term-one"),
+                    _video_item("https://v.example/bad1.mp4", "term-one"),
+                    _video_item("https://v.example/bad2.mp4", "term-one"),
+                ]
+            if search_term == "term-two":
+                return [
+                    _video_item("https://v.example/rel2.mp4", "term-two"),
+                    _video_item("https://v.example/rel3.mp4", "term-two"),
+                ]
+            return []
+
+        def verdict_fn(item, segment_text="", search_term=""):
+            return {
+                "verdict": "irrelevant" if "bad" in item.url else "relevant",
+                "reason": "x",
+                "asset_id": item.source_info.get("asset_id"),
+                "image_source": "thumbnail",
+                "attempts": 1,
+                "page": 1,
+                "term": search_term,
+            }
+
+        results = sm.prepare_segment_materials(
+            segments=[
+                {
+                    "index": 0,
+                    "text": "narration",
+                    "search_terms": ["term-one", "term-two"],
+                }
+            ],
+            video_subject="",
+            search_videos=fake_search,
+            save_video=lambda video_url, save_dir="": f"/saved/{video_url.rsplit('/', 1)[-1]}",
+            video_aspect=VideoAspect.portrait,
+            save_dir="/materials",
+            judge_candidate=verdict_fn,
+        )
+        self.assertEqual(
+            results[0].clips,
+            ["/saved/rel1.mp4", "/saved/rel2.mp4", "/saved/rel3.mp4"],
+        )
+        # resolved_term 记录首个贡献层；补足链条由 search_attempts 呈现。
+        self.assertEqual(results[0].resolved_term, "term-one")
+        self.assertEqual(results[0].fallback_level, "self")
+        self.assertEqual(
+            [(a["term"], a["found"]) for a in results[0].search_attempts],
+            [("term-one", True), ("term-two", True)],
+        )
+
+    def test_partial_fill_uses_subject_after_own_terms(self):
+        """名额补足（修 5）：自有词条全部用尽仍不足时，由 subject 层补齐
+        剩余名额；fallback_level 仍记录首个贡献层。"""
+        def fake_search(search_term, minimum_duration, video_aspect, page=1):
+            if page != 1:
+                return []
+            if search_term == "term-one":
+                return [
+                    _video_item("https://v.example/rel1.mp4", "term-one"),
+                    _video_item("https://v.example/bad1.mp4", "term-one"),
+                    _video_item("https://v.example/bad2.mp4", "term-one"),
+                ]
+            if search_term == "term-two":
+                return [
+                    _video_item("https://v.example/bad3.mp4", "term-two"),
+                    _video_item("https://v.example/bad4.mp4", "term-two"),
+                ]
+            if search_term == "money":
+                return [
+                    _video_item("https://v.example/subj1.mp4", "money"),
+                    _video_item("https://v.example/subj2.mp4", "money"),
+                ]
+            return []
+
+        def verdict_fn(item, segment_text="", search_term=""):
+            return {
+                "verdict": "irrelevant" if "bad" in item.url else "relevant",
+                "reason": "x",
+                "asset_id": item.source_info.get("asset_id"),
+                "image_source": "thumbnail",
+                "attempts": 1,
+                "page": 1,
+                "term": search_term,
+            }
+
+        results = sm.prepare_segment_materials(
+            segments=[
+                {
+                    "index": 0,
+                    "text": "narration",
+                    "search_terms": ["term-one", "term-two"],
+                }
+            ],
+            video_subject="money",
+            search_videos=fake_search,
+            save_video=lambda video_url, save_dir="": f"/saved/{video_url.rsplit('/', 1)[-1]}",
+            video_aspect=VideoAspect.portrait,
+            save_dir="/materials",
+            judge_candidate=verdict_fn,
+        )
+        self.assertEqual(
+            results[0].clips,
+            ["/saved/rel1.mp4", "/saved/subj1.mp4", "/saved/subj2.mp4"],
+        )
+        self.assertEqual(results[0].resolved_term, "term-one")
+        self.assertEqual(results[0].fallback_level, "self")
+        self.assertEqual(
+            [(a["level"], a["found"]) for a in results[0].search_attempts],
+            [("self", True), ("self", False), ("subject", True)],
+        )
+
     def test_segment_text_passed_to_judge(self):
         """旁白文本必须传入判定回调（issue #9 D5）。"""
         seen_texts = []

@@ -65,14 +65,18 @@ class TestPrepareSegmentMaterials(unittest.TestCase):
                 "term-two": [_video_item("https://v.example/t2.mp4", "term-two")],
             },
         )
-        self.assertEqual(searched, ["term-one", "term-two"])
+        # 名额补足（修 5）：t2 只贡献 1/3 名额，缺口会继续尝试 subject 层
+        # （此处 subject 池为空，最终 1/3）；t1 仍被搜索且零贡献。
+        self.assertEqual(searched, ["term-one", "term-two", "money"])
         self.assertEqual(results[0].fallback_level, "self")
         self.assertEqual(results[0].resolved_term, "term-two")
         self.assertEqual(results[0].clips, ["/saved/t2.mp4"])
         attempts = results[0].search_attempts
-        self.assertEqual([a["level"] for a in attempts], ["self", "self"])
-        self.assertEqual([a["term"] for a in attempts], ["term-one", "term-two"])
-        self.assertEqual([a["found"] for a in attempts], [False, True])
+        self.assertEqual([a["level"] for a in attempts], ["self", "self", "subject"])
+        self.assertEqual(
+            [a["term"] for a in attempts], ["term-one", "term-two", "money"]
+        )
+        self.assertEqual([a["found"] for a in attempts], [False, True, False])
 
     def test_used_url_skipped_across_own_terms(self):
         """已下载 URL 在同任务后续 self 层被跳过：跨自有词条不重复下载。"""
