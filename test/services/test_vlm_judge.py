@@ -126,5 +126,112 @@ class TestProbeImageSize(unittest.TestCase):
         self.assertEqual(vlm_judge._probe_image_size(b""), (0, 0))
 
 
+class _FakeGate:
+    """可编程假门：按需返回预设重复记录、None（放行）或直接抛异常。"""
+
+    def __init__(self, record=None, error=None):
+        self.record = record
+        self.error = error
+        self.calls = []
+
+    def judge_candidate_embedding(self, url, data_uri):
+        self.calls.append((url, data_uri))
+        if self.error is not None:
+            raise self.error
+        return self.record
+
+
+_DUP_RECORD = {
+    "verdict": "duplicate",
+    "reason": "cos=0.950 >= threshold",
+    "image_source": "embedding",
+    "duplicate_of": "https://accepted.example/video-a",
+    "cos": 0.95,
+}
+
+
+class TestJudgeCandidateEmbeddingGate(_VlmConfigMixin, unittest.TestCase):
+    """查重门接线（finding G）：gate 在图像就绪后、VLM 之前运行。"""
+
+    def _item(self, url="https://candidate.example/video-b"):
+        return SimpleNamespace(
+            url=url,
+            source_info={
+                "asset_id": "vid-abc",
+                "thumbnail_url": "https://img.example/t.jpg",
+                "page": 2,
+            },
+        )
+
+    def _run(self, gate=None):
+        item = self._item()
+        judge_image = patch.object(
+            vlm_judge,
+            "judge_image",
+            return_value=("relevant", "matches", 1),
+        )
+        thumbnail = patch.object(
+            vlm_judge,
+            "download_thumbnail_bytes",
+            return_value=(b"img-bytes", (800, 420)),
+        )
+        with thumbnail, judge_image as mocked_judge:
+            judge = vlm_judge.make_default_judge(embedding_gate=gate)
+            record = judge(
+                item=item,
+                segment_text="text",
+                search_term="black hole",
+            )
+        return record, mocked_judge
+
+    def test_duplicate_record_returned_without_vlm_call(self):
+        gate = _FakeGate(record=dict(_DUP_RECORD))
+        record, mocked_judge = self._run(gate)
+        self.assertEqual(mocked_judge.call_count, 0)
+        self.assertEqual(record["verdict"], "duplicate")
+        self.assertEqual(record["term"], "black hole")
+        self.assertEqual(record["asset_id"], "vid-abc")
+        self.assertEqual(record["reason"], "cos=0.950 >= threshold")
+        self.assertEqual(record["image_source"], "embedding")
+        self.assertEqual(record["attempts"], 0)
+        self.assertEqual(record["page"], 2)
+        self.assertEqual(record["duplicate_of"], _DUP_RECORD["duplicate_of"])
+        self.assertEqual(record["cos"], 0.95)
+
+    def test_gate_receives_item_url_and_data_uri(self):
+        gate = _FakeGate(record=dict(_DUP_RECORD))
+        self._run(gate)
+        url, data_uri = gate.calls[0]
+        self.assertEqual(url, "https://candidate.example/video-b")
+        self.assertTrue(data_uri.startswith("data:image/jpeg;base64,"))
+
+    def test_gate_pass_through_calls_vlm(self):
+        gate = _FakeGate(record=None)
+        record, mocked_judge = self._run(gate)
+        self.assertEqual(mocked_judge.call_count, 1)
+        self.assertEqual(record["verdict"], "relevant")
+        self.assertNotIn("duplicate_of", record)
+        self.assertNotIn("cos", record)
+        self.assertEqual(record["attempts"], 1)
+
+    def test_gate_exception_fails_open_to_vlm(self):
+        """gate 实现意外抛异常时照常走 VLM，绝不穿透 judge_candidate。"""
+        gate = _FakeGate(error=RuntimeError("boom"))
+        record, mocked_judge = self._run(gate)
+        self.assertEqual(mocked_judge.call_count, 1)
+        self.assertEqual(record["verdict"], "relevant")
+
+    def test_gate_off_matches_head_flow(self):
+        """embedding_gate=None（默认）时不触发查重，记录为 HEAD 原有形态。"""
+        record, mocked_judge = self._run(gate=None)
+        self.assertEqual(mocked_judge.call_count, 1)
+        self.assertEqual(record["verdict"], "relevant")
+        self.assertEqual(
+            sorted(record.keys()),
+            ["asset_id", "attempts", "image_source", "page", "reason",
+             "term", "verdict"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -29,6 +29,7 @@ from app.services import (
 from app.services import upload_post
 from app.services import state as sm
 from app.services import (
+    image_embedding,
     image_gen,
     segment_audio,
     segment_material,
@@ -1238,9 +1239,20 @@ def _run_segment_first_pipeline(
     # 3. Per-segment material search with fallback chain
     # VLM 下载前相关性过滤（issue #9）：[vlm] enabled=true 时逐候选判定，
     # 不相关素材在下载完整 mp4 之前被拒收。
+    # 图像查重门（finding G）：[image_embedding] duplicate_gate=true 时按
+    # 任务新建一个 gate——判定时缓存的候选嵌入在素材被采纳后经
+    # on_clip_accepted 移入 accepted 注册表，跨段重复画面在 VLM 之前被拒收。
+    embedding_gate = None
+    if image_embedding.is_duplicate_gate_enabled():
+        embedding_gate = image_embedding.make_default_gate()
+        logger.info(
+            "image embedding duplicate gate enabled: "
+            f"model={embedding_gate.model}, "
+            f"threshold={embedding_gate.threshold}"
+        )
     segment_judge = None
     if vlm_judge.is_enabled():
-        segment_judge = vlm_judge.make_default_judge()
+        segment_judge = vlm_judge.make_default_judge(embedding_gate=embedding_gate)
         logger.info("vlm pre-download material filter enabled")
     materials = segment_material.prepare_segment_materials(
         segments=segment_records,
@@ -1253,6 +1265,9 @@ def _run_segment_first_pipeline(
         clip_duration=params.video_clip_duration,
         save_dir=utils.task_dir(task_id),
         judge_candidate=segment_judge,
+        on_clip_accepted=(
+            embedding_gate.register_accepted if embedding_gate else None
+        ),
         # subject 层图片生成（替代 subject 视频搜索）：回调绑定段宽高比与
         # 任务素材目录，materials 层只拿 clip 路径与审计记录。
         generate_image=partial(

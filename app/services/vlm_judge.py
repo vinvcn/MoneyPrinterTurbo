@@ -327,9 +327,15 @@ def _candidate_local_path(item: Any) -> str:
     return local_file
 
 
-def make_default_judge():
+def make_default_judge(embedding_gate: Any = None):
     """
     构造注入 segment_material 的默认判定回调（issue #9 D1/D2/D3/D5）。
+
+    embedding_gate 可选注入图像查重门（image_embedding.EmbeddingGate）：
+    在预览图就绪后、VLM 调用前先做跨段重复检测，命中重复直接返回
+    duplicate 审计记录（不调 VLM）；gate 关闭（None）时行为与未引入
+    查重门之前完全一致。gate 自身 fail-open，这里的 try/except 只是
+    兜底防第三方实现抛异常穿透 judge_candidate。
 
     每个候选的判定顺序：
     1. 缩略图（存在且实际分辨率 ≥ [vlm] 阈值）；
@@ -419,6 +425,39 @@ def make_default_judge():
                 "attempts": 0,
                 "page": _safe_page(source),
             }
+
+        # 查重门（finding G）：VLM 之前先用候选预览图嵌入与本任务已收下
+        # 素材比对，命中重复直接拒收，不调 VLM。gate 缺席（None）时跳过，
+        # 行为与未引入查重门之前逐字节一致。
+        if embedding_gate is not None:
+            try:
+                duplicate = embedding_gate.judge_candidate_embedding(
+                    item.url, image_data_uri
+                )
+            except Exception as exc:
+                logger.warning(
+                    "embedding gate failed, fail-open: "
+                    f"asset_id={asset_id}, error={type(exc).__name__}"
+                )
+                duplicate = None
+            if duplicate is not None:
+                cos = duplicate.get("cos")
+                logger.info(
+                    "embedding gate flagged duplicate: "
+                    f"asset_id={asset_id}, term={search_term!r}, "
+                    f"duplicate_of={duplicate.get('duplicate_of')}, cos={cos}"
+                )
+                return {
+                    "term": search_term,
+                    "asset_id": asset_id,
+                    "verdict": duplicate.get("verdict", "duplicate"),
+                    "reason": duplicate.get("reason", ""),
+                    "image_source": duplicate.get("image_source", "embedding"),
+                    "attempts": 0,
+                    "page": _safe_page(source),
+                    "duplicate_of": duplicate.get("duplicate_of"),
+                    "cos": cos,
+                }
 
         verdict, reason, attempts = judge_image(
             image_data_uri=image_data_uri,
