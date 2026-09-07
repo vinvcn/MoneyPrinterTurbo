@@ -39,6 +39,7 @@ from loguru import logger
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect
 from app.services import task_artifacts
+from app.services.video import segment_window_plan
 from app.utils import utils
 
 # Number of clips to download per segment. The assembler cycles through them
@@ -127,6 +128,7 @@ def _download_clips_for_term(
     seen_urls: set[str] | None = None,
     used_urls: set[str] | None = None,
     accept_uncertain: bool = True,
+    on_clip_accepted: Callable[[str], None] | None = None,
 ) -> tuple[List[str], List[dict]]:
     """
     Download up to `needed_count` unique clips; return paths and URL provenance.
@@ -152,6 +154,13 @@ def _download_clips_for_term(
     as a last resort before moving to the next page/fallback level. This keeps
     a vague "eye close-up" out of a black-hole segment while anything better
     is available, without starving the pipeline.
+
+    A `duplicate` verdict (embedding gate hit, plan T5) is rejected outright:
+    the candidate is never downloaded or accepted and has no last-resort
+    tier — a near-duplicate of already-accepted material must not re-enter
+    the timeline even when the segment would otherwise run dry (the existing
+    image-gen/empty-segment fallbacks cover starvation instead). The record
+    still lands in `filter_records` so the audit chain shows the gate fired.
     """
     saved_paths: List[str] = []
     clip_sources: List[dict] = []
@@ -180,6 +189,17 @@ def _download_clips_for_term(
             )
             if used_urls is not None:
                 used_urls.add(item.url)
+            if on_clip_accepted is not None:
+                # 跨 worker 契约（duplicate gate 注册）：clip 一经采纳即回调。
+                # 回调异常只降级为告警，绝不中断素材下载链路。
+                try:
+                    on_clip_accepted(item.url)
+                except Exception as exc:
+                    logger.warning(
+                        "on_clip_accepted callback failed: "
+                        f"url={item.url}, error={type(exc).__name__}, "
+                        f"detail={exc}"
+                    )
             return saved_video_path
         return ""
 
@@ -194,12 +214,21 @@ def _download_clips_for_term(
         if filter_records is not None:
             filter_records.append(verdict)
         v = verdict.get("verdict")
-        if v == "irrelevant":
+        if v in ("irrelevant", "duplicate"):
+            detail = ""
+            if v == "duplicate":
+                # 嵌入门命中：审计链需要 duplicate_of 与 cos 才能对上记录。
+                detail = (
+                    f", duplicate_of={verdict.get('duplicate_of')}, "
+                    f"cos={verdict.get('cos')}"
+                )
             logger.info(
                 "vlm filter rejected candidate: "
                 f"asset_id={verdict.get('asset_id')}, "
+                f"verdict={v}, "
                 f"reason={verdict.get('reason')!r}, "
                 f"image_source={verdict.get('image_source')}"
+                f"{detail}"
             )
         else:
             logger.info(
@@ -212,7 +241,11 @@ def _download_clips_for_term(
 
     # Pass 1: accept only `relevant` candidates; park `uncertain` ones unless
     # `accept_uncertain` allows pass 2 to run on the same call (last page of
-    # the last fallback level).
+    # the last fallback level). `duplicate` (embedding gate hit) is rejected
+    # outright like `irrelevant` — plan T5: judged duplicates are never
+    # downloaded or accepted, and get no last-resort tier (admitting them as
+    # a fallback would put the very near-duplicate family the gate exists to
+    # block back on the timeline).
     deferred_uncertain: List[MaterialInfo] = []
     for item in items:
         if len(saved_paths) >= needed_count:
@@ -232,7 +265,7 @@ def _download_clips_for_term(
                 continue
             # 下载失败继续看下一个候选（与旧行为一致）。
             continue
-        if verdict.get("verdict") == "irrelevant":
+        if verdict.get("verdict") in ("irrelevant", "duplicate"):
             continue
         if verdict.get("verdict") == "uncertain":
             if accept_uncertain:
@@ -277,6 +310,7 @@ def prepare_segment_materials(
     save_dir: str = "",
     judge_candidate: Callable[..., dict] | None = None,
     generate_image: Callable[..., tuple[str, dict]] | None = None,
+    on_clip_accepted: Callable[[str], None] | None = None,
 ) -> List[SegmentMaterials]:
     """
     Search and download clips for every segment using the fallback chain.
@@ -289,8 +323,9 @@ def prepare_segment_materials(
             `page` kwarg when the provider supports pagination.
         save_video: download callable (url, save_dir) -> path ("" on failure).
         video_aspect: target orientation for remote filtering.
-        clip_duration: minimum duration requested from providers.
-        clips_per_segment: how many distinct clips to gather per segment.
+        clip_duration: minimum duration requested from providers; also the
+            window width used to derive the per-segment quota (B3).
+        clips_per_segment: diversity floor for distinct clips per segment.
         save_dir: download directory (empty = provider default cache).
         judge_candidate: optional VLM filter callable (issue #9); receives
             (item=MaterialInfo, segment_text=str, search_term=str) and returns
@@ -300,6 +335,10 @@ def prepare_segment_materials(
             returns (clip_path, audit_record). Called only when every own
             term produced zero clips; returns clip_path="" on failure.
             None = no image fallback (segment stays empty).
+        on_clip_accepted: optional callback invoked with the source URL of
+            every clip accepted into a segment's quota, immediately after it
+            is registered as used. Callback failures are logged and swallowed
+            (never break the pipeline).
 
     Returns:
         One SegmentMaterials per input segment, in the same order.
@@ -387,6 +426,14 @@ def prepare_segment_materials(
         non_empty_levels = sum(1 for _, t in candidates if (t or "").strip())
 
         segment_text = str(segment.get("text") or "")
+        # B3（F-H2）配额对齐：每段下载配额 = max(多样性下限, 装配层 A3 窗口
+        # 数)。长段按需多下，让装配层轮播复用从常态变成 provider 干涸兜底；
+        # 两层共用 segment_window_plan，配额与时间线切分不会错位。
+        segment_duration = float(segment.get("duration") or 0)
+        needed_clips = max(
+            clips_per_segment,
+            len(segment_window_plan(segment_duration, clip_duration)),
+        )
         saved_paths: List[str] = []
         clip_sources: List[dict] = []
         resolved_term = ""
@@ -402,7 +449,7 @@ def prepare_segment_materials(
             term = (term or "").strip()
             if not term:
                 continue
-            needed = clips_per_segment - len(saved_paths)
+            needed = needed_clips - len(saved_paths)
             if needed <= 0:
                 break
             seen_non_empty_levels += 1
@@ -436,6 +483,7 @@ def prepare_segment_materials(
                     seen_urls=level_seen_urls,
                     used_urls=used_urls_across_segments,
                     accept_uncertain=False,
+                    on_clip_accepted=on_clip_accepted,
                 )
                 level_clips.extend(probe_clips)
                 level_sources.extend(probe_sources)
@@ -462,6 +510,7 @@ def prepare_segment_materials(
                     seen_urls=level_seen_urls,
                     used_urls=used_urls_across_segments,
                     accept_uncertain=is_last_level,
+                    on_clip_accepted=on_clip_accepted,
                 )
                 level_clips.extend(extra_clips)
                 level_sources.extend(extra_sources)
@@ -481,7 +530,7 @@ def prepare_segment_materials(
                 if not resolved_term:
                     resolved_term = term
                     fallback_level = level
-                if len(saved_paths) >= clips_per_segment:
+                if len(saved_paths) >= needed_clips:
                     break
 
         # subject 图片生成（G1 决策）：仅当自有词条产出 0 clip 时触发，

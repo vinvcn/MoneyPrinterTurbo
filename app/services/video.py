@@ -1,5 +1,6 @@
 import itertools
 import io
+import math
 import os
 import random
 import gc
@@ -100,6 +101,42 @@ def _get_required_video_duration(audio_duration: float) -> float:
     轻量余量。函数独立出来，便于测试和后续按实际反馈调整余量大小。
     """
     return max(0.0, float(audio_duration) + _VIDEO_DURATION_SAFETY_MARGIN)
+
+
+# A3 窗口合并阈值：末窗短于该值时并入前窗，避免亚秒闪帧。A3 基准样例把
+# 有效阈值约束在 (0.744, 0.816] 区间（D=3.744/W=3 末窗 0.744 → 合并为单窗；
+# D=12.816/W=3 末窗 0.816 → 保留为独立短窗、维持 5 窗配额），这里取区间内
+# 的 0.75 定版；floor 参数仅允许调用方进一步收紧（取 min），默认 1.0 不生效。
+_WINDOW_MERGE_TAIL_SECONDS = 0.75
+
+# 装配层段填充判定容差：每段实际放置输出时长与 segment_duration 的允许
+# 偏差（帧率舍入在单段内累计不超过几十毫秒）。
+_SEGMENT_FILL_TOLERANCE = 0.05
+
+
+def segment_window_plan(
+    segment_duration: float, max_clip_duration: float, floor: float = 1.0
+) -> list[float]:
+    """
+    计算单个 segment 的输出窗口序列（每窗输出秒数，总和 == segment_duration）。
+
+    A3（F-H1）决策：n = ceil(D/W)，前 n-1 窗满 W，末窗 = 余量，精确覆盖
+    旁白时长。旧装配按满窗轮播，逐段超配最多 2.9s，concat 只截总时长不修
+    逐段对齐，段边界漂移实测 +2.18s 累计至 +12.38s（任务 044529cb）。
+
+    装配层（按窗放置素材）与素材层（按窗数决定下载配额，B3）共用本函数，
+    两边必须看到同一个切分，配额才不会与时间线错位。
+    """
+    if segment_duration <= 0 or max_clip_duration <= 0:
+        return []
+    n = max(1, math.ceil(segment_duration / max_clip_duration))
+    last = segment_duration - (n - 1) * max_clip_duration
+    merge_tail = min(floor, _WINDOW_MERGE_TAIL_SECONDS)
+    if n > 1 and last < merge_tail:
+        # 末窗过短（闪帧级）：并入前窗，少切一刀。
+        n -= 1
+        last = segment_duration - (n - 1) * max_clip_duration
+    return [max_clip_duration] * (n - 1) + [last]
 
 
 def is_material_resolution_acceptable(width: int, height: int) -> bool:
@@ -852,9 +889,6 @@ def _combine_videos_segment_first(
     normalized_clip_speed = utils.normalize_clip_speed(clip_speed)
     if normalized_clip_speed != 1.0:
         logger.info(f"clip playback speed: {normalized_clip_speed:.2f}x")
-    # 与旧流程一致：窗口后移时按播放速度反推源时长，保证不同速度下
-    # 源时间线连续且无重叠。
-    source_clip_duration = max_clip_duration * normalized_clip_speed
 
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
@@ -909,21 +943,35 @@ def _combine_videos_segment_first(
             clip_sequence += 1
             continue
 
-        # 每个片段最多占用 max_clip_duration 秒；同一个 segment 的多个
-        # clip 依次轮播覆盖其旁白时长，保持视觉多样性且顺序确定。
-        # advance_clip_window 开启时，同一源视频再次被轮询选中，截取窗口
-        # 从上次结束处继续（0-3s、3-6s…），到结尾后回绕到 0；关闭时始终
-        # 取前 max_clip_duration 秒。
+        # A3（F-H1）窗口计划：按 segment_window_plan 切窗（输出秒），精确
+        # 覆盖该段旁白时长。不变量：每段实际放置输出时长 == segment_duration
+        # （±0.05s）。素材源提前耗尽被截断时按实际放置扣减、继续轮播兜底，
+        # 宁可短放也不超配（超配会推移后续段边界，造成字幕-画面漂移）。
         segment_duration = float(segment.get("duration") or 0)
+        windows = segment_window_plan(segment_duration, max_clip_duration)
         segment_remaining = (
             segment_duration
             if segment_duration > 0
             else max_clip_duration
         )
+        if not windows:
+            # segment 没有时长信息（异常旁白）：保持旧行为，只放一个满窗。
+            windows = [max_clip_duration]
         clip_cycle = itertools.cycle(clip_paths)
         # 每个源视频已消耗的窗口偏移（秒），用于窗口后移。
         window_offset: dict[str, float] = {}
-        while segment_remaining > 0:
+        plan_index = 0
+        # 计划有效性：某个窗口因素材源提前耗尽而短放时，计划窗口与实际
+        # 剩余时长不再对齐，此后退回旧的"按剩余时长切满窗"自适应循环。
+        plan_intact = True
+        while segment_remaining > _SEGMENT_FILL_TOLERANCE:
+            if plan_index < len(windows) and plan_intact:
+                window_seconds = windows[plan_index]
+            else:
+                # 自适应兜底：素材干涸（或无计划的异常旁白段），窗口目标
+                # 取剩余输出时长，兜底但不再超配。
+                window_seconds = min(max_clip_duration, segment_remaining)
+            plan_index += 1
             video_path = next(clip_cycle)
             start_offset = (
                 window_offset.get(video_path, 0.0) if advance_clip_window else 0.0
@@ -936,23 +984,34 @@ def _combine_videos_segment_first(
                     # 短素材也能持续产出完整窗口。
                     if start_offset >= source_duration:
                         start_offset = 0.0
-                    clip = clip.subclipped(
-                        start_offset,
-                        min(start_offset + source_clip_duration, source_duration),
+                # 窗口的源秒数 = 输出窗口秒 × 播放速度（output = src/speed）。
+                target_source = window_seconds * normalized_clip_speed
+                if source_duration > 0:
+                    available_source = min(
+                        target_source, max(source_duration - start_offset, 0.0)
                     )
+                    clip = clip.subclipped(
+                        start_offset, start_offset + available_source
+                    )
+                else:
+                    # 源时长不可读（损坏素材）：与旧路径一致整段使用。
+                    available_source = clip.duration
                 if normalized_clip_speed != 1.0:
                     clip = clip.with_speed_scaled(normalized_clip_speed)
+                # 兜底裁剪上限取窗口目标（合并窗可超过 max_clip_duration），
+                # 归一化截断只作为异常安全网，正常路径放置时长 ≤ 窗口目标。
                 clip = _normalize_segment_clip(
                     clip,
                     video_width,
                     video_height,
-                    min(max_clip_duration, max(clip.duration, 0.1)),
+                    max(max_clip_duration, window_seconds),
                     transition_value,
                 )
                 if advance_clip_window and source_duration > 0:
-                    # 记录下一窗口起点：窗口消耗到结尾则回绕到 0（由下次
-                    # 读取时的 >= source_duration 分支处理），否则顺延。
-                    next_offset = start_offset + clip.duration
+                    # 记录下一窗口起点：按实际消耗的源秒数推进（含速度语义），
+                    # 消耗到结尾则回绕到 0（由下次读取时的 >= source_duration
+                    # 分支处理），保证同源时间线连续且无重叠。
+                    next_offset = start_offset + available_source
                     window_offset[video_path] = (
                         0.0 if next_offset >= source_duration else next_offset
                     )
@@ -988,7 +1047,11 @@ def _combine_videos_segment_first(
             if dedupe_clips_across_segments:
                 used_clip_paths.add(video_path)
             clip_sequence += 1
+            # 按实际放置输出时长扣减（不按计划值），源跑短时自然续到下一窗。
             segment_remaining -= clip_duration_saved
+            if clip_duration_saved < window_seconds - 0.01:
+                # 素材源在窗口中途耗尽：计划与剩余时长脱钩，转自适应兜底。
+                plan_intact = False
 
     logger.info("starting segment clip merging process")
     if not processed_clips:
