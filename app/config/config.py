@@ -559,6 +559,9 @@ image_embedding = _SynchronizedConfig(
             "base_url": "",
             "duplicate_gate": False,
             "duplicate_threshold": 0.68,
+            # 粗筛默认关闭；阈值取 T5 零误拒校准值（依据见 image_embedding.py）。
+            "coarse_filter": False,
+            "coarse_threshold": 0.089445,
         },
     )
 )
