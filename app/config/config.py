@@ -467,6 +467,7 @@ def save_config():
         config_to_save["chatterbox"] = dict(chatterbox)
         config_to_save["vlm"] = dict(vlm)
         config_to_save["image_gen"] = dict(image_gen)
+        config_to_save["image_embedding"] = dict(image_embedding)
         config_to_save["ui"] = dict(ui)
         serialized_config = toml.dumps(config_to_save)
 
@@ -544,6 +545,20 @@ image_gen = _SynchronizedConfig(
             "image_size_landscape": "1280x720",
             "num_inference_steps": 20,
             "guidance_scale": 7.5,
+        },
+    )
+)
+image_embedding = _SynchronizedConfig(
+    _cfg.get(
+        "image_embedding",
+        {
+            # [image_embedding] 段缺失时按"查重门关闭"处理：segment-first
+            # 素材流程不发起任何嵌入请求，行为与引入查重门之前完全一致。
+            "model": "tongyi-embedding-vision-flash",
+            "api_key": "",
+            "base_url": "",
+            "duplicate_gate": False,
+            "duplicate_threshold": 0.68,
         },
     )
 )
