@@ -126,6 +126,19 @@ class TestProbeImageSize(unittest.TestCase):
         self.assertEqual(vlm_judge._probe_image_size(b""), (0, 0))
 
 
+class _RecordingLogger:
+    """loguru 不走 stdlib logging 树，assertLogs 看不到——用桩记录 INFO 行。"""
+
+    def __init__(self):
+        self.infos = []
+
+    def info(self, message):
+        self.infos.append(message)
+
+    def warning(self, message):
+        pass
+
+
 class _FakeGate:
     """可编程假门：按需返回预设重复记录、None（放行）或直接抛异常。"""
 
@@ -134,8 +147,8 @@ class _FakeGate:
         self.error = error
         self.calls = []
 
-    def judge_candidate_embedding(self, url, data_uri):
-        self.calls.append((url, data_uri))
+    def judge_candidate_embedding(self, url, data_uri, term="", skip_coarse=False):
+        self.calls.append((url, data_uri, term, skip_coarse))
         if self.error is not None:
             raise self.error
         return self.record
@@ -147,6 +160,14 @@ _DUP_RECORD = {
     "image_source": "embedding",
     "duplicate_of": "https://accepted.example/video-a",
     "cos": 0.95,
+}
+
+# 与 EmbeddingGate（plan T2）冻结的 prefiltered 记录形状一致。
+_PREFILTERED_RECORD = {
+    "verdict": "prefiltered",
+    "reason": "coarse cos=0.050 < threshold 0.089",
+    "image_source": "embedding",
+    "cos": 0.05,
 }
 
 
@@ -186,7 +207,9 @@ class TestJudgeCandidateEmbeddingGate(_VlmConfigMixin, unittest.TestCase):
 
     def test_duplicate_record_returned_without_vlm_call(self):
         gate = _FakeGate(record=dict(_DUP_RECORD))
-        record, mocked_judge = self._run(gate)
+        recording = _RecordingLogger()
+        with patch.object(vlm_judge, "logger", recording):
+            record, mocked_judge = self._run(gate)
         self.assertEqual(mocked_judge.call_count, 0)
         self.assertEqual(record["verdict"], "duplicate")
         self.assertEqual(record["term"], "black hole")
@@ -197,13 +220,49 @@ class TestJudgeCandidateEmbeddingGate(_VlmConfigMixin, unittest.TestCase):
         self.assertEqual(record["page"], 2)
         self.assertEqual(record["duplicate_of"], _DUP_RECORD["duplicate_of"])
         self.assertEqual(record["cos"], 0.95)
+        # duplicate 日志逐字节锁定：关闭粗筛时审计口径与旧版完全一致
+        # （T5 校准按该行解析 run log，格式即契约）。
+        self.assertIn(
+            "embedding gate flagged duplicate: "
+            "asset_id=vid-abc, term='black hole', "
+            "duplicate_of=https://accepted.example/video-a, cos=0.95",
+            recording.infos,
+        )
 
-    def test_gate_receives_item_url_and_data_uri(self):
+    def test_gate_receives_url_data_uri_term_and_skip_coarse(self):
         gate = _FakeGate(record=dict(_DUP_RECORD))
         self._run(gate)
-        url, data_uri = gate.calls[0]
+        url, data_uri, term, skip_coarse = gate.calls[0]
         self.assertEqual(url, "https://candidate.example/video-b")
         self.assertTrue(data_uri.startswith("data:image/jpeg;base64,"))
+        self.assertEqual(term, "black hole")
+        self.assertFalse(skip_coarse)
+
+    def test_prefiltered_record_returned_without_vlm_call(self):
+        """粗筛停车（plan T3）：prefiltered 记录原样透传，绝不调 VLM；
+        走独立日志分支（verdict + cos），绝不复用 duplicate 行。"""
+        gate = _FakeGate(record=dict(_PREFILTERED_RECORD))
+        recording = _RecordingLogger()
+        with patch.object(vlm_judge, "logger", recording):
+            record, mocked_judge = self._run(gate)
+        self.assertEqual(mocked_judge.call_count, 0)
+        self.assertEqual(record["verdict"], "prefiltered")
+        self.assertEqual(record["term"], "black hole")
+        self.assertEqual(record["asset_id"], "vid-abc")
+        self.assertEqual(record["reason"], "coarse cos=0.050 < threshold 0.089")
+        self.assertEqual(record["image_source"], "embedding")
+        self.assertEqual(record["cos"], 0.05)
+        self.assertEqual(record["attempts"], 0)
+        self.assertEqual(record["page"], 2)
+        self.assertIn(
+            "embedding gate prefiltered candidate: "
+            "asset_id=vid-abc, term='black hole', verdict=prefiltered, cos=0.05",
+            recording.infos,
+        )
+        self.assertFalse(
+            any("flagged duplicate" in m for m in recording.infos),
+            "prefiltered 绝不能走 duplicate 日志分支",
+        )
 
     def test_gate_pass_through_calls_vlm(self):
         gate = _FakeGate(record=None)

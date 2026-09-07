@@ -5,6 +5,9 @@ duplicate 判定拒收契约单测。
 与装配层共用同一窗口计划，长段按需多下、短段保住多样性下限。
 嵌入门（plan T5）：verdict="duplicate" 的候选在素材层被拒收——不下载、不采纳、
 无 last-resort 兜底，但判定记录保留在 vlm_filter 审计链中。
+粗筛停车与名额补升（plan T3）：verdict="prefiltered" 的候选在 pass 1 停车
+——不下载、URL 留在 seen_urls（后续调用永不再递呈）；仅当本调用名额有缺口
+时按 cos 降序补升恰好缺口数，以 skip_coarse=True 复判交 VLM 终审。
 """
 
 import sys
@@ -12,9 +15,31 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from loguru import logger as loguru_logger
+
 from app.models.schema import VideoAspect
 from app.services import material
 from app.services import segment_material as sm
+
+
+class _LogSink:
+    """loguru 不走 stdlib logging 树，caplog 看不到——挂临时 sink 收集
+    原始消息文本。"""
+
+    def __init__(self):
+        self.messages = []
+        self._handler_id = None
+
+    def __enter__(self):
+        self._handler_id = loguru_logger.add(
+            lambda message: self.messages.append(message.record["message"]),
+            level="INFO",
+        )
+        return self
+
+    def __exit__(self, *exc_info):
+        loguru_logger.remove(self._handler_id)
+        return False
 
 
 def _video_item(url, term, provider="pexels"):
@@ -183,9 +208,9 @@ def _run_with_judge(segments, search_results, judge, on_clip_accepted=None):
         saved_urls.append(video_url)
         return f"/saved/{video_url.rsplit('/', 1)[-1]}"
 
-    def wrapped_judge(item, segment_text, search_term):
-        record = judge(item, segment_text, search_term)
-        judged.append((item.url, record.get("verdict")))
+    def wrapped_judge(item, segment_text, search_term, skip_coarse=False):
+        record = judge(item, segment_text, search_term, skip_coarse=skip_coarse)
+        judged.append((item.url, record.get("verdict"), skip_coarse))
         return record
 
     results = sm.prepare_segment_materials(
@@ -205,7 +230,7 @@ def _run_with_judge(segments, search_results, judge, on_clip_accepted=None):
 def test_duplicate_verdict_never_downloads_or_accepts():
     accepted = []
 
-    def judge(item, segment_text, search_term):
+    def judge(item, segment_text, search_term, skip_coarse=False):
         if item.url.endswith("dup.mp4"):
             return _dup_record(duplicate_of="https://v.example/a.mp4", cos=0.904)
         return _record("relevant")
@@ -242,7 +267,7 @@ def test_duplicate_verdict_never_downloads_or_accepts():
 
 
 def test_duplicate_in_middle_does_not_break_candidate_loop():
-    def judge(item, segment_text, search_term):
+    def judge(item, segment_text, search_term, skip_coarse=False):
         if item.url.endswith("dup.mp4"):
             return _dup_record(duplicate_of="https://v.example/a.mp4")
         return _record("relevant")
@@ -267,7 +292,7 @@ def test_duplicate_never_registered_in_used_urls():
     # seg0 判 duplicate 的 URL 未被下载，也就不得注册进 used_urls——
     # seg1 再见到同一 URL 时必须重新判定并可正常下载。
     # （若 bug 回归：seg0 错误下载会把它注册进 used_urls，seg2 直接跳过不判定。）
-    def judge(item, segment_text, search_term):
+    def judge(item, segment_text, search_term, skip_coarse=False):
         if segment_text == "first":
             return _dup_record(duplicate_of="https://v.example/x.mp4")
         return _record("relevant")
@@ -284,10 +309,188 @@ def test_duplicate_never_registered_in_used_urls():
         judge=judge,
     )
     # 同一 URL 被两段各判定一次：seg0 duplicate、seg1 relevant。
-    judged_same = [v for u, v in judged if u == "https://v.example/same.mp4"]
+    judged_same = [v for u, v, _ in judged if u == "https://v.example/same.mp4"]
     assert judged_same == ["duplicate", "relevant"]
     # seg0 无收：不下载、不采纳；seg1 正常下载同一 URL。
     assert results[0].clips == []
     assert results[0].clip_sources == []
     assert results[1].clips == ["/saved/same.mp4"]
     assert saved == ["https://v.example/same.mp4"]
+
+
+def _prefiltered_record(cos=0.05, asset_id=""):
+    # 镜像 vlm_judge 透传后的真实记录形状（asset_id 由判定层补齐）。
+    return {
+        "verdict": "prefiltered",
+        "reason": f"coarse cos={cos:.3f} < threshold 0.089",
+        "image_source": "embedding",
+        "cos": cos,
+        "asset_id": asset_id,
+    }
+
+
+def test_prefiltered_parked_never_downloaded_and_promoted_reject_drops():
+    """防落穿回归（T6 教训）：prefiltered 绝不落穿下载路径；升级复判
+    拒收后丢弃、不再递呈（seen_urls 保留停车 URL，page 2 / 收尾调用
+    均被挡住）；双记录进审计链。"""
+
+    def judge(item, segment_text, search_term, skip_coarse=False):
+        if skip_coarse:
+            return _record("irrelevant")
+        return _prefiltered_record(cos=0.05, asset_id=item.url)
+
+    with _LogSink() as sink:
+        results, saved, judged = _run_with_judge(
+            segments=[{"index": 0, "text": "city", "duration": 3.744}],
+            search_results={
+                "city": [_video_item("https://v.example/a.mp4", "city")]
+            },
+            judge=judge,
+        )
+    assert saved == []
+    assert results[0].clips == []
+    assert results[0].clip_sources == []
+    # 双记录：先 prefiltered（粗筛停车），后升级复判的最终 verdict。
+    assert [(r["verdict"], r.get("cos")) for r in results[0].vlm_filter] == [
+        ("prefiltered", 0.05),
+        ("irrelevant", None),
+    ]
+    # 恰好两轮判定（粗筛 + 升级复判）：拒收后不再递呈。
+    assert judged == [
+        ("https://v.example/a.mp4", "prefiltered", False),
+        ("https://v.example/a.mp4", "irrelevant", True),
+    ]
+    # 停车行独立措辞（绝不复用拒收/采纳行），带 asset_id 与 cos。
+    assert any(
+        "vlm filter prefiltered candidate (parked)" in m
+        and "asset_id=https://v.example/a.mp4" in m
+        and "cos=0.05" in m
+        for m in sink.messages
+    )
+
+
+def test_shortfall_promotes_exactly_shortfall_by_cos_desc():
+    """缺口触发补升：恰好 (needed − saved) 条、cos 降序、skip_coarse=True
+    复判且 VLM verdict 决定（relevant → 下载）；每条升级一行 INFO
+    （T6 审计 grep 该格式）。"""
+    cos_by_url = {
+        "https://v.example/p1.mp4": 0.01,
+        "https://v.example/p2.mp4": 0.08,
+        "https://v.example/p3.mp4": 0.05,
+    }
+
+    def judge(item, segment_text, search_term, skip_coarse=False):
+        if skip_coarse:
+            return _record("relevant")
+        if item.url in cos_by_url:
+            return _prefiltered_record(cos=cos_by_url[item.url], asset_id=item.url)
+        return _record("relevant")
+
+    with _LogSink() as sink:
+        results, saved, judged = _run_with_judge(
+            segments=[{"index": 0, "text": "city", "duration": 3.744}],
+            search_results={
+                "city": [
+                    _video_item("https://v.example/b.mp4", "city"),
+                    _video_item("https://v.example/p1.mp4", "city"),
+                    _video_item("https://v.example/p2.mp4", "city"),
+                    _video_item("https://v.example/p3.mp4", "city"),
+                ]
+            },
+            judge=judge,
+        )
+    # 配额拿满（needed=3：b 在位 + 缺口 2），下载顺序 = cos 降序。
+    assert results[0].clips == [
+        "/saved/b.mp4",
+        "/saved/p2.mp4",
+        "/saved/p3.mp4",
+    ]
+    assert saved == [
+        "https://v.example/b.mp4",
+        "https://v.example/p2.mp4",
+        "https://v.example/p3.mp4",
+    ]
+    # p1（最低 cos，超出缺口）未复判：只判过一次粗筛。
+    p1_calls = [j for j in judged if j[0] == "https://v.example/p1.mp4"]
+    assert p1_calls == [("https://v.example/p1.mp4", "prefiltered", False)]
+    # 被补升候选以 skip_coarse=True 复判，VLM verdict 决定。
+    p2_calls = [j for j in judged if j[0] == "https://v.example/p2.mp4"]
+    assert p2_calls == [
+        ("https://v.example/p2.mp4", "prefiltered", False),
+        ("https://v.example/p2.mp4", "relevant", True),
+    ]
+    # 双记录约定：先 prefiltered，后最终 verdict，按判定时序排列。
+    assert [r["verdict"] for r in results[0].vlm_filter] == [
+        "relevant",
+        "prefiltered",
+        "prefiltered",
+        "prefiltered",
+        "relevant",
+        "relevant",
+    ]
+    assert [
+        m for m in sink.messages
+        if "promoting prefiltered candidate for quota top-up" in m
+    ] == [
+        "promoting prefiltered candidate for quota top-up: "
+        "asset_id=https://v.example/p2.mp4, cos=0.08, slot=1/2",
+        "promoting prefiltered candidate for quota top-up: "
+        "asset_id=https://v.example/p3.mp4, cos=0.05, slot=2/2",
+    ]
+
+
+def test_quota_met_zero_promotions():
+    """配额已满：停车名单不补升——停车候选只判一次粗筛、永不下载。"""
+
+    def judge(item, segment_text, search_term, skip_coarse=False):
+        if skip_coarse:
+            return _record("relevant")
+        if item.url.endswith("park.mp4"):
+            return _prefiltered_record(cos=0.05, asset_id=item.url)
+        return _record("relevant")
+
+    with _LogSink() as sink:
+        results, saved, judged = _run_with_judge(
+            segments=[{"index": 0, "text": "city", "duration": 3.744}],
+            search_results={
+                "city": [
+                    _video_item("https://v.example/park.mp4", "city"),
+                    _video_item("https://v.example/a.mp4", "city"),
+                    _video_item("https://v.example/b.mp4", "city"),
+                    _video_item("https://v.example/c.mp4", "city"),
+                ]
+            },
+            judge=judge,
+        )
+    assert results[0].clips == ["/saved/a.mp4", "/saved/b.mp4", "/saved/c.mp4"]
+    park_calls = [j for j in judged if j[0] == "https://v.example/park.mp4"]
+    assert park_calls == [("https://v.example/park.mp4", "prefiltered", False)]
+    assert all(
+        "promoting prefiltered candidate" not in m for m in sink.messages
+    )
+
+
+def test_promoted_uncertain_follows_existing_deferral_rules():
+    """升级复判 uncertain 走既有延期规则：probe 调用回滚 seen_urls 让
+    page 2 / 收尾调用重新递呈；收尾调用（accept_uncertain=True）由
+    pass 2 兜底下载——补升不破坏 uncertain 兜底。"""
+
+    def judge(item, segment_text, search_term, skip_coarse=False):
+        if skip_coarse:
+            return _record("uncertain")
+        return _prefiltered_record(cos=0.05, asset_id=item.url)
+
+    results, saved, judged = _run_with_judge(
+        segments=[{"index": 0, "text": "city", "duration": 3.744}],
+        search_results={"city": [_video_item("https://v.example/u.mp4", "city")]},
+        judge=judge,
+    )
+    # 唯一候选最终经 pass 2 兜底下载，恰好一次。
+    assert results[0].clips == ["/saved/u.mp4"]
+    assert saved == ["https://v.example/u.mp4"]
+    # 判定序列：page1 probe / page2 probe / 收尾调用，各一轮
+    # （粗筛判定 → 补升复判）。
+    assert judged == [
+        ("https://v.example/u.mp4", "prefiltered", False),
+        ("https://v.example/u.mp4", "uncertain", True),
+    ] * 3
