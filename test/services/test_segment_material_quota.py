@@ -5,9 +5,10 @@ duplicate 判定拒收契约单测。
 与装配层共用同一窗口计划，长段按需多下、短段保住多样性下限。
 嵌入门（plan T5）：verdict="duplicate" 的候选在素材层被拒收——不下载、不采纳、
 无 last-resort 兜底，但判定记录保留在 vlm_filter 审计链中。
-粗筛停车与名额补升（plan T3）：verdict="prefiltered" 的候选在 pass 1 停车
-——不下载、URL 留在 seen_urls（后续调用永不再递呈）；仅当本调用名额有缺口
-时按 cos 降序补升恰好缺口数，以 skip_coarse=True 复判交 VLM 终审。
+重排 top-N（plan rerank-top5-vlm）：judge 启用时每个 (词条, 页) 在送 VLM 前
+先经 material_rerank.rerank_page 重排，只把 top-N（含无缩略图候选）按重排
+顺序交判定；已用/已判定 URL 在重排前剔除；重排结果按 (词条, 页) 备忘，
+同一运行内只算一次；重排调用抛异常时按 provider 原序 fail-open 并告警。
 """
 
 import sys
@@ -208,9 +209,9 @@ def _run_with_judge(segments, search_results, judge, on_clip_accepted=None):
         saved_urls.append(video_url)
         return f"/saved/{video_url.rsplit('/', 1)[-1]}"
 
-    def wrapped_judge(item, segment_text, search_term, skip_coarse=False):
-        record = judge(item, segment_text, search_term, skip_coarse=skip_coarse)
-        judged.append((item.url, record.get("verdict"), skip_coarse))
+    def wrapped_judge(item, segment_text, search_term):
+        record = judge(item, segment_text, search_term)
+        judged.append((item.url, record.get("verdict")))
         return record
 
     results = sm.prepare_segment_materials(
@@ -230,7 +231,7 @@ def _run_with_judge(segments, search_results, judge, on_clip_accepted=None):
 def test_duplicate_verdict_never_downloads_or_accepts():
     accepted = []
 
-    def judge(item, segment_text, search_term, skip_coarse=False):
+    def judge(item, segment_text, search_term):
         if item.url.endswith("dup.mp4"):
             return _dup_record(duplicate_of="https://v.example/a.mp4", cos=0.904)
         return _record("relevant")
@@ -267,7 +268,7 @@ def test_duplicate_verdict_never_downloads_or_accepts():
 
 
 def test_duplicate_in_middle_does_not_break_candidate_loop():
-    def judge(item, segment_text, search_term, skip_coarse=False):
+    def judge(item, segment_text, search_term):
         if item.url.endswith("dup.mp4"):
             return _dup_record(duplicate_of="https://v.example/a.mp4")
         return _record("relevant")
@@ -292,7 +293,7 @@ def test_duplicate_never_registered_in_used_urls():
     # seg0 判 duplicate 的 URL 未被下载，也就不得注册进 used_urls——
     # seg1 再见到同一 URL 时必须重新判定并可正常下载。
     # （若 bug 回归：seg0 错误下载会把它注册进 used_urls，seg2 直接跳过不判定。）
-    def judge(item, segment_text, search_term, skip_coarse=False):
+    def judge(item, segment_text, search_term):
         if segment_text == "first":
             return _dup_record(duplicate_of="https://v.example/x.mp4")
         return _record("relevant")
@@ -309,7 +310,7 @@ def test_duplicate_never_registered_in_used_urls():
         judge=judge,
     )
     # 同一 URL 被两段各判定一次：seg0 duplicate、seg1 relevant。
-    judged_same = [v for u, v, _ in judged if u == "https://v.example/same.mp4"]
+    judged_same = [v for u, v in judged if u == "https://v.example/same.mp4"]
     assert judged_same == ["duplicate", "relevant"]
     # seg0 无收：不下载、不采纳；seg1 正常下载同一 URL。
     assert results[0].clips == []
@@ -318,182 +319,222 @@ def test_duplicate_never_registered_in_used_urls():
     assert saved == ["https://v.example/same.mp4"]
 
 
-def _prefiltered_record(cos=0.05, asset_id=""):
-    # 镜像 vlm_judge 透传后的真实记录形状（asset_id 由判定层补齐）。
-    return {
-        "verdict": "prefiltered",
-        "reason": f"coarse cos={cos:.3f} < threshold 0.089",
-        "image_source": "embedding",
-        "cos": cos,
-        "asset_id": asset_id,
-    }
+def _patch_rerank(monkeypatch, behavior):
+    """material_rerank.rerank_page 打桩：记录每次 (term, [url...], top_n)
+    调用，返回值由 behavior(term, items, top_n) 决定。"""
+    calls = []
+
+    def fake_rerank(term, items, top_n):
+        calls.append((term, [i.url for i in items], top_n))
+        return behavior(term, items, top_n)
+
+    monkeypatch.setattr(sm.material_rerank, "rerank_page", fake_rerank)
+    return calls
 
 
-def test_prefiltered_parked_never_downloaded_and_promoted_reject_drops():
-    """防落穿回归（T6 教训）：prefiltered 绝不落穿下载路径；升级复判
-    拒收后丢弃、不再递呈（seen_urls 保留停车 URL，page 2 / 收尾调用
-    均被挡住）；双记录进审计链。"""
+def test_judge_receives_reranked_top5_in_ranked_order(monkeypatch):
+    """重排桩返回固定顺序：VLM 判定恰好按 top-5 重排顺序进行；名额打满后
+    尾部候选不再判定（plan rerank-top5-vlm 核心诉求）。"""
+    items = [_video_item(f"https://v.example/{c}.mp4", "city") for c in "abcdefg"]
 
-    def judge(item, segment_text, search_term, skip_coarse=False):
-        if skip_coarse:
-            return _record("irrelevant")
-        return _prefiltered_record(cos=0.05, asset_id=item.url)
+    def fixed_order(term, page_items, top_n):
+        # 重排桩：top-5 打乱到 [e, a, c, b, d]，尾部原序跟在后面。
+        ranked = [
+            page_items[4], page_items[0], page_items[2],
+            page_items[1], page_items[3],
+        ]
+        return ranked + page_items[5:]
 
-    with _LogSink() as sink:
-        results, saved, judged = _run_with_judge(
-            segments=[{"index": 0, "text": "city", "duration": 3.744}],
-            search_results={
-                "city": [_video_item("https://v.example/a.mp4", "city")]
-            },
-            judge=judge,
-        )
-    assert saved == []
-    assert results[0].clips == []
-    assert results[0].clip_sources == []
-    # 双记录：先 prefiltered（粗筛停车），后升级复判的最终 verdict。
-    assert [(r["verdict"], r.get("cos")) for r in results[0].vlm_filter] == [
-        ("prefiltered", 0.05),
-        ("irrelevant", None),
-    ]
-    # 恰好两轮判定（粗筛 + 升级复判）：拒收后不再递呈。
-    assert judged == [
-        ("https://v.example/a.mp4", "prefiltered", False),
-        ("https://v.example/a.mp4", "irrelevant", True),
-    ]
-    # 停车行独立措辞（绝不复用拒收/采纳行），带 asset_id 与 cos。
-    assert any(
-        "vlm filter prefiltered candidate (parked)" in m
-        and "asset_id=https://v.example/a.mp4" in m
-        and "cos=0.05" in m
-        for m in sink.messages
-    )
+    rerank_calls = _patch_rerank(monkeypatch, fixed_order)
 
-
-def test_shortfall_promotes_exactly_shortfall_by_cos_desc():
-    """缺口触发补升：恰好 (needed − saved) 条、cos 降序、skip_coarse=True
-    复判且 VLM verdict 决定（relevant → 下载）；每条升级一行 INFO
-    （T6 审计 grep 该格式）。"""
-    cos_by_url = {
-        "https://v.example/p1.mp4": 0.01,
-        "https://v.example/p2.mp4": 0.08,
-        "https://v.example/p3.mp4": 0.05,
-    }
-
-    def judge(item, segment_text, search_term, skip_coarse=False):
-        if skip_coarse:
-            return _record("relevant")
-        if item.url in cos_by_url:
-            return _prefiltered_record(cos=cos_by_url[item.url], asset_id=item.url)
+    def judge(item, segment_text, search_term):
         return _record("relevant")
-
-    with _LogSink() as sink:
-        results, saved, judged = _run_with_judge(
-            segments=[{"index": 0, "text": "city", "duration": 3.744}],
-            search_results={
-                "city": [
-                    _video_item("https://v.example/b.mp4", "city"),
-                    _video_item("https://v.example/p1.mp4", "city"),
-                    _video_item("https://v.example/p2.mp4", "city"),
-                    _video_item("https://v.example/p3.mp4", "city"),
-                ]
-            },
-            judge=judge,
-        )
-    # 配额拿满（needed=3：b 在位 + 缺口 2），下载顺序 = cos 降序。
-    assert results[0].clips == [
-        "/saved/b.mp4",
-        "/saved/p2.mp4",
-        "/saved/p3.mp4",
-    ]
-    assert saved == [
-        "https://v.example/b.mp4",
-        "https://v.example/p2.mp4",
-        "https://v.example/p3.mp4",
-    ]
-    # p1（最低 cos，超出缺口）未复判：只判过一次粗筛。
-    p1_calls = [j for j in judged if j[0] == "https://v.example/p1.mp4"]
-    assert p1_calls == [("https://v.example/p1.mp4", "prefiltered", False)]
-    # 被补升候选以 skip_coarse=True 复判，VLM verdict 决定。
-    p2_calls = [j for j in judged if j[0] == "https://v.example/p2.mp4"]
-    assert p2_calls == [
-        ("https://v.example/p2.mp4", "prefiltered", False),
-        ("https://v.example/p2.mp4", "relevant", True),
-    ]
-    # 双记录约定：先 prefiltered，后最终 verdict，按判定时序排列。
-    assert [r["verdict"] for r in results[0].vlm_filter] == [
-        "relevant",
-        "prefiltered",
-        "prefiltered",
-        "prefiltered",
-        "relevant",
-        "relevant",
-    ]
-    assert [
-        m for m in sink.messages
-        if "promoting prefiltered candidate for quota top-up" in m
-    ] == [
-        "promoting prefiltered candidate for quota top-up: "
-        "asset_id=https://v.example/p2.mp4, cos=0.08, slot=1/2",
-        "promoting prefiltered candidate for quota top-up: "
-        "asset_id=https://v.example/p3.mp4, cos=0.05, slot=2/2",
-    ]
-
-
-def test_quota_met_zero_promotions():
-    """配额已满：停车名单不补升——停车候选只判一次粗筛、永不下载。"""
-
-    def judge(item, segment_text, search_term, skip_coarse=False):
-        if skip_coarse:
-            return _record("relevant")
-        if item.url.endswith("park.mp4"):
-            return _prefiltered_record(cos=0.05, asset_id=item.url)
-        return _record("relevant")
-
-    with _LogSink() as sink:
-        results, saved, judged = _run_with_judge(
-            segments=[{"index": 0, "text": "city", "duration": 3.744}],
-            search_results={
-                "city": [
-                    _video_item("https://v.example/park.mp4", "city"),
-                    _video_item("https://v.example/a.mp4", "city"),
-                    _video_item("https://v.example/b.mp4", "city"),
-                    _video_item("https://v.example/c.mp4", "city"),
-                ]
-            },
-            judge=judge,
-        )
-    assert results[0].clips == ["/saved/a.mp4", "/saved/b.mp4", "/saved/c.mp4"]
-    park_calls = [j for j in judged if j[0] == "https://v.example/park.mp4"]
-    assert park_calls == [("https://v.example/park.mp4", "prefiltered", False)]
-    assert all(
-        "promoting prefiltered candidate" not in m for m in sink.messages
-    )
-
-
-def test_promoted_uncertain_follows_existing_deferral_rules():
-    """升级复判 uncertain 走既有延期规则：probe 调用回滚 seen_urls 让
-    page 2 / 收尾调用重新递呈；收尾调用（accept_uncertain=True）由
-    pass 2 兜底下载——补升不破坏 uncertain 兜底。"""
-
-    def judge(item, segment_text, search_term, skip_coarse=False):
-        if skip_coarse:
-            return _record("uncertain")
-        return _prefiltered_record(cos=0.05, asset_id=item.url)
 
     results, saved, judged = _run_with_judge(
-        segments=[{"index": 0, "text": "city", "duration": 3.744}],
-        search_results={"city": [_video_item("https://v.example/u.mp4", "city")]},
+        segments=[{"index": 0, "text": "city", "duration": 12.816}],
+        search_results={"city": items},
         judge=judge,
     )
-    # 唯一候选最终经 pass 2 兜底下载，恰好一次。
-    assert results[0].clips == ["/saved/u.mp4"]
-    assert saved == ["https://v.example/u.mp4"]
-    # 判定序列：page1 probe / page2 probe / 收尾调用，各一轮
-    # （粗筛判定 → 补升复判）。
-    assert judged == [
-        ("https://v.example/u.mp4", "prefiltered", False),
-        ("https://v.example/u.mp4", "uncertain", True),
-    ] * 3
+    # 判定序列 = 重排后的 top-5 顺序；f/g 从未进判定。
+    assert [u for u, _ in judged] == [
+        f"https://v.example/{c}.mp4" for c in "eacbd"
+    ]
+    # 下载顺序与采纳结果同序，配额 5 拿满（D=12.816/W=3 → 5 窗）。
+    assert results[0].clips == [f"/saved/{c}.mp4" for c in "eacbd"]
+    assert saved == [f"https://v.example/{c}.mp4" for c in "eacbd"]
+    # 重排恰好一次，输入是整页新鲜候选（本例无排除项）。
+    assert [(term, urls) for term, urls, _ in rerank_calls] == [
+        ("city", [f"https://v.example/{c}.mp4" for c in "abcdefg"])
+    ]
+
+
+def test_judge_disabled_items_pass_through_unrated(monkeypatch):
+    """judge 未启用：不调用重排，候选按 provider 原序直接下载（旧行为）。"""
+    items = [_video_item(f"https://v.example/{c}.mp4", "city") for c in "abcd"]
+    rerank_calls = _patch_rerank(
+        monkeypatch, lambda term, page_items, top_n: list(page_items)
+    )
+
+    results, _, saved = _run(
+        segments=[{"index": 0, "text": "city", "duration": 3.744}],
+        search_results={"city": items},
+    )
+    assert rerank_calls == []
+    assert results[0].clips == [f"/saved/{c}.mp4" for c in "abc"]
+    assert saved == [f"https://v.example/{c}.mp4" for c in "abc"]
+
+
+def test_used_urls_excluded_before_rerank_call(monkeypatch):
+    """跨段已采纳 URL 在重排调用前剔除：seg1 的重排输入不含 seg0 已下载
+    的候选（重排名额不浪费在已用素材上）。"""
+    tb_items = [_video_item("https://v.example/u1.mp4", "tb")] + [
+        _video_item(f"https://v.example/b{i}.mp4", "tb") for i in (1, 2, 3, 4)
+    ]
+    rerank_calls = _patch_rerank(
+        monkeypatch, lambda term, page_items, top_n: list(page_items)
+    )
+
+    def judge(item, segment_text, search_term):
+        return _record("relevant")
+
+    results, saved, _ = _run_with_judge(
+        segments=[
+            {"index": 0, "text": "first", "search_term": "ta", "duration": 3.744},
+            {"index": 1, "text": "second", "search_term": "tb", "duration": 3.744},
+        ],
+        search_results={
+            "ta": [_video_item("https://v.example/u1.mp4", "ta")],
+            "tb": tb_items,
+        },
+        judge=judge,
+    )
+    # seg0 重排输入 = 整页 [u1]；seg1 重排输入 = [b1..b4]（u1 已被 seg0
+    # 采纳，进入 used_urls 后在重排前剔除）。
+    assert [(term, urls) for term, urls, _ in rerank_calls] == [
+        ("ta", ["https://v.example/u1.mp4"]),
+        ("tb", [
+            "https://v.example/b1.mp4",
+            "https://v.example/b2.mp4",
+            "https://v.example/b3.mp4",
+            "https://v.example/b4.mp4",
+        ]),
+    ]
+    # seg1 不再判定/下载 u1，从新鲜候选拿满名额。
+    assert results[1].clips == [
+        "/saved/b1.mp4", "/saved/b2.mp4", "/saved/b3.mp4",
+    ]
+    assert saved.count("https://v.example/u1.mp4") == 1
+
+
+def test_judged_urls_excluded_before_rerank_on_page_two(monkeypatch):
+    """本层已判定 URL 在第 2 页重排前剔除：page1 判过的 p1 即使再次出现
+    在 page2 原始结果里也不进重排输入。"""
+    p1 = _video_item("https://v.example/p1.mp4", "t")
+    pages = {
+        1: [p1],
+        2: [p1]
+        + [_video_item(f"https://v.example/f{i}.mp4", "t") for i in (1, 2, 3)],
+    }
+    rerank_calls = _patch_rerank(
+        monkeypatch, lambda term, page_items, top_n: list(page_items)
+    )
+
+    def fake_search(search_term, minimum_duration, video_aspect, page=1):
+        return list(pages.get(page, []))
+
+    def judge(item, segment_text, search_term):
+        return _record("irrelevant" if "p1" in item.url else "relevant")
+
+    results = sm.prepare_segment_materials(
+        segments=[{"index": 0, "text": "t"}],
+        video_subject="",
+        search_videos=fake_search,
+        save_video=lambda video_url, save_dir="": (
+            f"/saved/{video_url.rsplit('/', 1)[-1]}"
+        ),
+        video_aspect=VideoAspect.portrait,
+        clip_duration=3,
+        save_dir="/materials",
+        judge_candidate=judge,
+    )
+    # 第 1 页重排输入含 p1；第 2 页重排输入只剩新鲜候选（p1 已判定）。
+    assert [(term, urls) for term, urls, _ in rerank_calls] == [
+        ("t", ["https://v.example/p1.mp4"]),
+        ("t", [
+            "https://v.example/f1.mp4",
+            "https://v.example/f2.mp4",
+            "https://v.example/f3.mp4",
+        ]),
+    ]
+    assert results[0].clips == [
+        "/saved/f1.mp4", "/saved/f2.mp4", "/saved/f3.mp4",
+    ]
+
+
+def test_rerank_memoized_once_per_term_page(monkeypatch):
+    """同一 (词条, 页) 跨段复用时重排只算一次（备忘命中不重调、不重记）。"""
+    items = [_video_item(f"https://v.example/{c}.mp4", "city") for c in "abcdefg"]
+
+    def top3_scrambled(term, page_items, top_n):
+        return [page_items[2], page_items[0], page_items[1]] + page_items[3:]
+
+    rerank_calls = _patch_rerank(monkeypatch, top3_scrambled)
+
+    def judge(item, segment_text, search_term):
+        return _record("relevant")
+
+    results, _, _ = _run_with_judge(
+        segments=[
+            {"index": 0, "text": "city", "duration": 3.744},
+            {"index": 1, "text": "city", "duration": 3.744},
+        ],
+        search_results={"city": items},
+        judge=judge,
+    )
+    # 两段共用 (city, 1)：重排只在 seg0 首次遇到时发生一次。
+    assert len(rerank_calls) == 1
+    # seg0 按重排顺序拿 c,a,b；seg1 复用同一选择，used 跳过后拿 d,e,f。
+    assert results[0].clips == ["/saved/c.mp4", "/saved/a.mp4", "/saved/b.mp4"]
+    assert results[1].clips == ["/saved/d.mp4", "/saved/e.mp4", "/saved/f.mp4"]
+
+
+def test_rerank_raise_falls_back_to_fresh_with_warning(monkeypatch):
+    """重排调用抛异常：告警后按 provider 原序 fail-open，流水线继续；
+    兜底结果进备忘，同 (词条, 页) 不再二次触发异常。"""
+
+    def exploding_rerank(term, page_items, top_n):
+        raise RuntimeError("reranker exploded")
+
+    rerank_calls = _patch_rerank(monkeypatch, exploding_rerank)
+
+    def judge(item, segment_text, search_term):
+        return _record("relevant")
+
+    items = [_video_item(f"https://v.example/{c}.mp4", "city") for c in "abcdef"]
+
+    with _LogSink() as sink:
+        results, saved, _ = _run_with_judge(
+            segments=[
+                {"index": 0, "text": "city", "duration": 3.744},
+                {"index": 1, "text": "city", "duration": 3.744},
+            ],
+            search_results={"city": items},
+            judge=judge,
+        )
+    # 抛异常的重排恰好被调用一次（seg0 首遇；seg1 复用兜底备忘）。
+    assert len(rerank_calls) == 1
+    # 两段都按 provider 原序拿满名额——选择退化为无重排，流水线不中断。
+    assert results[0].clips == ["/saved/a.mp4", "/saved/b.mp4", "/saved/c.mp4"]
+    assert results[1].clips == ["/saved/d.mp4", "/saved/e.mp4", "/saved/f.mp4"]
+    assert saved == [f"https://v.example/{c}.mp4" for c in "abcdef"]
+    # 告警行：term/page/error 字段齐全（loguru 需 sink 捕获，caplog 不可见）。
+    assert any(
+        "material rerank page selection failed" in m
+        and "term='city'" in m
+        and "page=1" in m
+        and "error=RuntimeError" in m
+        for m in sink.messages
+    )
 
 
 def test_resolution_summary_logged_for_success_and_empty():
@@ -501,7 +542,7 @@ def test_resolution_summary_logged_for_success_and_empty():
     截断前真实判定数），整层空手时补一行空层标记——配额提前打满的段
     不产生空层行。"""
 
-    def judge(item, segment_text, search_term, skip_coarse=False):
+    def judge(item, segment_text, search_term):
         return _record("relevant")
 
     with _LogSink() as sink:

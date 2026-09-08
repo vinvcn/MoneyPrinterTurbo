@@ -24,9 +24,10 @@ Every attempt is recorded on the segment record so the task manifest can show
 which term actually produced the visuals.
 
 Optional VLM pre-download filter (issue #9): when the [vlm] config section is
-enabled, every candidate is visually judged (thumbnail or first frame) before
-download; irrelevant candidates are skipped, and exhausted pages roll into the
-same fallback chain.
+enabled, each search page is first reranked with the Qwen3-VL reranker
+(plan rerank-top5-vlm) and only its top-N candidates are visually judged
+(thumbnail or first frame) before download; irrelevant candidates are skipped,
+and exhausted pages roll into the same fallback chain.
 """
 
 from dataclasses import dataclass, field
@@ -38,7 +39,7 @@ from loguru import logger
 
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect
-from app.services import task_artifacts
+from app.services import material_rerank, task_artifacts
 from app.services.video import segment_window_plan
 from app.utils import utils
 
@@ -165,18 +166,13 @@ def _download_clips_for_term(
     image-gen/empty-segment fallbacks cover starvation instead). The record
     still lands in `filter_records` so the audit chain shows the gate fired.
 
-    A `prefiltered` verdict (coarse embedding prefilter, plan T3) parks the
-    candidate: it is never downloaded in pass 1 and its URL deliberately
-    stays in `seen_urls` (no rollback), so later calls — page 2, the next
-    fallback level, the closing call — never re-offer it. When the call ends
-    short of its quota, the most promising parked candidates (highest cosine
-    first, exactly the shortfall count) are promoted: re-judged with
-    `skip_coarse=True` so the VLM has the final say, then handled by the
-    normal verdict rules. Accepted consequence: promoted below-threshold
-    candidates preempt fresh page-2/next-level candidates (page 2 may never
-    be fetched when promotion fills the quota). The closing call never
-    re-offers parked candidates (they are invisible via `seen_urls`), so the
-    uncertain last-resort pass below is unaffected.
+    Candidate selection happens upstream in `prepare_segment_materials`
+    (plan rerank-top5-vlm): when the VLM filter is enabled, each search page
+    is reranked with the Qwen3-VL reranker and only the top-N candidates
+    (plus thumbnail-less stragglers) reach this function, already in ranked
+    order. This function therefore consumes an already-ranked list and runs
+    no rerank of its own — the verdict rules below simply operate on that
+    order.
     """
     saved_paths: List[str] = []
     clip_sources: List[dict] = []
@@ -219,25 +215,14 @@ def _download_clips_for_term(
             return saved_video_path
         return ""
 
-    def _judge(item: MaterialInfo, skip_coarse: bool = False) -> dict | None:
+    def _judge(item: MaterialInfo) -> dict | None:
         if judge_candidate is None:
             return None
-        if skip_coarse:
-            # 仅补升复判需要透传 skip_coarse；旧签名判定回调（测试替身、
-            # 第三方扩展，同 search_videos 的 page 参数兼容惯例）不接受
-            # 该参数，而它们也绝不可能返回 prefiltered 触发补升。
-            verdict = judge_candidate(
-                item=item,
-                segment_text=segment_text,
-                search_term=term,
-                skip_coarse=True,
-            )
-        else:
-            verdict = judge_candidate(
-                item=item,
-                segment_text=segment_text,
-                search_term=term,
-            )
+        verdict = judge_candidate(
+            item=item,
+            segment_text=segment_text,
+            search_term=term,
+        )
         if filter_records is not None:
             filter_records.append(verdict)
         v = verdict.get("verdict")
@@ -257,15 +242,6 @@ def _download_clips_for_term(
                 f"image_source={verdict.get('image_source')}"
                 f"{detail}"
             )
-        elif v == "prefiltered":
-            # 粗筛停车（plan T3）：独立措辞 + cos，供校准审计对账；
-            # 绝不复用拒收/采纳行。
-            logger.info(
-                "vlm filter prefiltered candidate (parked): "
-                f"asset_id={verdict.get('asset_id')}, "
-                f"cos={verdict.get('cos')}, "
-                f"image_source={verdict.get('image_source')}"
-            )
         else:
             logger.info(
                 "vlm filter accepted candidate: "
@@ -283,10 +259,6 @@ def _download_clips_for_term(
     # a fallback would put the very near-duplicate family the gate exists to
     # block back on the timeline).
     deferred_uncertain: List[MaterialInfo] = []
-    # 粗筛停车名单（plan T3）：(候选, 余弦)。prefiltered 候选本调用内
-    # 不下载、URL 留在 seen_urls（后续调用永不再递呈），仅当名额有缺口
-    # 时按 cos 降序补升复判（见下方 promotion 块）。
-    deferred_prefiltered: List[tuple[MaterialInfo, float]] = []
     for item in items:
         if len(saved_paths) >= needed_count:
             break
@@ -307,13 +279,6 @@ def _download_clips_for_term(
             continue
         if verdict.get("verdict") in ("irrelevant", "duplicate"):
             continue
-        if verdict.get("verdict") == "prefiltered":
-            # 停车而非下载（T6 教训：显式处理每个 verdict，绝不落穿）。
-            # cos 缺失（第三方 gate 违约）按 0.0 记——排序时垫底。
-            deferred_prefiltered.append(
-                (item, float(verdict.get("cos") or 0.0))
-            )
-            continue
         if verdict.get("verdict") == "uncertain":
             if accept_uncertain:
                 deferred_uncertain.append(item)
@@ -321,64 +286,10 @@ def _download_clips_for_term(
                 # 本调用不允许兜底时，把 URL 从 seen_urls 回滚，让最后一层
                 # 的收尾调用能重新见到并延期该候选（seen_urls 的语义是
                 # "已下载"，不是"已判定"——判定状态由 deferred 名单跟踪）。
-                # 唯一例外是 prefiltered 停车：停车 URL 有意留在 seen_urls
-                # 不回滚（见下方 promotion 块），后续调用永不再递呈。
                 seen_urls.discard(item.url)
             continue
         if not _download_one(item):
             continue
-
-    # Top-up promotion（plan T3）：pass 1 停车了低于粗筛阈值的候选；若本
-    # 调用仍有名额缺口，把最有希望的停车候选（cos 降序、恰好缺口数）交
-    # VLM 终审——以 skip_coarse=True 复判，粗筛不再拦截。复判沿用既有
-    # verdict 规则：relevant 下载；uncertain 走既有延期规则；
-    # irrelevant/duplicate 丢弃。复判会重新拉取预览图（缩略图，或
-    # first_frame 来源时临时下载 mp4）——已接受的代价。
-    #
-    # 双记录约定：一个被补升的候选产生两条 filter 记录（先 "prefiltered"，
-    # 后最终 VLM verdict）；未来校准按 (term, asset_id) 去重、保留最后一条。
-    #
-    # 补升按调用粒度生效（probe 调用也不例外）；停车 URL 有意留在
-    # seen_urls（不回滚），后续调用（第 2 页、下一层、收尾调用）永不再
-    # 递呈它们。接受的后果：被补升的低分候选会抢占第 2 页/下一层的新鲜
-    # 候选（补升拿满名额时第 2 页可能永不拉取）——这正是 top-up 策略。
-    # 收尾调用永远不会见到停车候选（被 seen_urls 挡住），uncertain 兜底
-    # 不受影响。
-    if len(saved_paths) < needed_count and deferred_prefiltered:
-        shortfall = needed_count - len(saved_paths)
-        ranked = sorted(
-            deferred_prefiltered, key=lambda pair: pair[1], reverse=True
-        )[:shortfall]
-        for slot, (item, cos) in enumerate(ranked, start=1):
-            if used_urls and item.url in used_urls:
-                logger.info(
-                    "skipping candidate already used by an earlier segment: "
-                    f"url={item.url}"
-                )
-                continue
-            source = (
-                item.source_info if isinstance(item.source_info, dict) else {}
-            )
-            logger.info(
-                "promoting prefiltered candidate for quota top-up: "
-                f"asset_id={str(source.get('asset_id') or '')}, "
-                f"cos={cos}, slot={slot}/{shortfall}"
-            )
-            verdict = _judge(item, skip_coarse=True)
-            v = verdict.get("verdict") if verdict else None
-            if v in (None, "irrelevant", "duplicate", "prefiltered"):
-                # None（判定回调缺席，类型契约允许）与拒收同途丢弃；
-                # skip_coarse=True 下守约的 gate 不应再返回 prefiltered，
-                # 万一出现也绝不落穿下载（T6 教训）。
-                continue
-            if v == "uncertain":
-                if accept_uncertain:
-                    deferred_uncertain.append(item)
-                else:
-                    seen_urls.discard(item.url)
-                continue
-            if not _download_one(item):
-                continue
 
     # Pass 2 (last resort): the level ran dry on relevant candidates; accept
     # deferred uncertain ones so the segment is not starved. The caller sets
@@ -449,6 +360,11 @@ def prepare_segment_materials(
     # so a repeated term does not hit the provider API again. Page-aware:
     # page 1 must exist before page 2 is fetched (issue #9 D6).
     search_cache: dict[tuple[str, int], List[MaterialInfo]] = {}
+    # 重排 top-N 与 (词条, 页) 备忘（plan rerank-top5-vlm）：top_n 每次运行
+    # 只读一次；备忘与 search_cache 同为本次调用的局部状态，不会跨调用
+    # 泄漏。仅 VLM 判定启用时使用。
+    rerank_top_n = material_rerank._top_n()
+    rerank_cache: dict[tuple[str, int], List[MaterialInfo]] = {}
     def search_page_cached(term: str, page: int) -> List[MaterialInfo]:
         normalized = (term or "").strip()
         if not normalized:
@@ -561,7 +477,8 @@ def prepare_segment_materials(
             level_sources: List[dict] = []
             level_seen_urls: set[str] = set()
             # 收集阶段：逐页把候选聚到 level_page_items（共享 level_seen_urls
-            # 去重）。probe 调用（accept_uncertain=False）只下载 relevant，
+            # 去重）。judge 启用时收集的是重排 top-N 选择而非整页原始候选。
+            # probe 调用（accept_uncertain=False）只下载 relevant，
             # used_urls 的跳过判断也在 probe 中生效——已用素材不会进名额；
             # 本层目标名额是 needed（全链剩余缺口），不是每层都重下满额。
             # 翻页条件沿用 issue #9 D6：本页连一个 relevant 片段都没凑出
@@ -571,9 +488,48 @@ def prepare_segment_materials(
                 page_items = search_page_cached(term, page)
                 if not page_items:
                     break
-                level_page_items.extend(page_items)
+                if judge_candidate is None:
+                    # 未启用 VLM 判定：整页候选原样收集、原样送审，不重排、
+                    # 不建备忘（旧行为逐字节等价）。
+                    level_page_items.extend(page_items)
+                    probe_items = page_items
+                else:
+                    # 重排备忘（plan rerank-top5-vlm）：每个 (词条, 页) 只在
+                    # 首次遇到时计算一次 top-N 选择；后续命中直接复用，
+                    # 既不重调重排，也不重打重排审计行（重排模块只在真正
+                    # 重排时落日志）。
+                    cache_key = (term, page)
+                    if cache_key not in rerank_cache:
+                        # 已用/已判定 URL 在重排前剔除：重排名额不浪费在
+                        # 本层已判定（seen_urls）或跨段已采纳（used_urls）
+                        # 的候选上。union 产生新集合，不改动两处原状态。
+                        excluded = level_seen_urls | used_urls_across_segments
+                        fresh = [
+                            item
+                            for item in page_items
+                            if item.url and item.url not in excluded
+                        ]
+                        try:
+                            page_selection = material_rerank.rerank_page(
+                                term, fresh, rerank_top_n
+                            )
+                        except Exception as exc:
+                            # belt-and-braces：重排模块内部已 fail-open，这里
+                            # 只兜"重排调用本身被替换/抛异常"的情况——告警后
+                            # 按 provider 原序放行 fresh，流水线绝不中断。
+                            logger.warning(
+                                "material rerank page selection failed, "
+                                "falling back to provider order: "
+                                f"term={term!r}, page={page}, "
+                                f"error={type(exc).__name__}, detail={exc}"
+                            )
+                            page_selection = fresh
+                        rerank_cache[cache_key] = page_selection
+                    page_selection = rerank_cache[cache_key]
+                    level_page_items.extend(page_selection)
+                    probe_items = page_selection
                 probe_clips, probe_sources = _download_clips_for_term(
-                    items=page_items,
+                    items=probe_items,
                     needed_count=needed,
                     save_video=save_video,
                     save_dir=material_directory,
