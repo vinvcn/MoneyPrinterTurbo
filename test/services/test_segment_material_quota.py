@@ -494,3 +494,82 @@ def test_promoted_uncertain_follows_existing_deferral_rules():
         ("https://v.example/u.mp4", "prefiltered", False),
         ("https://v.example/u.mp4", "uncertain", True),
     ] * 3
+
+
+def test_resolution_summary_logged_for_success_and_empty():
+    """审计缺口 G1/G2：每段一行汇总（成功与空手都触发；vlm_judged 取
+    截断前真实判定数），整层空手时补一行空层标记——配额提前打满的段
+    不产生空层行。"""
+
+    def judge(item, segment_text, search_term, skip_coarse=False):
+        return _record("relevant")
+
+    with _LogSink() as sink:
+        results, _, _ = _run_with_judge(
+            segments=[
+                {"index": 0, "text": "city", "duration": 3.744},
+                {"index": 1, "text": "void", "duration": 3.744},
+            ],
+            search_results={
+                "city": [
+                    _video_item("https://v.example/a.mp4", "city"),
+                    _video_item("https://v.example/b.mp4", "city"),
+                    _video_item("https://v.example/c.mp4", "city"),
+                ]
+            },
+            judge=judge,
+        )
+    assert results[0].clips == ["/saved/a.mp4", "/saved/b.mp4", "/saved/c.mp4"]
+    assert results[1].clips == []
+    # 成功段汇总：配额、命中词条、回退层级、尝试层数、判定量齐全。
+    assert (
+        "segment 0: material resolution summary: clips=3/3, "
+        "resolved_term='city', fallback_level=self, levels_tried=1, "
+        "vlm_judged=3, image_gen=0"
+    ) in sink.messages
+    # 空手段同一格式：resolved_term/fallback_level 为空（!r 渲染 ''）。
+    assert (
+        "segment 1: material resolution summary: clips=0/3, "
+        "resolved_term='', fallback_level=, levels_tried=1, "
+        "vlm_judged=0, image_gen=0"
+    ) in sink.messages
+    # G2：空手段的 self 层补一行空层标记；成功段没有。
+    assert (
+        "segment 1: level produced no clips, level=self, term='void'"
+    ) in sink.messages
+    assert not any(
+        "level produced no clips" in m and m.startswith("segment 0:")
+        for m in sink.messages
+    )
+
+
+def test_imagegen_fallback_success_logged():
+    """审计缺口 G4：自有词条全空手且图片兜底成功时补一行，标明画面来自
+    生成概念图（只记文件名）；汇总行同步反映 fallback_level=subject。"""
+    with _LogSink() as sink:
+        results = sm.prepare_segment_materials(
+            segments=[{"index": 2, "text": "void", "duration": 3.744}],
+            video_subject="generic money",
+            search_videos=lambda search_term, minimum_duration, video_aspect: [],
+            save_video=lambda video_url, save_dir="": (
+                f"/saved/{video_url.rsplit('/', 1)[-1]}"
+            ),
+            video_aspect=VideoAspect.portrait,
+            clip_duration=3,
+            save_dir="/materials",
+            generate_image=lambda segment_text, subject_term: (
+                "/saved/gen1.mp4",
+                {"model": "Kwai-Kolors/Kolors", "source": "kolors"},
+            ),
+        )
+    assert results[0].clips == ["/saved/gen1.mp4"]
+    assert results[0].fallback_level == "subject"
+    assert (
+        "segment 2: image-gen fallback engaged: clip=gen1.mp4"
+    ) in sink.messages
+    # 汇总行与图片兜底状态一致：clips=1/3、image_gen=1。
+    assert (
+        "segment 2: material resolution summary: clips=1/3, "
+        "resolved_term='generic money', fallback_level=subject, "
+        "levels_tried=1, vlm_judged=0, image_gen=1"
+    ) in sink.messages

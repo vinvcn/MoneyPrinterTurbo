@@ -633,6 +633,14 @@ def prepare_segment_materials(
                     fallback_level = level
                 if len(saved_paths) >= needed_clips:
                     break
+            else:
+                # 审计缺口 G2：整层跑完仍 0 clip 时补一行标记，让"哪一层
+                # 空手"在日志流可见（search_attempts 只进清单不进日志）。
+                # 配额打满的 break 都在层体之前/上方 if 分支内，不会到这里。
+                logger.info(
+                    f"segment {segment.get('index', position)}: "
+                    f"level produced no clips, level={level}, term={term!r}"
+                )
 
         # subject 图片生成（G1 决策）：仅当自有词条产出 0 clip 时触发，
         # 生成单张覆盖整段时长的概念图替代视频；partial-fill 段保持视频
@@ -646,8 +654,27 @@ def prepare_segment_materials(
                 )
                 resolved_term = subject
                 fallback_level = "subject"
+                # 审计缺口 G4：图片兜底成功时补一行，标明该段画面来自生成
+                # 概念图而非视频素材；只记文件名，不记 prompt/图像内容。
+                logger.info(
+                    f"segment {segment.get('index', position)}: "
+                    f"image-gen fallback engaged: clip={Path(image_clip).name}"
+                )
             if image_record:
                 image_gen_records.append(image_record)
+
+        # 审计缺口 G1：每段一行汇总（成功/部分/空手都触发），把配额、命中
+        # 词条、回退层级、尝试层数、VLM 判定量与图片兜底一次性落进日志流，
+        # 供运行审计对账。vlm_judged 取截断前的真实判定条数——截断只发生
+        # 在下方 SegmentMaterials 构造（_MAX_FILTER_RECORDS）。
+        logger.info(
+            f"segment {segment.get('index', position)}: "
+            f"material resolution summary: clips={len(saved_paths)}/{needed_clips}, "
+            f"resolved_term={resolved_term!r}, fallback_level={fallback_level}, "
+            f"levels_tried={len(search_attempts)}, "
+            f"vlm_judged={len(vlm_filter_records)}, "
+            f"image_gen={len(image_gen_records)}"
+        )
 
         results.append(
             SegmentMaterials(
