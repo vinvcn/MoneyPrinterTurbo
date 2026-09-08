@@ -1706,32 +1706,100 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(result["failed_stage"], "audio")
         self.assertIn("segment 1", result["error"])
 
-    def test_segment_first_fails_early_when_no_english_search_terms(self):
-        """LLM 提炼失败且旁白/主题词均为中文时，任务必须在 terms 阶段提前失败，
-        而不是白跑 TTS 后以误导性的 materials 报错终止（UAT 任务 2ad59248）。"""
+    def test_segment_first_cjk_subject_proceeds_past_terms_stage(self):
+        """视频匹配重构后，零英文搜索来源不再在 terms 阶段硬失败：CJK 主题
+        + CJK 旁白任务越过历史守卫（原 18e6c8d 行为，回归见 QA 0df39803），
+        继续 TTS 与素材匹配直至完成，由分段查询生成与 image-gen 回填降级；
+        历史守卫条件命中时仅落一条信息级日志。"""
         params = VideoParams(
             video_subject="黑洞",
             video_script="宇宙中存在着一种天体，它的引力强大到连光都无法逃脱，这就是黑洞。",
         )
         state = MemoryState()
+        fake_audio_result = SimpleNamespace(
+            segments=[
+                {
+                    "index": 0,
+                    "text": "宇宙中存在着一种天体。",
+                    "audio_file": "audio-segment-0.mp3",
+                    "start_ms": 0,
+                    "duration_ms": 1000,
+                },
+            ],
+            audio_file="audio.mp3",
+            total_duration_ms=1000,
+            ok=True,
+            failed_index=None,
+            error="",
+        )
+        fake_materials = [
+            SimpleNamespace(
+                index=0,
+                search_term="",
+                resolved_term="",
+                fallback_level="subject",
+                clips=["/m/gen-0.mp4"],
+                search_attempts=[],
+                clip_sources=[{"url": "", "local_file": "gen-0.mp4"}],
+                vlm_filter=[],
+                image_gen=[{"model": "stub", "source": "kolors"}],
+            ),
+        ]
+        recorded_segments = {}
+
+        def fake_combine(**kwargs):
+            recorded_segments.update({s["index"]: s for s in kwargs["segments"]})
+            return kwargs["combined_video_path"]
 
         with (
             patch.object(tm.sm, "state", state),
             patch.object(tm, "segment_pipeline_enabled", return_value=True),
             patch.object(tm.segmenter, "segment_script") as segment_script,
+            patch.object(
+                tm.segment_audio,
+                "prepare_segment_audio",
+                return_value=fake_audio_result,
+            ),
             patch.object(tm, "save_script_data"),
             patch.object(
-                tm.video_match, "match_segments"
+                tm.video_match, "match_segments", return_value=fake_materials
             ) as match_segments,
+            patch.object(tm.video, "combine_videos", side_effect=fake_combine),
+            patch.object(tm.video, "generate_video", return_value=True),
+            patch.object(
+                tm.upload_post.upload_post_service,
+                "is_configured",
+                return_value=False,
+            ),
+            patch.object(tm, "logger") as mock_logger,
         ):
             segment_script.return_value = [
                 SimpleNamespace(index=0, text="宇宙中存在着一种天体。", estimated_duration=1.0),
             ]
-            result = tm.start("no-english-terms", params)
+            result = tm.start("cjk-subject-proceeds", params)
 
-        match_segments.assert_not_called()
-        self.assertEqual(result["failed_stage"], "terms")
-        self.assertIn("英文搜索词", result["error"])
+        # 素材匹配阶段真实到达：CJK 主题词原样流入 match 层（查询生成由
+        # 其内部 LLM 翻译，主题词不再硬性要求英文）。
+        match_segments.assert_called_once()
+        self.assertEqual(
+            match_segments.call_args.kwargs["video_subject"], "黑洞"
+        )
+        # 任务跑完而非停在 terms：状态 COMPLETE、进度 100（历史守卫在
+        # progress=10 即 FAILED）、成品视频返回。
+        task_record = state.get_task("cjk-subject-proceeds")
+        self.assertEqual(task_record["state"], tm.const.TASK_STATE_COMPLETE)
+        self.assertEqual(task_record["progress"], 100)
+        # 装配层收到的片段清单带 image-gen 回填 clip（combine_videos 捕获）。
+        self.assertEqual(recorded_segments[0]["clips"], ["/m/gen-0.mp4"])
+        self.assertTrue(result["videos"])
+        self.assertNotIn("failed_stage", task_record)
+        # 历史守卫条件命中只留观测行，不终止任务。
+        self.assertTrue(
+            any(
+                "历史守卫条件命中" in str(call.args[0])
+                for call in mock_logger.info.call_args_list
+            )
+        )
 
     @unittest.skipUnless(
         RUN_INTEGRATION_TESTS,

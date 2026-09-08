@@ -1150,26 +1150,18 @@ def _run_segment_first_pipeline(
         segments=segment_records,
     )
 
-    # 早期失败守卫：LLM 词条提炼失败且旁白/主题词均为中文时，全部搜索词会被
-    # CJK 过滤清空，素材层零搜索、任务白跑 TTS 后才以误导性的 materials 报错
-    # 终止。无任何可用英文搜索来源时提前在 terms 阶段失败（对齐经典路径）。
+    # 历史 CJK 早期守卫已随视频匹配重构移除：零英文搜索来源不再硬失败——
+    # match_segments 逐段经 LLM 生成英文查询（CJK 主题词可用），查询生成
+    # 全部失败时各段走 image-gen 回填，任务照常产出视频。保留信息级观测
+    # 行：历史守卫条件命中（主题词与全部旁白均无可用英文搜索来源）时落
+    # 一条日志，供运行审计对账；行为不再是终止任务。
     english_subject = segment_material.english_search_term(str(params.video_subject or ""))
-    has_usable_search_source = english_subject or any(
-        segment_material.english_search_term(candidate)
+    if not english_subject and not any(
+        segment_material.english_search_term(str(record.get("text") or ""))
         for record in segment_records
-        for candidate in (
-            *(record.get("search_terms") or []),
-            str(record.get("search_term") or ""),
-            str(record.get("text") or ""),
-        )
-    )
-    if not has_usable_search_source:
-        return _mark_task_failed(
-            task_id,
-            "terms",
-            "无可用英文搜索词：LLM 词条提炼失败或为空，且旁白文本与主题词均为中文"
-            "（CJK 无法直接用于英文素材搜索）。请检查 LLM provider 配置与余额，"
-            "或提供英文视频主题词/脚本。",
+    ):
+        logger.info(
+            "无可用英文搜索来源（历史守卫条件命中）：依赖分段查询生成与图像兜底继续"
         )
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=15)
