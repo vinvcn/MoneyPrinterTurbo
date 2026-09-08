@@ -28,8 +28,7 @@ from loguru import logger
 from app.config import config
 from app.utils import utils
 
-# allow: SIZE_OK — 判定回调/图像获取/VLM 客户端同域内聚，拆分归 F4 评审
-# （同 image_embedding.py 的 wave 例外惯例）。
+# allow: SIZE_OK — 判定回调/图像获取/VLM 客户端同域内聚，拆分归 F4 评审。
 
 DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
@@ -336,12 +335,9 @@ def make_default_judge(embedding_gate: Any = None):
 
     embedding_gate 可选注入图像查重门（image_embedding.EmbeddingGate）：
     在预览图就绪后、VLM 调用前先做跨段重复检测，命中重复直接返回
-    duplicate 审计记录（不调 VLM）；启用粗筛时低于粗筛阈值的候选返回
-    prefiltered 记录（不调 VLM），由调用方停车、名额有缺口时以
-    skip_coarse=True 复判升级。gate 关闭（None）时行为与未引入查重门
-    之前完全一致。gate 自身 fail-open，这里的 try/except 只是兜底防
-    第三方实现抛异常穿透 judge_candidate。skip_coarse 透传给 gate：
-    补升复判时为 True，粗筛不再拦截、直接交 VLM 终审。
+    duplicate 审计记录（不调 VLM）。gate 关闭（None）时行为与未引入
+    查重门之前完全一致。gate 自身 fail-open，这里的 try/except 只是
+    兜底防第三方实现抛异常穿透 judge_candidate。
 
     每个候选的判定顺序：
     1. 缩略图（存在且实际分辨率 ≥ [vlm] 阈值）；
@@ -356,7 +352,6 @@ def make_default_judge(embedding_gate: Any = None):
         item: Any,
         segment_text: str = "",
         search_term: str = "",
-        skip_coarse: bool = False,
     ) -> dict[str, Any]:
         source = item.source_info if isinstance(item.source_info, dict) else {}
         asset_id = str(source.get("asset_id") or "")
@@ -442,7 +437,6 @@ def make_default_judge(embedding_gate: Any = None):
                     item.url,
                     image_data_uri,
                     term=search_term,
-                    skip_coarse=skip_coarse,
                 )
             except Exception as exc:
                 logger.warning(
@@ -452,21 +446,11 @@ def make_default_judge(embedding_gate: Any = None):
                 duplicate = None
             if duplicate is not None:
                 cos = duplicate.get("cos")
-                if duplicate.get("verdict") == "prefiltered":
-                    # 粗筛停车（plan T3）：独立日志分支（verdict + cos）。
-                    # duplicate 行保持逐字节不变——关闭粗筛时日志与旧版
-                    # 完全一致（T5 校准按该行解析 run log）。
-                    logger.info(
-                        "embedding gate prefiltered candidate: "
-                        f"asset_id={asset_id}, term={search_term!r}, "
-                        f"verdict=prefiltered, cos={cos}"
-                    )
-                else:
-                    logger.info(
-                        "embedding gate flagged duplicate: "
-                        f"asset_id={asset_id}, term={search_term!r}, "
-                        f"duplicate_of={duplicate.get('duplicate_of')}, cos={cos}"
-                    )
+                logger.info(
+                    "embedding gate flagged duplicate: "
+                    f"asset_id={asset_id}, term={search_term!r}, "
+                    f"duplicate_of={duplicate.get('duplicate_of')}, cos={cos}"
+                )
                 return {
                     "term": search_term,
                     "asset_id": asset_id,
