@@ -28,7 +28,7 @@ Citation chain:
   `task failed, task_id: 0df39803…, stage: terms, error: 无可用英文搜索词：LLM 词条提炼失败或为空，且旁白文本与主题词均为中文…`
 - Regression proof: at `625781d` the same guard passed for Chinese subject 大熊猫的野外日常 (prior QA task `3129367d` produced a video) because `extract_terms_for_segments` populated `search_terms` BEFORE the guard (`git show 625781d:app/services/task.py` lines 1148-1150). The refactor removed the pre-population without updating the guard.
 
-**Assertion A0 (happy path with CJK subject completes): FAIL — code defect** (task `0df39803`, state=-1, progress=10). All remaining pipeline-mechanics assertions below were executed with a documented deviation: an English-subject panda task ("Why giant pandas are China's national treasure"), which passes the guard via `english_subject` and exercises the three-stage pipeline exactly as designed. No app/ or test/ code was modified.
+**Assertion A0 (happy path with CJK subject completes): FAIL — code defect** (task `0df39803`, state=-1, progress=10). **[FLIPPED TO PASS on 2026-09-08 after fix `fe5ec4d` — see "A0 RE-VERIFICATION" section below.]** All remaining pipeline-mechanics assertions below were executed with a documented deviation: an English-subject panda task ("Why giant pandas are China's national treasure"), which passes the guard via `english_subject` and exercises the three-stage pipeline exactly as designed. No app/ or test/ code was modified.
 
 ## 1. Stale sweep (tracked files only) — PASS
 
@@ -136,3 +136,30 @@ Submit → task **`86579c78-f43d-4971-b797-6f57e140c0e7`** (`submit-response-vlm
 - Happy run: 11/12 segments needed image-gen backfill (panda terms on pexels remain junk-heavy — consistent with the prior QA run's finding); VLM savings are partial for junk-heavy terms.
 - 2/12 segments lost their per-segment query package to transient LLM errors (retried once each, then designed fail-open) — cost-control retry budget (2 attempts) may be tight for flaky endpoints.
 - The user config's stale `top_n: 5` key under `[material_rerank]` is silently ignored; a config migration note (or parser warning) would prevent user confusion.
+
+---
+
+## 9. A0 RE-VERIFICATION (post `fe5ec4d`) — 2026-09-08
+
+Fix under test: `fe5ec4d` "fix: segment-first CJK subjects no longer hard-fail at terms stage" — removes the `18e6c8d` hard-fail, replaces it with an informational audit line `无可用英文搜索来源（历史守卫条件命中）：依赖分段查询生成与图像兜底继续` (task.py:1163); degradation = per-segment LLM queries + image-gen backfill. In-container probe: `grep -n 历史守卫条件命中 app/services/task.py` → lines 1156, 1164 (today's code runs).
+
+- **Stale state**: image rebuilt from HEAD `fe5ec4d` → `mpt-video-match:qa2` ID `6e934a813ae4` (2026-09-08 20:19) ≠ prior `mpt-video-match:qa` `15cc812b3408`. Container `mpt-vm-qa` recreated (API host 8092), user `config.toml` mounted **read-only**. Build log `image-build-a0.log` (ends `#12 DONE`). PASS.
+- **Run**: same CJK subject as the failed `0df39803` — 为什么大熊猫是国宝 (`request-a0.json`) → task **`b51e97fd-5af0-4754-b7da-b69febb26bc3`** (`submit-response-a0.txt`), 7 segments, portrait, pexels. Completed **state=1 progress=100** in ~37 min; `run-api-a0.log:1304`:
+  `segment-first task b51e97fd-5af0-4754-b7da-b69febb26bc3 finished, generated 1 videos.`
+  Video: `storage-a0/tasks/b51e97fd-…/final-1.mp4` (35,070,169 bytes). API response `status-a0.json` lists `/tasks/b51e97fd-…/final-1.mp4`.
+
+### A0 re-verification table
+
+| # | Assertion | Verdict | Evidence (run-api-a0.log) |
+|---|---|---|---|
+| A0.1 | Task proceeds past terms — no `_mark_task_failed`, no `stage: terms` failure | **PASS** | grep `task failed` = 0, `stage: terms` = 0, `mark_task_failed` = 0; progress reached 40/100 while materials ran (poll-a0.log) |
+| A0.2 | Informational line fires only on genuine condition | **PASS (fired — condition genuinely true)** | `:62` `无可用英文搜索来源（历史守卫条件命中）：依赖分段查询生成与图像兜底继续` — CJK subject AND fully-Chinese narration → `english_search_term` correctly finds no English source pre-pipeline; log is INFO, task continued |
+| A0.3 | Per-segment query generation produces English terms despite CJK subject | **PASS** | seg0 terms `:91` `'panda wild habitat'`, `:112` `'misty bamboo mountain'`, `:132` `'lone panda walking'` (pure English; CJK subject correctly NOT appended — designed `_normalize_terms` CJK rule); coarse query `:213` `'A rare giant panda lives in remote misty mountain forests…'`; fine (caption) query `:244` `'A solitary giant panda emerges from the fog in a remote mountain bamboo forest…'` |
+| A0.4 | Full funnel machinery runs (coarse → fine → VLM → backfill) | **PASS** | 38 search lines; 7 `coarse rank query` lines; 7 `material rerank selected` (210 score lines = 7×30); 70 `vlm filter verdict` = 7 segments × 10 (walk cap respected, vlm_judged=10 in every summary); 6 `accepted` + 6 `uncertain skipped` (cross-foots: seg0 2 search clips + 1 gen = 3/3, seg1 2+1 = 3/3, seg2/3 1+1 = 2/3, seg4-6 0+1 = 1/3); 7 `image-gen backfill` + 7 `fallback engaged`; summaries `:270,:469,:614,:795,:970,:1132,:1276` |
+| A0.5 | Early-exit on quota fill observed | **N/A this run** (documented) | all 7 segments hit the walk cap (vlm_judged=10) without filling quota — cap correctly bounds the walk; early-exit behavior itself was proven live in the §4 happy run (segment 0 judged 7 < 10) |
+| A0.6 | Legacy machinery: zero matches | **PASS** | `prefiltered`/`skip_coarse`/`promoting`/`deferred_uncertain`/`rerank_page`/`extract_terms_for_segments` each grep = 0 |
+| A0.7 | Task completes with a final video | **PASS** | `:1304` finished; `final-1.mp4` 35,070,169 bytes; state=1 progress=100 |
+
+**A0 verdict after fe5ec4d: PASS** — CJK subject 为什么大熊猫是国宝 runs the full three-stage pipeline end-to-end and produces a video. Zero Tracebacks in the run. No app/ or test/ code was touched during this re-verification.
+
+Evidence files added this session (untracked): `run-api-a0.log`, `run-docker-a0.log`, `image-build-a0.log`, `request-a0.json`, `submit-response-a0.txt`, `status-a0.json`, `poll-a0.log`, `storage-a0/`.
