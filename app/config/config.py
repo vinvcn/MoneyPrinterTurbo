@@ -568,10 +568,11 @@ material_rerank = _SynchronizedConfig(
         "material_rerank",
         {
             # [material_rerank] 段缺失时按"启用"处理：segment-first 素材流程
-            # 使用 reranker 对每个搜索页的候选做视觉精判，取 top_n 送 VLM。
+            # 使用 reranker 对每个搜索页的候选做视觉精判。
+            # VLM 最多按 fine 排序走查前 10 个候选，配额满即提前退出
             "enabled": True,
             "model": "Qwen/Qwen3-VL-Reranker-8B",
-            "top_n": 5,
+            "vlm_walk_limit": 10,
             "timeout": 120,
             "api_key": "",
             "base_url": "",

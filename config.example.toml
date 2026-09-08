@@ -410,15 +410,15 @@ duplicate_threshold = 0.68
 
 # -----------------------------------------------------------------------------
 # segment-first 流水线的 VLM 视觉重排序：每个搜索页下载前，用 VLM reranker
-# 对候选缩略图/首帧做视觉精判，取 top_n 条送后续 VLM 精判（[vlm] 过滤）。
+# 对候选缩略图/首帧做视觉精判，把重排最优的候选送后续 VLM 精判（[vlm] 过滤）。
 # 总开关（kill-switch），关闭后完全跳过 rerank，所有候选直接进入 VLM。
-# 每个搜索页 rerank 后仅把 top N 条送 VLM 精判，默认 5。
 # api_key / base_url 留空时继承 [vlm] 节的凭据。
 # -----------------------------------------------------------------------------
 [material_rerank]
 enabled = true
 model = "Qwen/Qwen3-VL-Reranker-8B"
-top_n = 5
+# VLM 最多按 fine 排序走查前 10 个候选，配额满即提前退出
+vlm_walk_limit = 10
 timeout = 120
 api_key = ""
 base_url = ""

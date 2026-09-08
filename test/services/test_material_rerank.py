@@ -24,7 +24,7 @@ from app.services import material_rerank
 from app.services.material_rerank import (
     _credentials,
     _rerank_timeout,
-    _top_n,
+    _walk_limit,
     is_rerank_enabled,
     rerank_page,
 )
@@ -102,7 +102,8 @@ def _isolate_credentials(monkeypatch):
 def test_config_defaults():
     assert config.material_rerank["enabled"] is True
     assert config.material_rerank["model"] == "Qwen/Qwen3-VL-Reranker-8B"
-    assert config.material_rerank["top_n"] == 5
+    assert config.material_rerank["vlm_walk_limit"] == 10
+    assert "top_n" not in config.material_rerank
     assert config.material_rerank["timeout"] == 120
     assert config.material_rerank["api_key"] == ""
     assert config.material_rerank["base_url"] == ""
@@ -113,13 +114,13 @@ def test_is_rerank_enabled_true_by_default(monkeypatch):
     assert is_rerank_enabled() is True
 
 
-def test_invalid_top_n_falls_back_to_default(monkeypatch):
-    monkeypatch.setitem(config.material_rerank, "top_n", "abc")
-    assert _top_n() == 5
-    monkeypatch.setitem(config.material_rerank, "top_n", 0)
-    assert _top_n() == 5
-    monkeypatch.setitem(config.material_rerank, "top_n", 3)
-    assert _top_n() == 3
+def test_invalid_walk_limit_falls_back_to_default(monkeypatch):
+    monkeypatch.setitem(config.material_rerank, "vlm_walk_limit", "abc")
+    assert _walk_limit() == 10
+    monkeypatch.setitem(config.material_rerank, "vlm_walk_limit", 0)
+    assert _walk_limit() == 10
+    monkeypatch.setitem(config.material_rerank, "vlm_walk_limit", 3)
+    assert _walk_limit() == 3
 
 
 def test_rerank_timeout_from_config(monkeypatch):
@@ -194,7 +195,6 @@ def test_request_body_headers_and_timeout_shape(monkeypatch):
             {"image": "https://img.example.com/a1.jpg"},
             {"image": "https://img.example.com/a2.jpg"},
         ],
-        "top_n": 2,
         "return_documents": False,
     }
     # 读超时来自 [material_rerank] timeout=120，连接超时固定 30s。
@@ -219,7 +219,7 @@ def test_orders_by_score_desc_with_stable_ties(monkeypatch):
     assert _asset_ids(result) == ["a3", "a1", "a4", "a2"]
 
 
-def test_top_n_cut_places_unrankable_tail_then_remaining(monkeypatch):
+def test_walk_limit_cut_places_unrankable_tail_then_remaining(monkeypatch):
     r1, u1, r2, u2, r3, r4 = (
         _item("r1", "https://img.example.com/r1.jpg"),
         _item("u1"),
@@ -482,7 +482,7 @@ def test_example_config_image_embedding_no_coarse_keys():
 def test_example_config_material_rerank_section():
     example = _example_config()
     mr = example["material_rerank"]
-    for key in ("enabled", "model", "top_n", "timeout", "api_key", "base_url"):
+    for key in ("enabled", "model", "vlm_walk_limit", "timeout", "api_key", "base_url"):
         assert key in mr, f"[material_rerank] missing key: {key}"
 
 

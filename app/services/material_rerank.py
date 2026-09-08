@@ -2,8 +2,8 @@
 素材搜索页重排客户端（Qwen/Qwen3-VL-Reranker-8B，SiliconFlow /v1/rerank）。
 
 segment-first 流水线在把每个搜索页的候选送 VLM 判定之前，先用重排器按
-"与搜索 term 的视觉相关性"对候选排序，只把 top_n 个（外加无缩略图而无法
-重排的候选）交给 VLM，显著减少 VLM 调用次数（plan rerank-top5-vlm 实测
+"与搜索 term 的视觉相关性"对候选排序，只把前 walk_limit 个（外加无缩略图
+而无法重排的候选）交给 VLM，显著减少 VLM 调用次数（plan rerank-top5-vlm 实测
 约省 70-75%）。
 
 设计决策：
@@ -37,7 +37,7 @@ from app.models.schema import MaterialInfo
 from app.services.vlm_judge import download_thumbnail_bytes, to_data_uri
 
 DEFAULT_RERANK_MODEL = "Qwen/Qwen3-VL-Reranker-8B"
-DEFAULT_TOP_N = 5
+DEFAULT_WALK_LIMIT = 10
 DEFAULT_TIMEOUT_SECONDS = 120
 # 连接超时固定 30s（与缩略图下载同级），读超时取 [material_rerank] timeout。
 CONNECT_TIMEOUT_SECONDS = 30
@@ -75,15 +75,15 @@ def is_rerank_enabled() -> bool:
     return bool(_section().get("enabled", True))
 
 
-def _top_n() -> int:
-    """[material_rerank] top_n；缺失、非法或小于 1 时回落 5。"""
+def _walk_limit() -> int:
+    """[material_rerank] vlm_walk_limit；缺失、非法或小于 1 时回落 10。"""
     try:
-        top_n = int(_section().get("top_n", DEFAULT_TOP_N))
+        walk_limit = int(_section().get("vlm_walk_limit", DEFAULT_WALK_LIMIT))
     except (TypeError, ValueError):
-        return DEFAULT_TOP_N
-    if top_n < 1:
-        return DEFAULT_TOP_N
-    return top_n
+        return DEFAULT_WALK_LIMIT
+    if walk_limit < 1:
+        return DEFAULT_WALK_LIMIT
+    return walk_limit
 
 
 def _rerank_timeout() -> float:
@@ -223,7 +223,6 @@ def _request_scores(
         "model": str(_section().get("model", "") or DEFAULT_RERANK_MODEL),
         "query": term,
         "documents": [{"image": thumbnail} for _item, thumbnail in rankable],
-        "top_n": len(rankable),
         "return_documents": False,
     }
     request = _RerankRequest(
@@ -253,11 +252,11 @@ def _request_scores(
 def rerank_page(
     term: str,
     items: list[MaterialInfo],
-    top_n: int,
+    walk_limit: int,
 ) -> list[MaterialInfo]:
     """对一页候选做视觉重排，返回交给下游（VLM 判定）的列表。
 
-    返回顺序：重排前 top_n 名 → 无缩略图候选（原顺序）→ 其余可重排候选
+    返回顺序：重排前 walk_limit 名 → 无缩略图候选（原顺序）→ 其余可重排候选
     （分数降序，同分保持原序）。任何失败一律原样返回 items——fail-open。
     """
     normalized = (term or "").strip()
@@ -285,7 +284,7 @@ def rerank_page(
             "material rerank score: "
             f"asset_id={_asset_id(item)}, score={score}, rank={rank}"
         )
-    top_block = ordered[:top_n]
+    top_block = ordered[:walk_limit]
     logger.info(
         "material rerank selected: "
         f"term={normalized!r}, ranked={len(ordered)}, "
@@ -294,5 +293,5 @@ def rerank_page(
     return (
         [item for item, _score in top_block]
         + unrankable
-        + [item for item, _score in ordered[top_n:]]
+        + [item for item, _score in ordered[walk_limit:]]
     )

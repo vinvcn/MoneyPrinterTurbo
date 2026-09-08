@@ -360,10 +360,10 @@ def prepare_segment_materials(
     # so a repeated term does not hit the provider API again. Page-aware:
     # page 1 must exist before page 2 is fetched (issue #9 D6).
     search_cache: dict[tuple[str, int], List[MaterialInfo]] = {}
-    # 重排 top-N 与 (词条, 页) 备忘（plan rerank-top5-vlm）：top_n 每次运行
-    # 只读一次；备忘与 search_cache 同为本次调用的局部状态，不会跨调用
+    # 重排 walk-limit 与 (词条, 页) 备忘（plan rerank-top5-vlm）：walk_limit
+    # 每次运行只读一次；备忘与 search_cache 同为本次调用的局部状态，不会跨调用
     # 泄漏。仅 VLM 判定启用时使用。
-    rerank_top_n = material_rerank._top_n()
+    rerank_walk_limit = material_rerank._walk_limit()
     rerank_cache: dict[tuple[str, int], List[MaterialInfo]] = {}
     def search_page_cached(term: str, page: int) -> List[MaterialInfo]:
         normalized = (term or "").strip()
@@ -511,7 +511,7 @@ def prepare_segment_materials(
                         ]
                         try:
                             page_selection = material_rerank.rerank_page(
-                                term, fresh, rerank_top_n
+                                term, fresh, rerank_walk_limit
                             )
                         except Exception as exc:
                             # belt-and-braces：重排模块内部已 fail-open，这里
