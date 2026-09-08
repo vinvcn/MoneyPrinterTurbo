@@ -1,10 +1,10 @@
 """
 素材搜索页重排客户端（Qwen/Qwen3-VL-Reranker-8B，SiliconFlow /v1/rerank）。
 
-segment-first 流水线在把每个搜索页的候选送 VLM 判定之前，先用重排器按
-"与搜索 term 的视觉相关性"对候选排序，只把前 walk_limit 个（外加无缩略图
-而无法重排的候选）交给 VLM，显著减少 VLM 调用次数（plan rerank-top5-vlm 实测
-约省 70-75%）。
+segment-first 流水线在把候选送 VLM 判定之前，先用重排器按"与查询的视觉
+相关性"对候选做全量降序排序（不截断；VLM 预算 walk_limit 由调用方套用，
+无缩略图而无法重排的候选垫底），显著减少 VLM 调用次数（plan
+rerank-top5-vlm 实测约省 70-75%）。
 
 设计决策：
 - fail-open 是硬契约：term 为空、候选为空、开关关闭、无凭据、网络错误、
@@ -47,7 +47,7 @@ RATE_LIMIT_BACKOFF_SECONDS = (1.5, 3.0, 6.0)
 
 
 class _RerankUnavailableError(Exception):
-    """重排请求最终不可用；仅被 rerank_page 捕获打 fail-open 行，类型名进入日志 error= 字段。"""
+    """重排请求最终不可用；仅被 rerank_candidates 捕获打 fail-open 行，类型名进入日志 error= 字段。"""
 
     def __init__(self, status: int, detail: str = ""):
         self.status = status
@@ -210,10 +210,10 @@ def _parse_scores(
 
 
 def _request_scores(
-    term: str,
+    query: str,
     rankable: list[tuple[MaterialInfo, str]],
 ) -> tuple[list[tuple[MaterialInfo, float]], bool]:
-    """发起重排请求并解析分数；失败抛异常由 rerank_page 兜底。
+    """发起重排请求并解析分数；失败抛异常由 rerank_candidates 兜底。
 
     首选 URL 文档；收到 400 时改发 base64 data URI 文档重试一次（缘由见
     模块 docstring）。返回 (scored 列表, 是否走了 base64 兜底)。
@@ -221,8 +221,10 @@ def _request_scores(
     api_key, base_url = _credentials()
     body: dict[str, Any] = {
         "model": str(_section().get("model", "") or DEFAULT_RERANK_MODEL),
-        "query": term,
+        "query": query,
         "documents": [{"image": thumbnail} for _item, thumbnail in rankable],
+        # 显式带上候选总数：不依赖服务端默认值，确保每个文档都拿到分数。
+        "top_n": len(rankable),
         "return_documents": False,
     }
     request = _RerankRequest(
@@ -249,17 +251,17 @@ def _request_scores(
     return _parse_scores(response, rankable), fallback_used
 
 
-def rerank_page(
-    term: str,
+def rerank_candidates(
+    query: str,
     items: list[MaterialInfo],
-    walk_limit: int,
 ) -> list[MaterialInfo]:
-    """对一页候选做视觉重排，返回交给下游（VLM 判定）的列表。
+    """按视觉相关性对候选做全量重排，返回完整降序列表（不截断）。
 
-    返回顺序：重排前 walk_limit 名 → 无缩略图候选（原顺序）→ 其余可重排候选
-    （分数降序，同分保持原序）。任何失败一律原样返回 items——fail-open。
+    返回顺序：全部可重排候选（分数降序，同分保持原序）→ 无缩略图候选
+    （原顺序）。VLM 预算（walk_limit）由调用方套用：video-match 每段调用
+    一次，传 caption 级 fine query。任何失败一律原样返回 items——fail-open。
     """
-    normalized = (term or "").strip()
+    normalized = (query or "").strip()
     if not normalized or not items or not is_rerank_enabled():
         return items
     rankable, unrankable = _split_by_thumbnail(items)
@@ -267,14 +269,14 @@ def rerank_page(
         return items
     api_key, base_url = _credentials()
     if not api_key or not base_url:
-        logger.info(f"material rerank skipped, no credentials: term={normalized!r}")
+        logger.info(f"material rerank skipped, no credentials: query={normalized!r}")
         return items
     try:
         scored, fallback_used = _request_scores(normalized, rankable)
     except Exception as exc:
         logger.error(
             "material rerank failed, fail-open: "
-            f"term={normalized!r}, error={type(exc).__name__}"
+            f"query={normalized!r}, error={type(exc).__name__}"
         )
         return items
     # Python 的 sorted 稳定：reverse=True 时同分候选仍保持原相对顺序。
@@ -284,14 +286,9 @@ def rerank_page(
             "material rerank score: "
             f"asset_id={_asset_id(item)}, score={score}, rank={rank}"
         )
-    top_block = ordered[:walk_limit]
     logger.info(
         "material rerank selected: "
-        f"term={normalized!r}, ranked={len(ordered)}, "
-        f"top={len(top_block)}, fallback={fallback_used}"
+        f"query={normalized!r}, ranked={len(ordered)}, "
+        f"fallback={fallback_used}"
     )
-    return (
-        [item for item, _score in top_block]
-        + unrankable
-        + [item for item, _score in ordered[walk_limit:]]
-    )
+    return [item for item, _score in ordered] + unrankable

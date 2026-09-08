@@ -510,9 +510,10 @@ def prepare_segment_materials(
                             if item.url and item.url not in excluded
                         ]
                         try:
-                            page_selection = material_rerank.rerank_page(
-                                term, fresh, rerank_walk_limit
-                            )
+                            # 临时兼容旧分页路径，video-match 重构中整段删除
+                            page_selection = material_rerank.rerank_candidates(
+                                term, fresh
+                            )[:rerank_walk_limit]
                         except Exception as exc:
                             # belt-and-braces：重排模块内部已 fail-open，这里
                             # 只兜"重排调用本身被替换/抛异常"的情况——告警后

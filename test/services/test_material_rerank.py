@@ -26,7 +26,7 @@ from app.services.material_rerank import (
     _rerank_timeout,
     _walk_limit,
     is_rerank_enabled,
-    rerank_page,
+    rerank_candidates,
 )
 
 
@@ -162,10 +162,10 @@ def test_no_credentials_skip_call(monkeypatch):
         _LogSink() as sink,
         patch.object(material_rerank.requests, "post") as post,
     ):
-        result = rerank_page("panda", items, 5)
+        result = rerank_candidates("panda", items)
     assert result == items
     post.assert_not_called()
-    assert "material rerank skipped, no credentials: term='panda'" in sink.text
+    assert "material rerank skipped, no credentials: query='panda'" in sink.text
 
 
 # ---------------------------------------------------------------- 请求形状
@@ -182,7 +182,7 @@ def test_request_body_headers_and_timeout_shape(monkeypatch):
         "post",
         return_value=_ok_response([(0, 0.9), (1, 0.1)]),
     ) as post:
-        rerank_page("panda", items, 5)
+        rerank_candidates("panda", items)
     assert post.call_args.args[0] == "https://rerank.example.com/v1/rerank"
     headers = post.call_args.kwargs["headers"]
     assert headers["Authorization"] == "Bearer test-rerank-key"
@@ -195,13 +195,14 @@ def test_request_body_headers_and_timeout_shape(monkeypatch):
             {"image": "https://img.example.com/a1.jpg"},
             {"image": "https://img.example.com/a2.jpg"},
         ],
+        "top_n": 2,
         "return_documents": False,
     }
     # 读超时来自 [material_rerank] timeout=120，连接超时固定 30s。
     assert post.call_args.kwargs["timeout"] == (30, 120)
 
 
-# ---------------------------------------------------------------- 排序与切片
+# ---------------------------------------------------------------- 排序与全量返回
 
 
 def test_orders_by_score_desc_with_stable_ties(monkeypatch):
@@ -210,16 +211,20 @@ def test_orders_by_score_desc_with_stable_ties(monkeypatch):
         _item("a2", "https://img.example.com/a2.jpg"),
         _item("a3", "https://img.example.com/a3.jpg"),
         _item("a4", "https://img.example.com/a4.jpg"),
+        _item("a5", "https://img.example.com/a5.jpg"),
     ]
     _isolate_credentials(monkeypatch)
-    # 返回顺序故意打乱；a3/a4 同分 0.5，须保持原相对顺序（a3 在前）。
-    response = _ok_response([(2, 0.9), (0, 0.5), (3, 0.5), (1, 0.1)])
+    # 返回顺序故意打乱；a1/a4 同分 0.5，须保持原相对顺序（a1 在前）。
+    response = _ok_response([(2, 0.9), (0, 0.5), (3, 0.5), (1, 0.1), (4, 0.3)])
     with patch.object(material_rerank.requests, "post", return_value=response):
-        result = rerank_page("panda", items, 4)
-    assert _asset_ids(result) == ["a3", "a1", "a4", "a2"]
+        result = rerank_candidates("panda", items)
+    # 全量返回：5 个文档打分 → 5 个文档按分数降序原样返回，不截断。
+    assert len(result) == 5
+    assert sorted(_asset_ids(result)) == ["a1", "a2", "a3", "a4", "a5"]
+    assert _asset_ids(result) == ["a3", "a1", "a4", "a5", "a2"]
 
 
-def test_walk_limit_cut_places_unrankable_tail_then_remaining(monkeypatch):
+def test_unrankable_tail_after_full_ranked_order(monkeypatch):
     r1, u1, r2, u2, r3, r4 = (
         _item("r1", "https://img.example.com/r1.jpg"),
         _item("u1"),
@@ -234,12 +239,10 @@ def test_walk_limit_cut_places_unrankable_tail_then_remaining(monkeypatch):
         [(3, 0.9), (0, 0.8), (2, 0.3), (1, 0.1)]  # rankable 的 index：r4, r1, r3, r2
     )
     with patch.object(material_rerank.requests, "post", return_value=response):
-        result = rerank_page("panda", items, 2)
-    assert _asset_ids(result) == [
-        "r4", "r1",  # 重排 top-2
-        "u1", "u2",  # 无缩略图候选，原顺序
-        "r3", "r2",  # 其余可重排候选，重排顺序
-    ]
+        result = rerank_candidates("panda", items)
+    # 不再截断：全部可重排候选按降序在前，无缩略图候选按原序垫底；
+    # 截断（walk_limit）是调用方的职责。
+    assert _asset_ids(result) == ["r4", "r1", "r3", "r2", "u1", "u2"]
 
 
 # ---------------------------------------------------------------- 成功路径审计日志
@@ -253,11 +256,11 @@ def test_success_log_lines_exact_format(monkeypatch):
         _LogSink() as sink,
         patch.object(material_rerank.requests, "post", return_value=response),
     ):
-        rerank_page("panda", items, 1)
+        rerank_candidates("panda", items)
     assert "material rerank score: asset_id=a2, score=0.7, rank=1" in sink.text
     assert "material rerank score: asset_id=a1, score=0.2, rank=2" in sink.text
     assert (
-        "material rerank selected: term='panda', ranked=2, top=1, fallback=False"
+        "material rerank selected: query='panda', ranked=2, fallback=False"
         in sink.text
     )
 
@@ -274,10 +277,10 @@ def test_no_secret_leak_in_logs(monkeypatch):
             side_effect=material_rerank.requests.exceptions.ConnectionError("boom"),
         ),
     ):
-        result = rerank_page("panda", items, 5)
+        result = rerank_candidates("panda", items)
     assert result == items
     assert "sk-super-secret-123" not in sink.text
-    assert "material rerank failed, fail-open: term='panda'" in sink.text
+    assert "material rerank failed, fail-open: query='panda'" in sink.text
 
 
 # ---------------------------------------------------------------- 失败 fail-open
@@ -294,12 +297,12 @@ def test_fail_open_on_connection_error(monkeypatch):
             side_effect=material_rerank.requests.exceptions.ConnectionError("boom"),
         ) as post,
     ):
-        result = rerank_page("panda", items, 5)
+        result = rerank_candidates("panda", items)
     assert result == items
     # 直连 + config.proxy 各一次，无更多重试。
     assert post.call_count == 2
     assert (
-        "material rerank failed, fail-open: term='panda', error=ConnectionError"
+        "material rerank failed, fail-open: query='panda', error=ConnectionError"
         in sink.text
     )
 
@@ -315,11 +318,11 @@ def test_fail_open_on_429_exhausted(monkeypatch):
         ) as post,
         patch.object(material_rerank.time, "sleep") as sleep,
     ):
-        result = rerank_page("panda", items, 5)
+        result = rerank_candidates("panda", items)
     assert result == items
     assert post.call_count == 4
     assert sleep.call_args_list == [call(1.5), call(3.0), call(6.0)]
-    assert "material rerank failed, fail-open: term='panda'" in sink.text
+    assert "material rerank failed, fail-open: query='panda'" in sink.text
 
 
 def test_429_retry_then_succeeds(monkeypatch):
@@ -332,7 +335,7 @@ def test_429_retry_then_succeeds(monkeypatch):
         ) as post,
         patch.object(material_rerank.time, "sleep") as sleep,
     ):
-        result = rerank_page("panda", items, 5)
+        result = rerank_candidates("panda", items)
     assert _asset_ids(result) == ["a2", "a1"]
     assert post.call_count == 2
     sleep.assert_called_once_with(1.5)
@@ -354,10 +357,10 @@ def test_fail_open_on_400_then_400_again(monkeypatch):
             return_value=(stub_payload, (16, 16)),
         ),
     ):
-        result = rerank_page("panda", items, 5)
+        result = rerank_candidates("panda", items)
     assert result == items
     assert post.call_count == 2
-    assert "material rerank failed, fail-open: term='panda'" in sink.text
+    assert "material rerank failed, fail-open: query='panda'" in sink.text
 
 
 def test_base64_fallback_after_400(monkeypatch):
@@ -379,7 +382,7 @@ def test_base64_fallback_after_400(monkeypatch):
             return_value=(stub_payload, (16, 16)),
         ) as download,
     ):
-        result = rerank_page("panda", items, 5)
+        result = rerank_candidates("panda", items)
     # 首调用 URL 文档，400 后改发 base64 data URI 文档重试一次。
     assert post.call_count == 2
     assert download.call_count == 2
@@ -396,7 +399,7 @@ def test_base64_fallback_after_400(monkeypatch):
     assert _asset_ids(result) == ["a2", "a1"]
     assert "material rerank failed, fail-open" not in sink.text
     assert (
-        "material rerank selected: term='panda', ranked=2, top=2, fallback=True"
+        "material rerank selected: query='panda', ranked=2, fallback=True"
         in sink.text
     )
 
@@ -409,10 +412,10 @@ def test_fail_open_on_malformed_json(monkeypatch):
         _LogSink() as sink,
         patch.object(material_rerank.requests, "post", return_value=broken),
     ):
-        result = rerank_page("panda", items, 5)
+        result = rerank_candidates("panda", items)
     assert result == items
     assert (
-        "material rerank failed, fail-open: term='panda', error=ValueError"
+        "material rerank failed, fail-open: query='panda', error=ValueError"
         in sink.text
     )
 
@@ -425,10 +428,10 @@ def test_fail_open_on_missing_results(monkeypatch):
         _LogSink() as sink,
         patch.object(material_rerank.requests, "post", return_value=response),
     ):
-        result = rerank_page("panda", items, 5)
+        result = rerank_candidates("panda", items)
     assert result == items
     assert (
-        "material rerank failed, fail-open: term='panda', error=KeyError" in sink.text
+        "material rerank failed, fail-open: query='panda', error=KeyError" in sink.text
     )
 
 
@@ -439,7 +442,7 @@ def test_blank_term_passthrough(monkeypatch):
     items = [_item("a1", "https://img.example.com/a1.jpg")]
     _isolate_credentials(monkeypatch)
     with patch.object(material_rerank.requests, "post") as post:
-        result = rerank_page("   ", items, 5)
+        result = rerank_candidates("   ", items)
     assert result == items
     post.assert_not_called()
 
@@ -449,7 +452,7 @@ def test_disabled_toggle_passthrough(monkeypatch):
     _isolate_credentials(monkeypatch)
     monkeypatch.setitem(config.material_rerank, "enabled", False)
     with patch.object(material_rerank.requests, "post") as post:
-        result = rerank_page("panda", items, 5)
+        result = rerank_candidates("panda", items)
     assert result == items
     post.assert_not_called()
 
@@ -458,7 +461,7 @@ def test_no_rankable_items_passthrough(monkeypatch):
     items = [_item("a1"), _item("a2", ""), _item("a3", "   ")]
     _isolate_credentials(monkeypatch)
     with patch.object(material_rerank.requests, "post") as post:
-        result = rerank_page("panda", items, 5)
+        result = rerank_candidates("panda", items)
     assert result == items
     post.assert_not_called()
 

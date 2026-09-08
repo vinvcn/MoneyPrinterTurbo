@@ -6,7 +6,7 @@ duplicate 判定拒收契约单测。
 嵌入门（plan T5）：verdict="duplicate" 的候选在素材层被拒收——不下载、不采纳、
 无 last-resort 兜底，但判定记录保留在 vlm_filter 审计链中。
 重排 top-N（plan rerank-top5-vlm）：judge 启用时每个 (词条, 页) 在送 VLM 前
-先经 material_rerank.rerank_page 重排，只把 top-N（含无缩略图候选）按重排
+先经 material_rerank.rerank_candidates 重排，只把 top-N（含无缩略图候选）按重排
 顺序交判定；已用/已判定 URL 在重排前剔除；重排结果按 (词条, 页) 备忘，
 同一运行内只算一次；重排调用抛异常时按 provider 原序 fail-open 并告警。
 """
@@ -320,15 +320,15 @@ def test_duplicate_never_registered_in_used_urls():
 
 
 def _patch_rerank(monkeypatch, behavior):
-    """material_rerank.rerank_page 打桩：记录每次 (term, [url...], top_n)
-    调用，返回值由 behavior(term, items, top_n) 决定。"""
+    """material_rerank.rerank_candidates 打桩：记录每次 (term, [url...])
+    调用，返回值由 behavior(term, items) 决定（全量降序，截断由调用方做）。"""
     calls = []
 
-    def fake_rerank(term, items, top_n):
-        calls.append((term, [i.url for i in items], top_n))
-        return behavior(term, items, top_n)
+    def fake_rerank(term, items):
+        calls.append((term, [i.url for i in items]))
+        return behavior(term, items)
 
-    monkeypatch.setattr(sm.material_rerank, "rerank_page", fake_rerank)
+    monkeypatch.setattr(sm.material_rerank, "rerank_candidates", fake_rerank)
     return calls
 
 
@@ -337,7 +337,7 @@ def test_judge_receives_reranked_top5_in_ranked_order(monkeypatch):
     尾部候选不再判定（plan rerank-top5-vlm 核心诉求）。"""
     items = [_video_item(f"https://v.example/{c}.mp4", "city") for c in "abcdefg"]
 
-    def fixed_order(term, page_items, top_n):
+    def fixed_order(term, page_items):
         # 重排桩：top-5 打乱到 [e, a, c, b, d]，尾部原序跟在后面。
         ranked = [
             page_items[4], page_items[0], page_items[2],
@@ -363,7 +363,7 @@ def test_judge_receives_reranked_top5_in_ranked_order(monkeypatch):
     assert results[0].clips == [f"/saved/{c}.mp4" for c in "eacbd"]
     assert saved == [f"https://v.example/{c}.mp4" for c in "eacbd"]
     # 重排恰好一次，输入是整页新鲜候选（本例无排除项）。
-    assert [(term, urls) for term, urls, _ in rerank_calls] == [
+    assert [(term, urls) for term, urls in rerank_calls] == [
         ("city", [f"https://v.example/{c}.mp4" for c in "abcdefg"])
     ]
 
@@ -372,7 +372,7 @@ def test_judge_disabled_items_pass_through_unrated(monkeypatch):
     """judge 未启用：不调用重排，候选按 provider 原序直接下载（旧行为）。"""
     items = [_video_item(f"https://v.example/{c}.mp4", "city") for c in "abcd"]
     rerank_calls = _patch_rerank(
-        monkeypatch, lambda term, page_items, top_n: list(page_items)
+        monkeypatch, lambda term, page_items: list(page_items)
     )
 
     results, _, saved = _run(
@@ -391,7 +391,7 @@ def test_used_urls_excluded_before_rerank_call(monkeypatch):
         _video_item(f"https://v.example/b{i}.mp4", "tb") for i in (1, 2, 3, 4)
     ]
     rerank_calls = _patch_rerank(
-        monkeypatch, lambda term, page_items, top_n: list(page_items)
+        monkeypatch, lambda term, page_items: list(page_items)
     )
 
     def judge(item, segment_text, search_term):
@@ -410,7 +410,7 @@ def test_used_urls_excluded_before_rerank_call(monkeypatch):
     )
     # seg0 重排输入 = 整页 [u1]；seg1 重排输入 = [b1..b4]（u1 已被 seg0
     # 采纳，进入 used_urls 后在重排前剔除）。
-    assert [(term, urls) for term, urls, _ in rerank_calls] == [
+    assert [(term, urls) for term, urls in rerank_calls] == [
         ("ta", ["https://v.example/u1.mp4"]),
         ("tb", [
             "https://v.example/b1.mp4",
@@ -436,7 +436,7 @@ def test_judged_urls_excluded_before_rerank_on_page_two(monkeypatch):
         + [_video_item(f"https://v.example/f{i}.mp4", "t") for i in (1, 2, 3)],
     }
     rerank_calls = _patch_rerank(
-        monkeypatch, lambda term, page_items, top_n: list(page_items)
+        monkeypatch, lambda term, page_items: list(page_items)
     )
 
     def fake_search(search_term, minimum_duration, video_aspect, page=1):
@@ -458,7 +458,7 @@ def test_judged_urls_excluded_before_rerank_on_page_two(monkeypatch):
         judge_candidate=judge,
     )
     # 第 1 页重排输入含 p1；第 2 页重排输入只剩新鲜候选（p1 已判定）。
-    assert [(term, urls) for term, urls, _ in rerank_calls] == [
+    assert [(term, urls) for term, urls in rerank_calls] == [
         ("t", ["https://v.example/p1.mp4"]),
         ("t", [
             "https://v.example/f1.mp4",
@@ -475,7 +475,7 @@ def test_rerank_memoized_once_per_term_page(monkeypatch):
     """同一 (词条, 页) 跨段复用时重排只算一次（备忘命中不重调、不重记）。"""
     items = [_video_item(f"https://v.example/{c}.mp4", "city") for c in "abcdefg"]
 
-    def top3_scrambled(term, page_items, top_n):
+    def top3_scrambled(term, page_items):
         return [page_items[2], page_items[0], page_items[1]] + page_items[3:]
 
     rerank_calls = _patch_rerank(monkeypatch, top3_scrambled)
@@ -502,7 +502,7 @@ def test_rerank_raise_falls_back_to_fresh_with_warning(monkeypatch):
     """重排调用抛异常：告警后按 provider 原序 fail-open，流水线继续；
     兜底结果进备忘，同 (词条, 页) 不再二次触发异常。"""
 
-    def exploding_rerank(term, page_items, top_n):
+    def exploding_rerank(term, page_items):
         raise RuntimeError("reranker exploded")
 
     rerank_calls = _patch_rerank(monkeypatch, exploding_rerank)
