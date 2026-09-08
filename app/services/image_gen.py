@@ -280,6 +280,7 @@ def make_subject_clip(
     subject_term: str,
     video_aspect: Any,
     save_dir: str,
+    duration: float | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """
     subject 层图片 clip 获取的编排入口（由 task.py 注入为
@@ -287,6 +288,8 @@ def make_subject_clip(
 
     返回 (clip_path, audit_record)；clip_path 为 "" 时段空手。audit_record
     随 manifest 的 image_gen 字段落盘（prompt/model/source/路径）。
+    duration 为目标 clip 时长（秒）；None 保持既有默认时长，video-match
+    的名额回填按剩余窗口时长和覆盖此值。
     """
     image_size = _image_size_for(video_aspect)
     model = str(config.image_gen.get("model") or "Kwai-Kolors/Kolors")
@@ -332,7 +335,11 @@ def make_subject_clip(
         return "", record
 
     record["image"] = os.path.basename(image_path)
-    clip_path = still_to_clip(image_path, save_dir)
+    clip_path = still_to_clip(
+        image_path,
+        save_dir,
+        duration=_CLIP_DURATION_SECONDS if duration is None else float(duration),
+    )
     record["clip"] = os.path.basename(clip_path) if clip_path else ""
     if not clip_path:
         record["error"] = "still_to_clip_failed"

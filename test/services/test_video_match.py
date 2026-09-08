@@ -3,10 +3,12 @@ import math
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from app.models.schema import MaterialInfo
 from app.services import image_embedding, video_match
 from app.services.image_embedding import EmbeddingGate
 from app.services.video_match import SegmentQueries, generate_segment_queries
@@ -455,6 +457,649 @@ class TestCoarseRank(unittest.TestCase):
         selected, dup_skips, _ = self._rank(pool, None, None, vectors)
         self.assertEqual([c["url"] for c in selected], ["https://x/1", "https://x/0"])
         self.assertEqual(dup_skips, [])
+
+
+def _verdict_record(verdict: str, **extra) -> dict:
+    """判定回调的标准返回记录（verdict 三值 + 审计字段）。"""
+    return {
+        "verdict": verdict,
+        "reason": f"{verdict} reason",
+        "image_source": "poster",
+        "asset_id": "stub",
+        **extra,
+    }
+
+
+def _video_item(url: str, term: str, thumbnail: str | None = None) -> MaterialInfo:
+    source = {"provider": "pexels", "search_term": term, "asset_id": url}
+    if thumbnail is not None:
+        source["thumbnail_url"] = thumbnail
+    return MaterialInfo(provider="pexels", url=url, duration=10, source_info=source)
+
+
+class TestMatchSegments(unittest.TestCase):
+    """match_segments 三段漏斗主编排：配额、走查预算、降级链与去重契约。
+
+    全 mock 表面：LLM（查询包）、搜索、重排、VLM 判定、下载、image-gen、
+    缩略图（data URI）与嵌入向量（粗排）；断言调用次数与 SegmentMaterials
+    字段（不以日志为成功依据），日志仅在任务指定的 grep 锚点处断言。
+    """
+
+    # 与 image_embedding.DEFAULT_DUPLICATE_THRESHOLD 无关：测试门用固定阈值。
+    _GATE_THRESHOLD = 0.68
+
+    @staticmethod
+    def _queries_json(terms: list[str]) -> str:
+        return json.dumps(
+            {
+                "terms": terms,
+                "coarse_query": "A broad scene.",
+                "fine_query": "A precise moment.",
+            }
+        )
+
+    def _run(
+        self,
+        segments: list[dict],
+        llm_payloads: list[str],
+        pages_by_term: dict,
+        judge=None,
+        walk_limit: int = 10,
+        rerank_enabled: bool = True,
+        rerank=None,
+        vectors: dict | None = None,
+        subject: str = "panda",
+        generate_image=None,
+        gate: bool = False,
+        embed_text_fails: bool = False,
+    ) -> SimpleNamespace:
+        """以确定性桩运行 match_segments，返回全部调用记录与结果。"""
+        searched: list[tuple[str, int]] = []
+        saved_urls: list[str] = []
+        judge_calls: list[tuple[str, str]] = []
+        image_calls: list[tuple[dict, float]] = []
+        rerank_calls: list[tuple[str, list[str]]] = []
+        captured: dict = {}
+        llm_queue = list(llm_payloads)
+        vectors = dict(vectors or {})
+
+        def fake_llm(prompt):
+            return llm_queue.pop(0)
+
+        def fake_search(search_term, page=1, **_legacy_kwargs):
+            # 两参新契约形态的桩：同时容忍旧四参调用（TypeError 回退链
+            # 的第一跳在 match_segments 内，旧形态测试直接走第一跳）。
+            searched.append((search_term, page))
+            return list(pages_by_term.get((search_term, page), []))
+
+        def fake_save_video(video_url, save_dir=""):
+            saved_urls.append(video_url)
+            return f"/saved/{video_url.rsplit('/', 1)[-1]}"
+
+        def fake_judge(item, segment_text="", search_term=""):
+            judge_calls.append((item.url, search_term))
+            if callable(judge):
+                return judge(item, segment_text, search_term)
+            return _verdict_record(judge)
+
+        def fake_rerank(query, items):
+            rerank_calls.append((query, [i.url for i in items]))
+            if rerank is None:
+                return list(items)
+            return rerank(query, items)
+
+        def fake_image(segment, duration):
+            image_calls.append((segment, duration))
+            return (
+                f"/saved/gen-{segment.get('index', 0)}.mp4",
+                {"model": "Kwai-Kolors/Kolors", "source": "kolors"},
+            )
+
+        def fake_download_thumbnail(url):
+            return (url.encode(), (640, 320))
+
+        stub_embed = _StubEmbedImage(vectors)
+        gate_obj = None
+        gate_cache: dict[str, list[float]] = {}
+        register_calls: list[str] = []
+        if gate:
+            gate_obj = EmbeddingGate(
+                model="m",
+                api_key="k",
+                threshold=self._GATE_THRESHOLD,
+                vector_cache=gate_cache,
+            )
+            original_register = gate_obj.register_accepted
+
+            def spy_register(url):
+                register_calls.append(url)
+                return original_register(url)
+
+            gate_obj.register_accepted = spy_register
+
+        original_coarse = video_match.coarse_rank
+
+        def spy_coarse(pool, coarse_query, vector_cache, embedding_gate):
+            captured["pool"] = list(pool)
+            return original_coarse(pool, coarse_query, vector_cache, embedding_gate)
+
+        with (
+            patch.object(
+                video_match.llm, "generate_response", side_effect=fake_llm
+            ),
+            patch.object(
+                video_match, "download_thumbnail_bytes", fake_download_thumbnail
+            ),
+            patch.object(video_match, "to_data_uri", lambda payload: payload.decode()),
+            patch.object(
+                image_embedding,
+                "embed_text",
+                return_value=None if embed_text_fails else [1.0, 0.0, 0.0],
+            ),
+            patch.object(image_embedding, "embed_image", stub_embed),
+            patch.object(video_match, "coarse_rank", spy_coarse),
+            patch.object(
+                video_match.material_rerank,
+                "is_rerank_enabled",
+                return_value=rerank_enabled,
+            ),
+            patch.object(
+                video_match.material_rerank, "_walk_limit", return_value=walk_limit
+            ),
+            patch.object(
+                video_match.material_rerank, "rerank_candidates", fake_rerank
+            ),
+            patch.object(video_match, "logger") as mock_logger,
+        ):
+            results = video_match.match_segments(
+                segments=segments,
+                video_subject=subject,
+                search_videos=fake_search,
+                save_video=fake_save_video,
+                video_aspect="9:16",
+                clip_duration=3,
+                judge_candidate=fake_judge if judge is not None else None,
+                embedding_gate=gate_obj,
+                generate_image=generate_image if generate_image is not None else fake_image,
+            )
+
+        return SimpleNamespace(
+            results=results,
+            searched=searched,
+            saved=saved_urls,
+            judge_calls=judge_calls,
+            image_calls=image_calls,
+            rerank_calls=rerank_calls,
+            captured=captured,
+            gate=gate_obj,
+            gate_cache=gate_cache,
+            register_calls=register_calls,
+            logger=mock_logger,
+        )
+
+    def _info_messages(self, run: SimpleNamespace) -> list[str]:
+        return [str(c.args[0]) for c in run.logger.info.call_args_list]
+
+    def _warning_messages(self, run: SimpleNamespace) -> list[str]:
+        return [str(c.args[0]) for c in run.logger.warning.call_args_list]
+
+    def test_full_happy_path_fills_quota_with_early_exit(self):
+        """D=12.816/W=3 → 配额 5：fine 序走查拿满即提前退出，判定次数
+        ≤ walk 预算；采纳候选经 save_video + register_accepted 入册。"""
+        pages = {
+            ("panda one panda", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
+                for i in range(6)
+            ],
+            ("panda one panda", 2): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
+                for i in (6, 7)
+            ],
+            ("panda two panda", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda two", f"img-{i}")
+                for i in (8, 9)
+            ],
+            ("panda two panda", 2): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda two", f"img-{i}")
+                for i in (10, 11)
+            ],
+        }
+        vectors = {f"img-{i}": _vec_with_cos(0.95 - 0.05 * i) for i in range(12)}
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 12.816}],
+            llm_payloads=[self._queries_json(["panda one", "panda two"])],
+            pages_by_term=pages,
+            judge="relevant",
+            walk_limit=10,
+            rerank=lambda _query, items: list(reversed(items)),
+            vectors=vectors,
+            gate=True,
+        )
+
+        result = run.results[0]
+        # 配额 = max(3, len(plan(12.816, 3))) = 5，走查按 fine 逆序拿满。
+        self.assertEqual(result.clips, [f"/saved/u{i}.mp4" for i in (11, 10, 9, 8, 7)])
+        self.assertEqual(
+            run.saved, [f"https://v.example/u{i}.mp4" for i in (11, 10, 9, 8, 7)]
+        )
+        # 提前退出：判定次数 = 配额 5 ≤ walk 预算 10；判定回带出处词条。
+        self.assertEqual(
+            run.judge_calls,
+            [(f"https://v.example/u{i}.mp4", "panda two panda") for i in (11, 10, 9, 8)]
+            + [("https://v.example/u7.mp4", "panda one panda")],
+        )
+        # 采纳即回调查重门注册（accepted-only 契约由 match 层保证）；
+        # 粗排预热共享缓存：同 URL 全链路零重复嵌入。
+        self.assertEqual(
+            run.register_calls,
+            [f"https://v.example/u{i}.mp4" for i in (11, 10, 9, 8, 7)],
+        )
+        self.assertEqual(len(run.gate_cache), 12)
+        # 精排输入 = 粗排 top-30（12 个全量、余弦降序），恰好一次。
+        self.assertEqual(
+            run.rerank_calls,
+            [("A precise moment.", [f"https://v.example/u{i}.mp4" for i in range(12)])],
+        )
+        self.assertEqual(run.image_calls, [])
+        self.assertEqual(result.resolved_term, "panda two panda")
+        self.assertEqual(result.fallback_level, "self")
+        self.assertEqual(result.search_term, "panda one panda")
+        self.assertEqual(
+            [(a["term"], a["found"]) for a in result.search_attempts],
+            [("panda one panda", True), ("panda two panda", True)],
+        )
+        self.assertEqual(len(result.vlm_filter), 5)
+
+    def test_partial_fill_backfills_remaining_windows(self):
+        """部分命中：image-gen 回填一次覆盖未填充尾部窗口，时长 = 尾窗和；
+        SegmentMaterials 同时反映视频 clip 与生成 clip 的来源。"""
+        pages = {
+            ("panda one panda", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
+                for i in range(4)
+            ],
+        }
+        vectors = {f"img-{i}": _vec_with_cos(0.9 - 0.1 * i) for i in range(4)}
+
+        def judge(item, segment_text, search_term):
+            if item.url.endswith(("u2.mp4", "u3.mp4")):
+                return _verdict_record("irrelevant")
+            return _verdict_record("relevant")
+
+        segment = {"index": 0, "text": "panda", "duration": 12.816}
+        run = self._run(
+            segments=[segment],
+            llm_payloads=[self._queries_json(["panda one"])],
+            pages_by_term=pages,
+            judge=judge,
+            vectors=vectors,
+        )
+
+        result = run.results[0]
+        # 配额 5，视频命中 2（u2/u3 判 irrelevant），尾部窗口 [3,3,0.816]。
+        self.assertEqual(len(run.judge_calls), 4)
+        self.assertEqual(len(run.image_calls), 1)
+        segment_arg, duration_arg = run.image_calls[0]
+        self.assertEqual(segment_arg, segment)
+        self.assertAlmostEqual(duration_arg, 6.816, places=6)
+        self.assertEqual(
+            result.clips, ["/saved/u0.mp4", "/saved/u1.mp4", "/saved/gen-0.mp4"]
+        )
+        self.assertEqual(
+            result.clip_sources[-1], {"url": "", "local_file": "gen-0.mp4"}
+        )
+        self.assertEqual(result.image_gen, [{"model": "Kwai-Kolors/Kolors", "source": "kolors"}])
+        self.assertEqual(result.resolved_term, "panda one panda")
+        self.assertEqual(result.fallback_level, "self")
+        self.assertEqual(len(result.vlm_filter), 4)
+
+    def test_vlm_disabled_skips_search_and_backfills_whole_segment(self):
+        """VLM 关闭（judge=None）：零搜索、零下载，整段 image-gen（强制立场）。"""
+        pages = {
+            ("panda one panda", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
+                for i in range(4)
+            ],
+        }
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 12.816}],
+            llm_payloads=[self._queries_json(["panda one", "panda two"])],
+            pages_by_term=pages,
+            judge=None,
+        )
+
+        result = run.results[0]
+        self.assertEqual(run.searched, [])
+        self.assertEqual(run.saved, [])
+        self.assertEqual(run.judge_calls, [])
+        # 整段回填：时长 = 全部窗口之和 ≈ 段时长。
+        self.assertEqual(len(run.image_calls), 1)
+        segment_arg, duration_arg = run.image_calls[0]
+        self.assertEqual(segment_arg["index"], 0)
+        self.assertAlmostEqual(duration_arg, 12.816, places=3)
+        self.assertEqual(result.clips, ["/saved/gen-0.mp4"])
+        self.assertEqual(result.fallback_level, "subject")
+        self.assertEqual(result.resolved_term, "panda")
+        self.assertEqual(result.search_attempts, [])
+        self.assertTrue(
+            any(
+                "video match: vlm disabled, image-gen only" in m
+                for m in self._info_messages(run)
+            )
+        )
+
+    def test_coarse_failure_flows_interleave_pool_to_fine(self):
+        """粗排查询向量不可得：fail-open 返回 interleave pool[:30]，精排
+        与走查照常完成——流水线绝不因粗排失败阻塞。"""
+        pages = {
+            ("panda one panda", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
+                for i in (0, 1, 2)
+            ],
+            ("panda two panda", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda two", f"img-{i}")
+                for i in (3, 4, 5)
+            ],
+            ("panda one panda", 2): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
+                for i in (6, 7)
+            ],
+            ("panda two panda", 2): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda two", f"img-{i}")
+                for i in (8, 9)
+            ],
+        }
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 12.816}],
+            llm_payloads=[self._queries_json(["panda one", "panda two"])],
+            pages_by_term=pages,
+            judge="relevant",
+            walk_limit=10,
+            embed_text_fails=True,
+        )
+
+        result = run.results[0]
+        interleave = [f"https://v.example/u{i}.mp4" for i in range(10)]
+        self.assertEqual([c["url"] for c in run.captured["pool"]], interleave)
+        # 精排收到的仍是完整 interleave 池（粗排 fail-open 不缩水）。
+        self.assertEqual(run.rerank_calls[0][1], interleave)
+        self.assertEqual(result.clips, [f"/saved/u{i}.mp4" for i in range(5)])
+        self.assertEqual(len(run.judge_calls), 5)
+        self.assertTrue(
+            any(
+                "video match: coarse rank failed, fail-open" in m
+                for m in self._warning_messages(run)
+            )
+        )
+
+    def test_fine_disabled_walks_coarse_order_capped(self):
+        """[material_rerank] enabled=false：精排整段跳过（零调用），走查
+        消费粗排序并被 walk 预算截断。"""
+        pages = {
+            ("panda one panda", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
+                for i in range(6)
+            ],
+        }
+        vectors = {f"img-{i}": _vec_with_cos(0.9 - 0.1 * i) for i in range(6)}
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 3.744}],
+            llm_payloads=[self._queries_json(["panda one"])],
+            pages_by_term=pages,
+            judge="relevant",
+            walk_limit=3,
+            rerank_enabled=False,
+            vectors=vectors,
+        )
+
+        result = run.results[0]
+        self.assertEqual(run.rerank_calls, [])
+        self.assertEqual(result.clips, ["/saved/u0.mp4", "/saved/u1.mp4", "/saved/u2.mp4"])
+        self.assertEqual(len(run.judge_calls), 3)
+        self.assertTrue(
+            any(
+                "video match: fine rerank disabled, using coarse order" in m
+                for m in self._info_messages(run)
+            )
+        )
+
+    def test_fine_fail_open_uses_coarse_order(self):
+        """精排调用本身抛异常：告警后按粗排序走查，cap 仍然生效。"""
+        pages = {
+            ("panda one panda", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
+                for i in range(6)
+            ],
+        }
+        vectors = {f"img-{i}": _vec_with_cos(0.9 - 0.1 * i) for i in range(6)}
+
+        def exploding_rerank(query, items):
+            raise RuntimeError("reranker exploded")
+
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 3.744}],
+            llm_payloads=[self._queries_json(["panda one"])],
+            pages_by_term=pages,
+            judge="relevant",
+            walk_limit=3,
+            rerank=exploding_rerank,
+            vectors=vectors,
+        )
+
+        result = run.results[0]
+        self.assertEqual(result.clips, ["/saved/u0.mp4", "/saved/u1.mp4", "/saved/u2.mp4"])
+        self.assertEqual(len(run.judge_calls), 3)
+        self.assertTrue(
+            any(
+                "video match: fine rerank failed" in m
+                for m in self._warning_messages(run)
+            )
+        )
+
+    def test_duplicate_url_across_terms_appears_once_in_pool(self):
+        """同一 URL 被两个词条同时返回：按 URL 去重保首个（interleave 序
+        中先出现的词条持有该候选）。"""
+        pages = {
+            ("panda one panda", 1): [
+                _video_item("https://v.example/dup.mp4", "panda one", "img-dup"),
+                _video_item("https://v.example/a.mp4", "panda one", "img-a"),
+            ],
+            ("panda two panda", 1): [
+                _video_item("https://v.example/dup.mp4", "panda two", "img-dup"),
+                _video_item("https://v.example/b.mp4", "panda two", "img-b"),
+            ],
+        }
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 3.744}],
+            llm_payloads=[self._queries_json(["panda one", "panda two"])],
+            pages_by_term=pages,
+            judge="relevant",
+        )
+
+        pool = run.captured["pool"]
+        self.assertEqual(
+            [c["url"] for c in pool],
+            [
+                "https://v.example/dup.mp4",
+                "https://v.example/a.mp4",
+                "https://v.example/b.mp4",
+            ],
+        )
+        self.assertEqual(pool[0]["term"], "panda one panda")
+        # 去重后配额照常拿满，dup URL 只下载一次。
+        self.assertEqual(
+            run.results[0].clips,
+            ["/saved/dup.mp4", "/saved/a.mp4", "/saved/b.mp4"],
+        )
+        self.assertEqual(run.saved.count("https://v.example/dup.mp4"), 1)
+        self.assertEqual(len(run.judge_calls), 3)
+
+    def test_used_url_never_enters_later_pool(self):
+        """前面 segment 已采纳的 URL：后续 segment 的候选池不含它，不重复
+        判定、不重复下载（跨段 used 排除镜像旧机制）。"""
+        pages = {
+            ("t one panda", 1): [
+                _video_item("https://v.example/x.mp4", "t one", "img-x"),
+                _video_item("https://v.example/a.mp4", "t one", "img-a"),
+                _video_item("https://v.example/b.mp4", "t one", "img-b"),
+            ],
+            ("t two panda", 1): [
+                _video_item("https://v.example/x.mp4", "t two", "img-x"),
+                _video_item("https://v.example/c.mp4", "t two", "img-c"),
+                _video_item("https://v.example/d.mp4", "t two", "img-d"),
+                _video_item("https://v.example/e.mp4", "t two", "img-e"),
+            ],
+        }
+        run = self._run(
+            segments=[
+                {"index": 0, "text": "first", "duration": 3.744},
+                {"index": 1, "text": "second", "duration": 3.744},
+            ],
+            llm_payloads=[
+                self._queries_json(["t one"]),
+                self._queries_json(["t two"]),
+            ],
+            pages_by_term=pages,
+            judge="relevant",
+        )
+
+        self.assertEqual(
+            run.results[0].clips,
+            ["/saved/x.mp4", "/saved/a.mp4", "/saved/b.mp4"],
+        )
+        self.assertEqual(
+            run.results[1].clips,
+            ["/saved/c.mp4", "/saved/d.mp4", "/saved/e.mp4"],
+        )
+        # x 全程只下载一次、只判定一次（seg1 的池里根本没有它）。
+        self.assertEqual(run.saved.count("https://v.example/x.mp4"), 1)
+        self.assertEqual(
+            [url for url, _term in run.judge_calls].count("https://v.example/x.mp4"),
+            1,
+        )
+        self.assertNotIn(
+            "https://v.example/x.mp4", [c["url"] for c in run.captured["pool"]]
+        )
+
+    def test_search_cache_same_term_page_once_across_segments(self):
+        """两段生成同一词条：(词条, 页) 备忘使命中缓存的关键词组合只透传
+        一次供应商调用；第二段从剩余新鲜候选拿满名额。"""
+        pages = {
+            ("city walk panda", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "city walk", f"img-{i}")
+                for i in range(6)
+            ],
+        }
+        run = self._run(
+            segments=[
+                {"index": 0, "text": "walk one", "duration": 3.744},
+                {"index": 1, "text": "walk two", "duration": 3.744},
+            ],
+            llm_payloads=[
+                self._queries_json(["city walk"]),
+                self._queries_json(["city walk"]),
+            ],
+            pages_by_term=pages,
+            judge="relevant",
+        )
+
+        self.assertEqual(
+            run.searched, [("city walk panda", 1), ("city walk panda", 2)]
+        )
+        self.assertEqual(
+            run.results[0].clips,
+            ["/saved/u0.mp4", "/saved/u1.mp4", "/saved/u2.mp4"],
+        )
+        self.assertEqual(
+            run.results[1].clips,
+            ["/saved/u3.mp4", "/saved/u4.mp4", "/saved/u5.mp4"],
+        )
+        self.assertEqual(len(run.saved), 6)
+
+    def test_quota_accounting_pinned_to_window_plan(self):
+        """配额 = max(CLIPS_PER_SEGMENT, len(segment_window_plan(D, W)))：
+        D=12.816/W=3 → 5 窗；D=9.48/W=3 → 3 窗。名额满即停走（判定次数 =
+        配额，而非 walk 预算或池大小）。"""
+        for duration, expected in ((12.816, 5), (9.48, 3)):
+            with self.subTest(duration=duration):
+                pages = {
+                    ("panda one panda", 1): [
+                        _video_item(
+                            f"https://v.example/u{i}.mp4", "panda one", f"img-{i}"
+                        )
+                        for i in range(8)
+                    ],
+                }
+                vectors = {
+                    f"img-{i}": _vec_with_cos(0.9 - 0.05 * i) for i in range(8)
+                }
+                run = self._run(
+                    segments=[{"index": 0, "text": "panda", "duration": duration}],
+                    llm_payloads=[self._queries_json(["panda one"])],
+                    pages_by_term=pages,
+                    judge="relevant",
+                    walk_limit=10,
+                    vectors=vectors,
+                )
+                self.assertEqual(len(run.results[0].clips), expected)
+                self.assertEqual(len(run.judge_calls), expected)
+                self.assertEqual(len(run.saved), expected)
+
+    def test_judge_exception_skips_candidate_and_continues(self):
+        """单候选判定抛异常 = 跳过该候选继续走查（fail-open），绝不阻塞。"""
+        pages = {
+            ("panda one panda", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
+                for i in range(4)
+            ],
+        }
+        vectors = {f"img-{i}": _vec_with_cos(0.9 - 0.1 * i) for i in range(4)}
+
+        def judge(item, segment_text, search_term):
+            if item.url.endswith("u1.mp4"):
+                raise RuntimeError("vlm exploded")
+            return _verdict_record("relevant")
+
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 3.744}],
+            llm_payloads=[self._queries_json(["panda one"])],
+            pages_by_term=pages,
+            judge=judge,
+            vectors=vectors,
+        )
+
+        result = run.results[0]
+        # u1 异常被跳过，u2/u3 依次补位拿满配额 3。
+        self.assertEqual(
+            result.clips, ["/saved/u0.mp4", "/saved/u2.mp4", "/saved/u3.mp4"]
+        )
+        self.assertEqual(len(run.judge_calls), 4)
+        self.assertTrue(
+            any("vlm judge failed, fail-open" in m for m in self._warning_messages(run))
+        )
+
+    def test_empty_pool_and_failed_queries_backfill_whole_segment(self):
+        """畸形输入：LLM 查询包全失败 + 搜索空手 → 主题词兜底搜索、空池
+        直接整段回填，流水线不崩、不阻塞。"""
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 3.744}],
+            llm_payloads=["total garbage", "still garbage"],
+            pages_by_term={},
+            judge="relevant",
+        )
+
+        result = run.results[0]
+        # 词条为空 → 主题词兜底；第 1 页即空 → 不翻第 2 页。
+        self.assertEqual(run.searched, [("panda", 1)])
+        self.assertEqual(run.judge_calls, [])
+        self.assertEqual(len(run.image_calls), 1)
+        self.assertAlmostEqual(run.image_calls[0][1], 3.744, places=3)
+        self.assertEqual(result.clips, ["/saved/gen-0.mp4"])
+        self.assertEqual(result.fallback_level, "subject")
+        self.assertEqual(
+            result.search_attempts,
+            [{"level": "self", "term": "panda", "found": False}],
+        )
 
 
 if __name__ == "__main__":
