@@ -364,6 +364,8 @@ timeout = 30
 # ffmpeg first-frame extraction from the candidate mp4.
 min_thumbnail_width = 640
 min_thumbnail_height = 320
+# Note: [material_rerank] inherits its api_key / base_url from this [vlm]
+# section when its own are left empty (see [material_rerank] below).
 
 # -----------------------------------------------------------------------------
 # Subject-level image generation (segment-first pipeline).
@@ -401,13 +403,6 @@ base_url = ""
 duplicate_gate = false
 # 余弦相似度 ≥ 该阈值判为重复（实测阳性 0.708-0.921，渗透上限 0.663）。
 duplicate_threshold = 0.68
-# 文本-图像余弦粗筛（VLM 前的廉价预过滤）：开启后未被查重拒绝的候选，先按
-# 段落搜索词的文本嵌入与图像嵌入算余弦，低于阈值直接拒收，省一次 VLM 调用。
-# 默认关闭；阈值由 UAT 标注数据零误杀校准（官方无固定阈值），只保证相关
-# 素材零误拒，粗筛不能替代 VLM 终审。
-# 注意：粗筛仅在 [vlm] 过滤启用时生效——judge 关闭时门不会被调用。
-coarse_filter = false
-coarse_threshold = 0.089445
 
 # =============================================================================
 # Material Reranker / 素材视觉重排序

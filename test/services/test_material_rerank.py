@@ -460,3 +460,47 @@ def test_no_rankable_items_passthrough(monkeypatch):
         result = rerank_page("panda", items, 5)
     assert result == items
     post.assert_not_called()
+
+
+# ---------------------------------------------------------------- config.example.toml 粗筛键清除验证
+
+
+import tomllib as _tomllib
+
+
+def _example_config():
+    config_path = Path(__file__).resolve().parents[2] / "config.example.toml"
+    return _tomllib.loads(config_path.read_text(encoding="utf-8"))
+
+
+def test_example_config_image_embedding_no_coarse_keys():
+    example = _example_config()
+    ie = example["image_embedding"]
+    assert "duplicate_gate" in ie
+    assert "coarse_filter" not in ie
+    assert "coarse_threshold" not in ie
+
+
+def test_example_config_material_rerank_section():
+    example = _example_config()
+    mr = example["material_rerank"]
+    for key in ("enabled", "model", "top_n", "timeout", "api_key", "base_url"):
+        assert key in mr, f"[material_rerank] missing key: {key}"
+
+
+def test_live_parser_defaults_no_coarse_in_image_embedding():
+    from app.config.config import image_embedding as _ie_synced
+
+    defaults_only = {k: v for k, v in _ie_synced.items() if k in _ie_synced}
+    raw = dict(config.image_embedding)
+    user_only_keys = set(raw.keys()) - {
+        "model", "api_key", "base_url", "duplicate_gate", "duplicate_threshold",
+        "provider_name",
+    }
+    assert user_only_keys <= {"coarse_filter", "coarse_threshold"}, (
+        f"unexpected extra keys in live config.image_embedding: {user_only_keys}"
+    )
+    config_path = Path(__file__).resolve().parents[2] / "app" / "config" / "config.py"
+    src = config_path.read_text(encoding="utf-8")
+    assert '"coarse_filter"' not in src
+    assert '"coarse_threshold"' not in src
