@@ -1,10 +1,11 @@
 """
-task.py 查重门/粗筛接线测试（embed-prefilter T4）。
+task.py 查重门接线测试。
 
-只测接线契约：duplicate_gate 与 coarse_filter 任一开启时按任务建一个
-EmbeddingGate 并把 register_accepted 注入素材层；两者都关闭时不建门、
-不注入回调。VLM judge 的注入行为归 T3（test_vlm_judge.py /
-test_segment_material_quota.py），本文件不覆盖。全部 mock，无网络请求。
+只测接线契约：duplicate_gate 开启时按任务建一个 EmbeddingGate 并把
+register_accepted 注入素材层；关闭时不建门、不注入回调。VLM judge 的
+注入行为归 T3（test_vlm_judge.py / test_segment_material_quota.py），
+本文件不覆盖。material_rerank 的启用状态不影响门的构造。全部 mock，
+无网络请求。
 """
 
 import sys
@@ -20,7 +21,7 @@ from app.services import task
 
 
 class TestTaskGateWiring(unittest.TestCase):
-    def _run_pipeline_to_materials(self, duplicate_enabled, coarse_enabled):
+    def _run_pipeline_to_materials(self, duplicate_enabled):
         """跑 stop_at="materials" 流水线，返回素材层收到的 kwargs 与 gate mock。"""
         captured = {}
         gate = MagicMock()
@@ -65,11 +66,6 @@ class TestTaskGateWiring(unittest.TestCase):
             ),
             patch.object(
                 task.image_embedding,
-                "is_coarse_filter_enabled",
-                return_value=coarse_enabled,
-            ),
-            patch.object(
-                task.image_embedding,
                 "make_default_gate",
                 new=gate_factory,
             ),
@@ -109,20 +105,25 @@ class TestTaskGateWiring(unittest.TestCase):
         return captured, gate_factory, gate
 
     def test_gate_built_when_duplicate_gate_enabled(self):
-        captured, gate_factory, gate = self._run_pipeline_to_materials(True, False)
+        captured, gate_factory, gate = self._run_pipeline_to_materials(True)
         gate_factory.assert_called_once()
         self.assertIs(captured["on_clip_accepted"], gate.register_accepted)
 
-    def test_gate_built_when_only_coarse_filter_enabled(self):
-        captured, gate_factory, gate = self._run_pipeline_to_materials(False, True)
-        gate_factory.assert_called_once()
-        self.assertIs(captured["on_clip_accepted"], gate.register_accepted)
-
-    def test_no_gate_when_both_flags_off(self):
-        captured, gate_factory, _ = self._run_pipeline_to_materials(False, False)
+    def test_no_gate_when_duplicate_gate_disabled(self):
+        captured, gate_factory, _ = self._run_pipeline_to_materials(False)
         gate_factory.assert_not_called()
         self.assertIsNone(captured["on_clip_accepted"])
         self.assertIsNone(captured["judge_candidate"])
+
+    def test_rerank_irrelevant_to_gate_construction(self):
+        """material_rerank 启用不触发门构造；门只由 duplicate_gate 决定。"""
+        with patch(
+            "app.services.material_rerank.is_rerank_enabled", return_value=True
+        ):
+            captured, gate_factory, _ = self._run_pipeline_to_materials(False)
+            gate_factory.assert_not_called()
+            self.assertIsNone(captured["on_clip_accepted"])
+            self.assertIsNone(captured["judge_candidate"])
 
 
 if __name__ == "__main__":

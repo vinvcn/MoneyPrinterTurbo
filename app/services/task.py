@@ -1242,18 +1242,15 @@ def _run_segment_first_pipeline(
     # 图像查重门（finding G）：[image_embedding] duplicate_gate=true 时按
     # 任务新建一个 gate——判定时缓存的候选嵌入在素材被采纳后经
     # on_clip_accepted 移入 accepted 注册表，跨段重复画面在 VLM 之前被拒收。
-    # 粗筛（coarse_filter=true）复用同一 gate：未被查重拒绝的候选先过
-    # 文本-图像余弦预筛再交 VLM 终审；任一开关开启即建门。
     embedding_gate = None
     duplicate_gate_on = image_embedding.is_duplicate_gate_enabled()
-    coarse_filter_on = image_embedding.is_coarse_filter_enabled()
-    if duplicate_gate_on or coarse_filter_on:
+    if duplicate_gate_on:
         embedding_gate = image_embedding.make_default_gate()
         logger.info(
             "image embedding gate enabled: "
             f"model={embedding_gate.model}, "
             f"threshold={embedding_gate.threshold}, "
-            f"duplicate={duplicate_gate_on}, coarse={coarse_filter_on}"
+            f"duplicate={duplicate_gate_on}"
         )
     segment_judge = None
     if vlm_judge.is_enabled():
