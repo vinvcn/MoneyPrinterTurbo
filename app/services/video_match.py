@@ -1,15 +1,15 @@
 """
 逐段 LLM 查询生成（视频素材匹配三段漏斗的第一级）。
 
-segment-first 流水线的素材匹配正在重构为三级漏斗：粗排（embedding 召回
+segment-first 流水线的素材匹配是三级漏斗：粗排（embedding 召回
 排序）→ 精排（VL 模型重排）→ VLM 走查。本模块在分段之后为每个片段生成
-一份查询包：terms（英文搜索词，主词在前，沿用 segment_terms 的既有语义）、
+一份查询包：terms（英文搜索词，主词在前，沿用既有搜索词语义）、
 coarse_query（宽场景描述，供粗排 embedding 检索）、fine_query（精确视觉
 时刻描述，供精排重排比对）。
 
-与逐段搜索词提炼（segment_terms.py）的成本控制方式一致：一次
+与逐段搜索词提炼的成本控制方式一致：一次
 llm.generate_response 调用同时产出三类查询；响应无法解析出 JSON 对象时
-按 segment_terms 的重试策略重试，重试耗尽后 fail-open 返回空查询包
+按既定重试策略重试，重试耗尽后 fail-open 返回空查询包
 （terms=[], coarse_query=None, fine_query=None），降级由调用方处理。
 """
 
@@ -36,15 +36,14 @@ from app.services.segment_material import (
 from app.services.video import segment_window_plan
 from app.services.vlm_judge import download_thumbnail_bytes, to_data_uri
 
-# 解析失败的最大尝试次数（与 segment_terms._MAX_RETRIES 同构，镜像其重试
-# 语义：range(1, _MAX_RETRIES + 1) 即最多 2 次调用）。
+# 解析失败的最大尝试次数：range(1, _MAX_RETRIES + 1) 即最多 2 次调用，
+# 逐段搜索词提炼与查询包生成共用同一重试语义。
 _MAX_RETRIES = 2
 
-# 每段最多提炼的搜索词数量；第一个词为主搜索词，其余为备用词（沿用
-# segment_terms.TERMS_PER_SEGMENT 的语义）。
+# 每段最多提炼的搜索词数量；第一个词为主搜索词，其余为备用词。
 _MAX_TERMS = 3
 
-# 字符级 CJK 判定：与 segment_terms/segment_material 保持同一正则——搜索
+# 字符级 CJK 判定：与 segment_material 保持同一正则——搜索
 # API（Pexels/Pixabay/Coverr）仅接受英文查询，含中日韩字符的词召回极差。
 _CJK_PATTERN = re.compile(r"[一-鿿぀-ヿ가-힯]")
 
@@ -70,7 +69,7 @@ def _build_prompt(subject: str, segment_text: str) -> str:
     """
     构造单段三查询提示词。
 
-    保持与 generate_terms / segment_terms 相同的 Role/Constrains/Output
+    保持与 generate_terms 相同的 Role/Constrains/Output
     Example 结构（模型对该格式已稳定），Context 为单段文本并绑定主题词。
     """
     output_example = json.dumps(
@@ -131,7 +130,7 @@ def _clean_query(value: object) -> str | None:
 
 def _normalize_terms(raw_terms: object, subject: str) -> list[str]:
     """
-    词条规整，逐字沿用 segment_terms 的语义：截断、追加英文主题词、
+    词条规整：截断、追加英文主题词、
     逐词 CJK 过滤；全部词条被过滤时返回空列表（降级由调用方处理）。
     """
     if not isinstance(raw_terms, list):
@@ -200,7 +199,7 @@ def generate_segment_queries(subject: str, segment_text: str) -> SegmentQueries:
         segment_text: 该片段的旁白原文。
 
     Returns:
-        SegmentQueries。解析失败按 segment_terms 的策略重试，重试耗尽后
+        SegmentQueries。解析失败按既定策略重试，重试耗尽后
         fail-open 返回空查询包（terms=[], coarse_query=None,
         fine_query=None），绝不抛异常；空词条等降级由调用方处理。
     """
@@ -345,10 +344,9 @@ def coarse_rank(
 
 
 # ---------------------------------------------------------------------------
-# 三段漏斗主编排（todo 5）：每段 查询包 → 搜索聚池（页优先 interleave）→
+# 三段漏斗主编排：每段 查询包 → 搜索聚池（页优先 interleave）→
 # 粗排 → 精排 → VLM 走查（配额满提前退出）→ image-gen 回填。替代
-# prepare_segment_materials 的层级/翻页/延期机械（旧实现保留至 todo 6
-# 与 task.py 接线一并删除，本模块只新增不改动）。
+# 旧实现的层级/翻页/延期机械（旧实现已随 task.py 接线删除）。
 # ---------------------------------------------------------------------------
 
 
@@ -394,7 +392,7 @@ def _search_terms_for_queries(queries: SegmentQueries, subject: str) -> list[str
     """
     漏斗入口词条：queries.terms 为主，空词条时回落英文主题词。
 
-    镜像 prepare_segment_materials 的词条处理：逐词过英文过滤（搜索
+    镜像旧实现的词条处理：逐词过英文过滤（搜索
     API 仅接受英文）、去空串、按序去重。queries.terms 为空（LLM 失败
     或全部被 CJK 过滤）时以主题词兜底；主题词也含 CJK 时返回空列表——
     该段没有可用搜索词，候选池为空，直接落入 image-gen 回填。
@@ -422,7 +420,7 @@ def match_segments(
     """
     三段漏斗素材匹配主编排：粗排（embedding 召回）→ 精排（VL 重排）→
     VLM 走查（配额满提前退出），未满名额（含 VLM 关闭的整段情形）一律
-    image-gen 回填。字段与旧 prepare_segment_materials 逐字段一致。
+    image-gen 回填。字段与旧实现逐字段一致。
 
     Args:
         segments: 片段 dict 列表，至少含 {"index", "text", "duration"}。
@@ -463,7 +461,7 @@ def match_segments(
         与输入等长的 SegmentMaterials 列表（字段与旧实现一致）。
     """
     subject = english_search_term(str(video_subject or ""))
-    # (词条, 页) 搜索备忘：镜像 prepare_segment_materials 的语义——同一
+    # (词条, 页) 搜索备忘：镜像旧实现的语义——同一
     # 关键词组合跨段、跨词条只打一次供应商 API。
     search_cache: dict[tuple[str, int], list[MaterialInfo]] = {}
 

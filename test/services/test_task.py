@@ -1639,8 +1639,8 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.segmenter, "segment_script") as segment_script,
             patch.object(tm.segment_audio, "prepare_segment_audio", return_value=fake_audio_result),
             patch.object(
-                tm.segment_material,
-                "prepare_segment_materials",
+                tm.video_match,
+                "match_segments",
                 return_value=fake_materials,
             ),
             patch.object(tm, "generate_terms", return_value=["coffee"]),
@@ -1719,20 +1719,17 @@ class TestTaskService(unittest.TestCase):
             patch.object(tm.sm, "state", state),
             patch.object(tm, "segment_pipeline_enabled", return_value=True),
             patch.object(tm.segmenter, "segment_script") as segment_script,
-            patch.object(
-                tm.segment_terms, "extract_terms_for_segments", return_value={}
-            ),
             patch.object(tm, "save_script_data"),
             patch.object(
-                tm.segment_material, "prepare_segment_materials"
-            ) as prepare_materials,
+                tm.video_match, "match_segments"
+            ) as match_segments,
         ):
             segment_script.return_value = [
                 SimpleNamespace(index=0, text="宇宙中存在着一种天体。", estimated_duration=1.0),
             ]
             result = tm.start("no-english-terms", params)
 
-        prepare_materials.assert_not_called()
+        match_segments.assert_not_called()
         self.assertEqual(result["failed_stage"], "terms")
         self.assertIn("英文搜索词", result["error"])
 

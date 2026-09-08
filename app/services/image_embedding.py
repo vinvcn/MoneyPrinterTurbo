@@ -299,6 +299,11 @@ class EmbeddingGate:
     def register_accepted(self, url: str) -> None:
         """把候选缓存向量挪入已采纳注册表（无 API 调用）。"""
         vec = self._candidates.pop(url, None)
+        if vec is None and self._shared_cache is not None:
+            # 粗排预热的向量只写入共享缓存、不经过 _candidates（走查前
+            # 已被判过的候选才会落入 _candidates）：从共享缓存兜底取出，
+            # 否则采纳注册表静默漏注册，跨段近重复检测失效。
+            vec = self._shared_cache.get(url)
         if vec is not None:
             self._accepted[url] = vec
 
@@ -337,11 +342,18 @@ def _gate_threshold() -> float:
     return threshold
 
 
-def make_default_gate() -> EmbeddingGate:
-    """按 [image_embedding] 配置构造查重门（task.py 每任务调用一次）。"""
+def make_default_gate(
+    vector_cache: dict[str, list[float]] | None = None,
+) -> EmbeddingGate:
+    """按 [image_embedding] 配置构造查重门（task.py 每任务调用一次）。
+
+    vector_cache 是任务级 url->向量缓存：注入后门与 video_match 粗排共享
+    同一份候选向量，同一 URL 全链路只嵌入一次。
+    """
     return EmbeddingGate(
         model=_gate_setting("model", DEFAULT_EMBEDDING_MODEL),
         api_key=str((getattr(config, "image_embedding", None) or {}).get("api_key", "") or ""),
         threshold=_gate_threshold(),
         base_url=_gate_setting("base_url", "") or None,
+        vector_cache=vector_cache,
     )

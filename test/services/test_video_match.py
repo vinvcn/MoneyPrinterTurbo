@@ -119,7 +119,7 @@ class TestGenerateSegmentQueries(unittest.TestCase):
         self.assertEqual(
             result, SegmentQueries(terms=[], coarse_query=None, fine_query=None)
         )
-        # 与 segment_terms._MAX_RETRIES 同构：range(1, 2+1) → 最多 2 次调用。
+        # 解析失败重试语义：range(1, 2+1) → 最多 2 次调用。
         self.assertEqual(calls["n"], 2)
 
     def test_llm_error_string_is_retried_then_recovers(self):
@@ -664,7 +664,19 @@ class TestMatchSegments(unittest.TestCase):
                 for i in (10, 11)
             ],
         }
-        vectors = {f"img-{i}": _vec_with_cos(0.95 - 0.05 * i) for i in range(12)}
+        # 候选向量：e0 分量 a_i=0.95-0.05i 保证与查询 [1,0,0] 的余弦严格
+        # 递减（粗排/精排序不受影响）；走查将采纳的 5 个候选各占一个独立
+        # 方位角，两两余弦 ≤ ~0.58 < 0.68——互不为近重复。register_accepted
+        # 修复后采纳向量真正入册，若候选两两近似（如全部躺在同一平面上）
+        # 门会把后续候选判重拒收，配额断言就会被 image-gen 回填打破。
+        walked = (11, 10, 9, 8, 7)
+        azimuth = {i: 1.1 * n for n, i in enumerate(walked)}
+        vectors = {}
+        for i in range(12):
+            a = 0.95 - 0.05 * i
+            b = math.sqrt(1.0 - a * a)
+            phi = azimuth.get(i, 0.0)
+            vectors[f"img-{i}"] = [a, b * math.cos(phi), b * math.sin(phi)]
         run = self._run(
             segments=[{"index": 0, "text": "panda", "duration": 12.816}],
             llm_payloads=[self._queries_json(["panda one", "panda two"])],

@@ -34,8 +34,8 @@ from app.services import (
     segment_audio,
     segment_material,
     segment_subtitle,
-    segment_terms,
     segmenter,
+    video_match,
     vlm_judge,
 )
 from app.utils import file_security, utils
@@ -1142,22 +1142,6 @@ def _run_segment_first_pipeline(
         f"segmented script: task_id={task_id}, segments={len(segment_records)}"
     )
 
-    # 用 LLM 把每段文本提炼成最多 3 个英文搜索词（generate_terms 的同构提示词）：
-    # 主词在前、备用词在后，主词搜索失败时素材层用备用词重试。
-    # 提炼失败的分段不出现在映射里，prepare_segment_materials 会回退用原文搜索。
-    segment_term_map = segment_terms.extract_terms_for_segments(
-        segment_records,
-        video_subject=params.video_subject,
-    )
-    for record in segment_records:
-        terms = segment_term_map.get(record["index"])
-        if terms:
-            # search_terms 供素材层按序重试；search_term 保留主词，兼容旧消费方。
-            record["search_terms"] = terms
-            record["search_term"] = terms[0]
-        else:
-            record["search_term"] = ""
-
     save_script_data(
         task_id,
         video_script,
@@ -1236,16 +1220,19 @@ def _run_segment_first_pipeline(
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
-    # 3. Per-segment material search with fallback chain
+    # 3. 逐段素材匹配（三段漏斗：粗排 → 精排 → VLM 走查 → image-gen 回填）
     # VLM 下载前相关性过滤（issue #9）：[vlm] enabled=true 时逐候选判定，
     # 不相关素材在下载完整 mp4 之前被拒收。
     # 图像查重门（finding G）：[image_embedding] duplicate_gate=true 时按
-    # 任务新建一个 gate——判定时缓存的候选嵌入在素材被采纳后经
-    # on_clip_accepted 移入 accepted 注册表，跨段重复画面在 VLM 之前被拒收。
+    # 任务新建一个 gate，并注入任务级 url->向量缓存——video_match 粗排
+    # 预热与门走查共享同一份向量（同一 URL 全链路只嵌入一次）；素材被
+    # 采纳后 match_segments 经 register_accepted 把向量移入 accepted
+    # 注册表，跨段重复画面在 VLM 之前被拒收。
     embedding_gate = None
     duplicate_gate_on = image_embedding.is_duplicate_gate_enabled()
     if duplicate_gate_on:
-        embedding_gate = image_embedding.make_default_gate()
+        vector_cache: dict[str, list[float]] = {}
+        embedding_gate = image_embedding.make_default_gate(vector_cache=vector_cache)
         logger.info(
             "image embedding gate enabled: "
             f"model={embedding_gate.model}, "
@@ -1256,27 +1243,60 @@ def _run_segment_first_pipeline(
     if vlm_judge.is_enabled():
         segment_judge = vlm_judge.make_default_judge(embedding_gate=embedding_gate)
         logger.info("vlm pre-download material filter enabled")
-    materials = segment_material.prepare_segment_materials(
+
+    task_material_dir = utils.task_dir(task_id)
+
+    def search_videos(
+        search_term: str,
+        minimum_duration=None,
+        video_aspect=None,
+        page: int = 1,
+    ):
+        # 页感知搜索回调：match_segments 按 (词条, 页) 逐页取候选，这里把
+        # 页码绑定进素材源缓存搜索（24h 持久缓存与源选择沿用旧接线），
+        # 只服务单次 (词条, 页) 取数；(词条, 页) 级备忘由 match_segments 自持。
+        page_search = material.search_videos_with_cache_for_source(
+            params.video_source,
+            page=max(1, int(page or 1)),
+        )
+        return page_search(
+            search_term=search_term,
+            minimum_duration=params.video_clip_duration
+            if minimum_duration is None
+            else minimum_duration,
+            video_aspect=params.video_aspect
+            if video_aspect is None
+            else video_aspect,
+        )
+
+    def save_video(video_url: str, save_dir: str = "") -> str:
+        # 镜像旧接线：segment-first 素材固定下载进任务目录，忽略 match
+        # 层透传的 save_dir（其取值来自 [app] material_directory 的模块级
+        # 兜底解析，本流程覆盖为任务目录）。
+        return material.save_video(video_url=video_url, save_dir=task_material_dir)
+
+    def generate_image(segment: dict, duration=None):
+        # image-gen 回填回调（match_segments 契约）：segment 是完整片段
+        # dict，duration 是待回填窗口的时长和；None 时 make_subject_clip
+        # 保持整段默认时长，行为与旧接线一致。
+        return image_gen.make_subject_clip(
+            segment_text=str(segment.get("text") or ""),
+            subject_term=english_subject,
+            video_aspect=params.video_aspect,
+            save_dir=task_material_dir,
+            duration=duration,
+        )
+
+    materials = video_match.match_segments(
         segments=segment_records,
         video_subject=params.video_subject,
-        search_videos=material.search_videos_with_cache_for_source(
-            params.video_source
-        ),
-        save_video=material.save_video,
+        search_videos=search_videos,
+        save_video=save_video,
         video_aspect=params.video_aspect,
         clip_duration=params.video_clip_duration,
-        save_dir=utils.task_dir(task_id),
         judge_candidate=segment_judge,
-        on_clip_accepted=(
-            embedding_gate.register_accepted if embedding_gate else None
-        ),
-        # subject 层图片生成（替代 subject 视频搜索）：回调绑定段宽高比与
-        # 任务素材目录，materials 层只拿 clip 路径与审计记录。
-        generate_image=partial(
-            image_gen.make_subject_clip,
-            video_aspect=params.video_aspect,
-            save_dir=utils.task_dir(task_id),
-        ),
+        embedding_gate=embedding_gate,
+        generate_image=generate_image,
     )
     segment_material.persist_segment_material_sources(task_id, materials)
 

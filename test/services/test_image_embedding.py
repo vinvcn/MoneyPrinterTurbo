@@ -526,6 +526,26 @@ class TestEmbeddingGateSharedCache(unittest.TestCase):
         self.assertEqual(record["verdict"], "duplicate")
         self.assertEqual(stub.calls, ["data:a", "data:b"])
 
+    def test_register_accepted_falls_back_to_shared_cache(self):
+        """粗排预热的向量只存在于共享缓存、不经过 _candidates：
+        register_accepted 必须从共享缓存兜底注册，否则采纳注册表静默
+        漏注册，跨段近重复检测失效（finding G 回归）。"""
+        shared = {"https://a": [1.0, 0.0]}
+        gate = EmbeddingGate(
+            model="m", api_key="k", threshold=0.68, vector_cache=shared
+        )
+        # 未经过 judge_candidate_embedding（_candidates 为空），直接注册。
+        gate.register_accepted("https://a")
+        self.assertIn("https://a", gate._accepted)
+        self.assertEqual(gate._accepted["https://a"], [1.0, 0.0])
+        # 近似向量随后被判重复，证明注册表真正参与查重比对。
+        stub = _VectorStub({"data:b": [0.999, 0.0447]})
+        with patch.object(image_embedding, "embed_image", stub):
+            record = gate.judge_candidate_embedding("https://b", "data:b")
+        assert record is not None
+        self.assertEqual(record["verdict"], "duplicate")
+        self.assertEqual(record["duplicate_of"], "https://a")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -284,7 +284,7 @@ def make_subject_clip(
 ) -> tuple[str, dict[str, Any]]:
     """
     subject 层图片 clip 获取的编排入口（由 task.py 注入为
-    prepare_segment_materials 的 generate_image 回调）。
+    video_match.match_segments 的 generate_image 回调）。
 
     返回 (clip_path, audit_record)；clip_path 为 "" 时段空手。audit_record
     随 manifest 的 image_gen 字段落盘（prompt/model/source/路径）。

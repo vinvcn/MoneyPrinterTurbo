@@ -1,11 +1,11 @@
 """
 task.py 查重门接线测试。
 
-只测接线契约：duplicate_gate 开启时按任务建一个 EmbeddingGate 并把
-register_accepted 注入素材层；关闭时不建门、不注入回调。VLM judge 的
-注入行为归 T3（test_vlm_judge.py / test_segment_material_quota.py），
-本文件不覆盖。material_rerank 的启用状态不影响门的构造。全部 mock，
-无网络请求。
+只测接线契约：duplicate_gate 开启时按任务建一个 EmbeddingGate 并注入
+任务级 vector_cache（与 video_match 粗排共享同一份 url->向量缓存），
+随 match_segments 一起下发；关闭时不建门、gate/judge 传 None。
+VLM judge 的注入行为归 T3（test_vlm_judge.py），本文件不覆盖。
+material_rerank 的启用状态不影响门的构造。全部 mock，无网络请求。
 """
 
 import sys
@@ -25,8 +25,9 @@ class TestTaskGateWiring(unittest.TestCase):
         """跑 stop_at="materials" 流水线，返回素材层收到的 kwargs 与 gate mock。"""
         captured = {}
         gate = MagicMock()
+        gate.register_accepted = MagicMock()
 
-        def fake_prepare(**kwargs):
+        def fake_match(**kwargs):
             captured.update(kwargs)
             return [SimpleNamespace(clips=["clip.mp4"])]
 
@@ -37,11 +38,6 @@ class TestTaskGateWiring(unittest.TestCase):
                 task.segmenter,
                 "segment_script",
                 lambda script: [SimpleNamespace(index=0, text="hello world")],
-            ),
-            patch.object(
-                task.segment_terms,
-                "extract_terms_for_segments",
-                lambda records, video_subject: {},
             ),
             patch.object(task, "save_script_data", lambda *a, **k: None),
             patch.object(
@@ -73,11 +69,9 @@ class TestTaskGateWiring(unittest.TestCase):
             patch.object(
                 task.material,
                 "search_videos_with_cache_for_source",
-                lambda source: lambda *a, **k: [],
+                lambda source, page=1: lambda *a, **k: [],
             ),
-            patch.object(
-                task.segment_material, "prepare_segment_materials", fake_prepare
-            ),
+            patch.object(task.video_match, "match_segments", fake_match),
             patch.object(
                 task.segment_material,
                 "persist_segment_material_sources",
@@ -104,15 +98,24 @@ class TestTaskGateWiring(unittest.TestCase):
         )
         return captured, gate_factory, gate
 
-    def test_gate_built_when_duplicate_gate_enabled(self):
+    def test_gate_built_with_vector_cache_when_duplicate_gate_enabled(self):
         captured, gate_factory, gate = self._run_pipeline_to_materials(True)
         gate_factory.assert_called_once()
-        self.assertIs(captured["on_clip_accepted"], gate.register_accepted)
+        # 门按任务注入任务级向量缓存：match_segments 取回同一份 dict 供
+        # 粗排预热，粗排与查重门共享向量（同一 URL 全链路只嵌入一次）。
+        self.assertIsInstance(
+            gate_factory.call_args.kwargs.get("vector_cache"), dict
+        )
+        self.assertIs(captured["embedding_gate"], gate)
+        self.assertIsNone(captured["judge_candidate"])
+        self.assertTrue(callable(captured["generate_image"]))
+        self.assertTrue(callable(captured["search_videos"]))
+        self.assertTrue(callable(captured["save_video"]))
 
     def test_no_gate_when_duplicate_gate_disabled(self):
         captured, gate_factory, _ = self._run_pipeline_to_materials(False)
         gate_factory.assert_not_called()
-        self.assertIsNone(captured["on_clip_accepted"])
+        self.assertIsNone(captured["embedding_gate"])
         self.assertIsNone(captured["judge_candidate"])
 
     def test_rerank_irrelevant_to_gate_construction(self):
@@ -122,7 +125,7 @@ class TestTaskGateWiring(unittest.TestCase):
         ):
             captured, gate_factory, _ = self._run_pipeline_to_materials(False)
             gate_factory.assert_not_called()
-            self.assertIsNone(captured["on_clip_accepted"])
+            self.assertIsNone(captured["embedding_gate"])
             self.assertIsNone(captured["judge_candidate"])
 
 
