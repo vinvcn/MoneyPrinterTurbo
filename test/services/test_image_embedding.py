@@ -15,7 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.services import image_embedding
-from app.services.image_embedding import EmbeddingGate, embed_image
+from app.services.image_embedding import EmbeddingGate, embed_image, embed_text
 
 
 def _ok_response(vector=None, dim=768):
@@ -355,6 +355,176 @@ class TestGateConfig(unittest.TestCase):
         ):
             gate = image_embedding.make_default_gate()
         self.assertEqual(gate.threshold, 0.68)
+
+
+class TestEmbedText(unittest.TestCase):
+    """embed_text：与 embed_image 同端点的文本分支，fail-open 契约镜像。"""
+
+    def test_success_returns_vector_and_sends_text_body(self):
+        cfg = {"model": "custom-model", "api_key": "text-key", "base_url": ""}
+        with (
+            patch.object(image_embedding.config, "image_embedding", cfg),
+            patch.object(
+                image_embedding.requests, "post", return_value=_ok_response(dim=8)
+            ) as post,
+        ):
+            vec = embed_text("a panda in a forest")
+        assert vec is not None
+        self.assertEqual(len(vec), 8)
+        self.assertTrue(all(isinstance(v, float) for v in vec))
+        self.assertEqual(
+            post.call_args.args[0], image_embedding.DEFAULT_EMBEDDING_BASE_URL
+        )
+        headers = post.call_args.kwargs["headers"]
+        self.assertEqual(headers["Authorization"], "Bearer text-key")
+        self.assertEqual(
+            post.call_args.kwargs["json"],
+            {
+                "model": "custom-model",
+                "input": {"contents": [{"text": "a panda in a forest"}]},
+            },
+        )
+
+    def test_blank_query_returns_none_without_request(self):
+        with (
+            patch.object(image_embedding.config, "image_embedding", {"api_key": "k"}),
+            patch.object(image_embedding.requests, "post") as post,
+        ):
+            self.assertIsNone(embed_text("   "))
+        post.assert_not_called()
+
+    def test_base_url_override_from_config(self):
+        cfg = {
+            "model": "m",
+            "api_key": "k",
+            "base_url": "https://gateway.example.com/embed",
+        }
+        with (
+            patch.object(image_embedding.config, "image_embedding", cfg),
+            patch.object(
+                image_embedding.requests, "post", return_value=_ok_response(dim=3)
+            ) as post,
+        ):
+            embed_text("q")
+        self.assertEqual(
+            post.call_args.args[0], "https://gateway.example.com/embed"
+        )
+
+    def test_429_retries_with_backoff_then_succeeds(self):
+        responses = [_status_response(429), _ok_response(dim=8)]
+        with (
+            patch.object(
+                image_embedding.config, "image_embedding", {"api_key": "k"}
+            ),
+            patch.object(
+                image_embedding.requests, "post", side_effect=responses
+            ) as post,
+            patch.object(image_embedding.time, "sleep") as sleep,
+        ):
+            vec = embed_text("q")
+        assert vec is not None
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once_with(1.5)
+
+    def test_429_exhausted_returns_none(self):
+        responses = [_status_response(429)] * 4
+        with (
+            patch.object(
+                image_embedding.config, "image_embedding", {"api_key": "k"}
+            ),
+            patch.object(
+                image_embedding.requests, "post", side_effect=responses
+            ) as post,
+            patch.object(image_embedding.time, "sleep") as sleep,
+        ):
+            vec = embed_text("q")
+        self.assertIsNone(vec)
+        self.assertEqual(post.call_count, 4)
+        self.assertEqual(
+            [c.args[0] for c in sleep.call_args_list], [1.5, 3.0, 6.0]
+        )
+
+    def test_http_error_fails_open_and_logs(self):
+        with (
+            patch.object(
+                image_embedding.config, "image_embedding", {"api_key": "k"}
+            ),
+            patch.object(
+                image_embedding.requests,
+                "post",
+                return_value=_status_response(500),
+            ),
+            patch.object(image_embedding, "logger") as mock_logger,
+        ):
+            vec = embed_text("q")
+        self.assertIsNone(vec)
+        self.assertEqual(mock_logger.warning.call_count, 1)
+        self.assertIn("text embedding http error", str(mock_logger.warning.call_args))
+
+    def test_timeout_returns_none(self):
+        with (
+            patch.object(
+                image_embedding.config, "image_embedding", {"api_key": "k"}
+            ),
+            patch.object(
+                image_embedding.requests,
+                "post",
+                side_effect=image_embedding.requests.exceptions.Timeout,
+            ),
+        ):
+            self.assertIsNone(embed_text("q"))
+
+    def test_missing_keys_returns_none(self):
+        bad = SimpleNamespace(status_code=200, json=lambda: {})
+        with (
+            patch.object(
+                image_embedding.config, "image_embedding", {"api_key": "k"}
+            ),
+            patch.object(image_embedding.requests, "post", return_value=bad),
+        ):
+            self.assertIsNone(embed_text("q"))
+
+
+class TestEmbeddingGateSharedCache(unittest.TestCase):
+    """vector_cache 注入：粗排预热与门走查共享向量，URL 全链路只嵌入一次。"""
+
+    def test_same_url_judged_twice_embeds_once_with_shared_cache(self):
+        shared: dict[str, list[float]] = {}
+        gate = EmbeddingGate(
+            model="m", api_key="k", threshold=0.68, vector_cache=shared
+        )
+        stub = _VectorStub({"data:a": [1.0, 0.0]})
+        with patch.object(image_embedding, "embed_image", stub):
+            self.assertIsNone(gate.judge_candidate_embedding("https://a", "data:a"))
+            self.assertIsNone(gate.judge_candidate_embedding("https://a", "data:a"))
+        self.assertEqual(stub.calls, ["data:a"])
+        self.assertEqual(shared, {"https://a": [1.0, 0.0]})
+
+    def test_shared_cache_warmed_elsewhere_skips_embed(self):
+        """另一调用方（粗排预热）写入共享缓存后，本门零嵌入复用向量。"""
+        shared = {"https://a": [1.0, 0.0]}
+        gate = EmbeddingGate(
+            model="m", api_key="k", threshold=0.68, vector_cache=shared
+        )
+        stub = _VectorStub({"data:a": [1.0, 0.0]})
+        with patch.object(image_embedding, "embed_image", stub):
+            self.assertIsNone(gate.judge_candidate_embedding("https://a", "data:a"))
+        self.assertEqual(stub.calls, [])
+
+    def test_shared_cache_keeps_register_accepted_flow(self):
+        """共享缓存不破坏采纳注册表：缓存向量挪入注册表后仍能判重复。"""
+        shared: dict[str, list[float]] = {}
+        gate = EmbeddingGate(
+            model="m", api_key="k", threshold=0.68, vector_cache=shared
+        )
+        stub = _VectorStub({"data:a": [1.0, 0.0], "data:b": [0.999, 0.0447]})
+        with patch.object(image_embedding, "embed_image", stub):
+            self.assertIsNone(gate.judge_candidate_embedding("https://a", "data:a"))
+            gate.register_accepted("https://a")
+            record = gate.judge_candidate_embedding("https://b", "data:b")
+        assert record is not None
+        self.assertEqual(record["verdict"], "duplicate")
+        self.assertEqual(stub.calls, ["data:a", "data:b"])
 
 
 if __name__ == "__main__":

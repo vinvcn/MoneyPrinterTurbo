@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 from loguru import logger
 
+from app.services import image_embedding
 from app.services import llm
 
 # 解析失败的最大尝试次数（与 segment_terms._MAX_RETRIES 同构，镜像其重试
@@ -208,3 +209,122 @@ def generate_segment_queries(subject: str, segment_text: str) -> SegmentQueries:
         "queries and leaving degradation to the caller"
     )
     return SegmentQueries(terms=[], coarse_query=None, fine_query=None)
+
+
+# ---------------------------------------------------------------------------
+# 粗排：embedding 召回排序（三段漏斗第一段，消费 generate_segment_queries
+# 产出的 coarse_query，输出 top-30 交给下游精排/走查）。
+# ---------------------------------------------------------------------------
+
+# 粗排最多放行的候选数：漏斗约定粗排产出 top-30，重复候选不计入配额。
+_COARSE_TOP_K = 30
+
+
+def coarse_rank(
+    pool: list[dict],
+    coarse_query: str | None,
+    vector_cache: dict[str, list[float]] | None,
+    embedding_gate: image_embedding.EmbeddingGate | None,
+) -> tuple[list[dict], list[dict]]:
+    """
+    用 coarse_query 的文本向量对候选池做余弦排序，再过查重门取 top-30。
+
+    pool 是调用方按 interleave 顺序给出的候选列表，每项为含 url /
+    data_uri / asset_id 键的 dict。返回 (selected, duplicate_skips)：
+    selected 是至多 30 个非重复候选（余弦降序、稳定），duplicate_skips
+    是查重门拒收记录（asset_id/url/reason）供调用方写审计日志。
+
+    fail-open 是硬契约：coarse_query 缺失或 embed_text 失败时原样返回
+    pool[:30]（pool 切片即 interleave 路径，粗排完全退场）；单个候选
+    嵌入失败得分 -1.0 沉底，不阻塞整体，交给查重门复判；查重门为
+    None（duplicate_gate 关闭）时跳过查重直接按排序放行。
+
+    vector_cache 是粗排与查重门共享的 url -> 向量缓存：候选向量优先读
+    缓存，未命中时嵌入并写回；调用方把它注入 EmbeddingGate(vector_cache
+    =...) 后，同一 URL 在粗排预热与门走查之间只嵌入一次。
+    """
+    if not coarse_query:
+        logger.warning(
+            "video match: coarse rank failed, fail-open: "
+            "reason=missing coarse query"
+        )
+        return list(pool)[:_COARSE_TOP_K], []
+    query_vec = image_embedding.embed_text(coarse_query)
+    if query_vec is None:
+        logger.warning(
+            "video match: coarse rank failed, fail-open: "
+            "reason=query embedding unavailable"
+        )
+        return list(pool)[:_COARSE_TOP_K], []
+
+    # 嵌入凭据与端点直接读 [image_embedding] 配置（与查重门同一套解析），
+    # 不依赖查重门是否注入。
+    section = getattr(image_embedding.config, "image_embedding", None) or {}
+    model = image_embedding._gate_setting(
+        "model", image_embedding.DEFAULT_EMBEDDING_MODEL
+    )
+    api_key = str(section.get("api_key", "") or "")
+    base_url = image_embedding._gate_setting("base_url", "") or None
+
+    cache = vector_cache if vector_cache is not None else {}
+    scored: list[tuple[float, dict]] = []
+    for cand in pool:
+        url = str(cand.get("url") or "")
+        vec = cache.get(url)
+        if vec is None:
+            vec = image_embedding.embed_image(
+                data_uri=str(cand.get("data_uri") or ""),
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+            )
+            # 嵌入失败不写缓存（同 URL 之后仍可重试）；成功写回供查重
+            # 门复用，避免同 URL 二次嵌入。
+            if vec is not None:
+                cache[url] = vec
+        if vec is None:
+            # 得分 -1.0 沉底而非剔除：保持 fail-open，候选仍参与走查，
+            # 由查重门复判（门内嵌入重试成功仍可被放行）。
+            logger.warning(
+                "video match: coarse rank candidate embed failed, "
+                f"sink to bottom: url={url}"
+            )
+            scored.append((-1.0, cand))
+            continue
+        scored.append((image_embedding._cosine_similarity(query_vec, vec), cand))
+
+    # 稳定降序：sorted 的稳定性保证同分候选维持 pool（interleave）顺序。
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    selected: list[dict] = []
+    duplicate_skips: list[dict] = []
+    if embedding_gate is None:
+        # 查重门关闭（调用方未注入）：跳过走查，排序前 30 直接放行。
+        selected = [cand for _, cand in scored[:_COARSE_TOP_K]]
+    else:
+        for _, cand in scored:
+            if len(selected) >= _COARSE_TOP_K:
+                break
+            url = str(cand.get("url") or "")
+            record = embedding_gate.judge_candidate_embedding(
+                url,
+                str(cand.get("data_uri") or ""),
+                coarse_query,
+            )
+            if record is not None:
+                # 走查前向量已全部预热进共享缓存，此步不产生新的嵌入调用。
+                duplicate_skips.append(
+                    {
+                        "asset_id": cand.get("asset_id"),
+                        "url": url,
+                        "reason": record.get("reason") or record.get("verdict"),
+                    }
+                )
+                continue
+            selected.append(cand)
+
+    logger.info(
+        f"video match: coarse rank query={coarse_query!r} pool={len(pool)} "
+        f"selected={len(selected)} duplicates={len(duplicate_skips)}"
+    )
+    return selected, duplicate_skips

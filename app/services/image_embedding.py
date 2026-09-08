@@ -4,9 +4,10 @@
 背景：同上传者的系列素材画面高度相似，跨段重复下载后会以"换段不换画"
 的形式进入成片。本模块在 VLM 相关性判定之前，先对候选预览图做多模态
 嵌入，与本任务已收下素材的嵌入逐对计算余弦相似度，命中重复直接拒收，
-省一次 VLM 调用与整段重复画面。DashScope 嵌入只用于近重复检测
-（duplicate-only）：页面级相关性排序由 [material_rerank] 承担，本门
-不再做文本-图像粗筛。
+省一次 VLM 调用与整段重复画面。DashScope 嵌入服务于两处：查重门
+（duplicate-only）与粗排的文本查询向量（embed_text，video_match 粗排
+用它与候选图像向量做跨模态余弦排序）；页面级相关性排序仍由
+[material_rerank] 承担，本门自身不做相关性预筛。
 
 设计决策（.omo/FINDINGS-SUMMARY.md，finding G）：
 - 模型 tongyi-embedding-vision-flash，DashScope 形状 A 请求体
@@ -118,6 +119,87 @@ def embed_image(
     return None
 
 
+def embed_text(query: str) -> list[float] | None:
+    """
+    对一段文本做多模态嵌入，失败返回 None（fail-open）。
+
+    供 video_match 粗排把 coarse_query 映射到与图像相同的语义空间，对
+    候选图像向量做跨模态余弦排序（与 embed_image 同一端点、同一模型，
+    官方文档明确所有模态的向量位于同一语义空间，可直接比较）。凭据与
+    端点沿用 [image_embedding] 配置（与 make_default_gate 同一套解析），
+    429 按退避序列重试；其余任何失败一律返回 None。本函数不做内部
+    缓存：查询向量由调用方按查询串缓存，避免同一段落多个候选重复计费。
+    """
+    if not str(query or "").strip():
+        return None
+    section = getattr(config, "image_embedding", None) or {}
+    model = _gate_setting("model", DEFAULT_EMBEDDING_MODEL)
+    api_key = str(section.get("api_key", "") or "")
+    base_url = _gate_setting("base_url", "") or None
+    endpoint = base_url or DEFAULT_EMBEDDING_BASE_URL
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": model,
+        "input": {"contents": [{"text": query}]},
+    }
+    for attempt in range(1, len(RATE_LIMIT_BACKOFF_SECONDS) + 2):
+        try:
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                json=body,
+                timeout=30.0,
+                proxies=getattr(config, "proxy", {}) or {},
+            )
+        except Exception as exc:
+            logger.warning(
+                "text embedding request failed: "
+                f"attempt={attempt}, model={model}, error={type(exc).__name__}"
+            )
+            return None
+        if (
+            response.status_code == 429
+            and attempt <= len(RATE_LIMIT_BACKOFF_SECONDS)
+        ):
+            delay = RATE_LIMIT_BACKOFF_SECONDS[attempt - 1]
+            logger.warning(
+                "text embedding rate limited: "
+                f"attempt={attempt}, model={model}, retry in {delay}s"
+            )
+            time.sleep(delay)
+            continue
+        if response.status_code >= 400:
+            # 正文可能回显鉴权上下文，只记状态码不记正文。
+            logger.warning(
+                "text embedding http error: "
+                f"attempt={attempt}, model={model}, status={response.status_code}"
+            )
+            return None
+        try:
+            embedding = response.json()["output"]["embeddings"][0]["embedding"]
+        except Exception as exc:
+            logger.warning(
+                "text embedding unusable response: "
+                f"attempt={attempt}, model={model}, error={type(exc).__name__}"
+            )
+            return None
+        if (
+            not isinstance(embedding, list)
+            or not embedding
+            or not all(isinstance(v, (int, float)) for v in embedding)
+        ):
+            logger.warning(
+                "text embedding vector malformed: "
+                f"attempt={attempt}, model={model}"
+            )
+            return None
+        return [float(v) for v in embedding]
+    return None
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """余弦相似度；维度不一致或零向量时返回 0（视为最不相似）。"""
     if not a or not b or len(a) != len(b):
@@ -141,7 +223,9 @@ class EmbeddingGate:
     生命周期与单个视频任务一致：task.py 每次生成为其新建实例，注册表与
     候选缓存随对象回收，不跨任务泄漏。候选向量在判定时写入缓存（判定
     语义为"先嵌入再比对"），素材真正被采纳时 register_accepted 把缓存
-    向量挪入注册表，不再发起任何 API 调用。本门只做近重复检测：
+    向量挪入注册表，不再发起任何 API 调用。可选注入 vector_cache 与
+    video_match 粗排共享候选向量（嵌入前先查共享缓存，命中即免一次
+    嵌入）。本门只做近重复检测：
     DashScope 嵌入仅用于与已采纳素材的余弦比对，不做任何文本-图像
     相关性预筛。
     """
@@ -152,6 +236,7 @@ class EmbeddingGate:
         api_key: str,
         threshold: float,
         base_url: str | None = None,
+        vector_cache: dict[str, list[float]] | None = None,
     ):
         self.model = model
         self.api_key = api_key
@@ -162,6 +247,10 @@ class EmbeddingGate:
         # 判定过但尚未采纳的候选：url -> 向量。拒收的候选残留在此无害
         # （同 URL 再次出现时免一次重复嵌入），随任务结束一并回收。
         self._candidates: dict[str, list[float]] = {}
+        # 共享候选向量缓存：调用方注入的 url -> 向量（video_match 粗排
+        # 预热用的同一份 dict），门在嵌入前先查它，命中即免一次嵌入。
+        # None 时门内行为与引入共享缓存之前完全一致（只走 _candidates）。
+        self._shared_cache = vector_cache
 
     def judge_candidate_embedding(
         self,
@@ -172,13 +261,16 @@ class EmbeddingGate:
         """
         嵌入候选并与已采纳注册表查重。
 
-        (1) 候选向量经 _candidates 缓存，每个 URL 只嵌入一次；(2) 与
+        (1) 候选向量经 _candidates 与可选共享缓存（vector_cache）双重
+        去重，每个 URL 只嵌入一次；(2) 与
         注册表逐对算余弦，命中重复返回审计记录（verdict="duplicate"），
         重复是终审拒绝。其余情况返回 None 放行；register_accepted 只对
         真正被采纳的 URL 生效。term 保留在调用契约上（审计记录携带搜索
         词），门内不再使用。
         """
         vec = self._candidates.get(url)
+        if vec is None and self._shared_cache is not None:
+            vec = self._shared_cache.get(url)
         if vec is None:
             vec = embed_image(
                 data_uri=data_uri,
@@ -189,6 +281,10 @@ class EmbeddingGate:
             if vec is None:
                 return None
             self._candidates[url] = vec
+            # 新鲜嵌入写回共享缓存：粗排与查重门共用同一向量，同 URL
+            # 全链路只嵌入一次。
+            if self._shared_cache is not None:
+                self._shared_cache[url] = vec
         duplicate_of, cos = self._closest_accepted(vec)
         if duplicate_of is not None:
             return {
