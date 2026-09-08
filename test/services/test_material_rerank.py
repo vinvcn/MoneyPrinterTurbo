@@ -3,12 +3,13 @@ material_rerank 重排客户端的单元测试。
 
 全部 mock，不发真实网络请求；fail-open 是硬契约，每条失败路径都要有
 对应用例证明"原样返回 items"而不是抛异常。loguru 不走 stdlib logging 树，
-caplog 看不到——挂临时 sink 收集原始消息文本（与 test_image_embedding
+caplog 看不到——挂临时 sink 收集原始消息文本（与 test_segment_material_quota
 同款）。
 """
 
 import base64
 import sys
+import tomllib as _tomllib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import call, patch
@@ -31,7 +32,7 @@ from app.services.material_rerank import (
 
 class _LogSink:
     """loguru 不走 stdlib logging 树，caplog 看不到——挂临时 sink 收集
-    原始消息文本（与 test_image_embedding 同款）。"""
+    原始消息文本（与 test_segment_material_quota 同款）。"""
 
     def __init__(self):
         self.messages = []
@@ -465,9 +466,6 @@ def test_no_rankable_items_passthrough(monkeypatch):
 # ---------------------------------------------------------------- config.example.toml 粗筛键清除验证
 
 
-import tomllib as _tomllib
-
-
 def _example_config():
     config_path = Path(__file__).resolve().parents[2] / "config.example.toml"
     return _tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -489,9 +487,6 @@ def test_example_config_material_rerank_section():
 
 
 def test_live_parser_defaults_no_coarse_in_image_embedding():
-    from app.config.config import image_embedding as _ie_synced
-
-    defaults_only = {k: v for k, v in _ie_synced.items() if k in _ie_synced}
     raw = dict(config.image_embedding)
     user_only_keys = set(raw.keys()) - {
         "model", "api_key", "base_url", "duplicate_gate", "duplicate_threshold",
