@@ -468,6 +468,7 @@ def save_config():
         config_to_save["vlm"] = dict(vlm)
         config_to_save["image_gen"] = dict(image_gen)
         config_to_save["image_embedding"] = dict(image_embedding)
+        config_to_save["material_rerank"] = dict(material_rerank)
         config_to_save["ui"] = dict(ui)
         serialized_config = toml.dumps(config_to_save)
 
@@ -562,6 +563,21 @@ image_embedding = _SynchronizedConfig(
             # 粗筛默认关闭；阈值取 T5 零误拒校准值（依据见 image_embedding.py）。
             "coarse_filter": False,
             "coarse_threshold": 0.089445,
+        },
+    )
+)
+material_rerank = _SynchronizedConfig(
+    _cfg.get(
+        "material_rerank",
+        {
+            # [material_rerank] 段缺失时按"启用"处理：segment-first 素材流程
+            # 使用 reranker 对每个搜索页的候选做视觉精判，取 top_n 送 VLM。
+            "enabled": True,
+            "model": "Qwen/Qwen3-VL-Reranker-8B",
+            "top_n": 5,
+            "timeout": 120,
+            "api_key": "",
+            "base_url": "",
         },
     )
 )
