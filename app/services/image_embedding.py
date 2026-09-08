@@ -325,6 +325,15 @@ class EmbeddingGate:
                         "image_source": "embedding",
                         "cos": coarse_cos,
                     }
+                # 审计缺口 G3：粗筛实际运行且放行时补一行通过记录，与
+                # prefiltered 行成对，让"粗筛看过并放行"在日志流可见。
+                # 查重-only（粗筛关闭）、空白 term、skip_coarse 复判或查询
+                # 向量嵌入失败时不打——放行候选由下游 vlm filter verdict
+                # 行覆盖，门内保持静默。
+                logger.info(
+                    "embedding gate passed candidate: "
+                    f"term={term!r}, cos={coarse_cos}"
+                )
         return None
 
     def register_accepted(self, url: str) -> None:

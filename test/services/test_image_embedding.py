@@ -16,8 +16,30 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from loguru import logger as loguru_logger
+
 from app.services import image_embedding
 from app.services.image_embedding import EmbeddingGate, embed_image, embed_text
+
+
+class _LogSink:
+    """loguru 不走 stdlib logging 树，caplog 看不到——挂临时 sink 收集
+    原始消息文本（与 test_segment_material_quota 同款）。"""
+
+    def __init__(self):
+        self.messages = []
+        self._handler_id = None
+
+    def __enter__(self):
+        self._handler_id = loguru_logger.add(
+            lambda message: self.messages.append(message.record["message"]),
+            level="INFO",
+        )
+        return self
+
+    def __exit__(self, *exc_info):
+        loguru_logger.remove(self._handler_id)
+        return False
 
 
 def _ok_response(vector=None, dim=768):
@@ -777,6 +799,53 @@ class TestEmbeddingGateCoarse(unittest.TestCase):
         assert record2 is not None
         self.assertEqual(record2["verdict"], "duplicate")
         self.assertEqual(img_stub.calls, ["data:a", "data:b"])
+
+    def test_coarse_pass_through_logs_candidate(self):
+        """审计缺口 G3：粗筛实际运行且放行时补一行通过记录（term + 粗筛
+        cos），与 prefiltered 行成对；skip_coarse 复判不经过粗筛，不打。"""
+        gate, _, text_stub, patches = _coarse_gate_with(
+            {"data:a": [1.0, 0.0]},
+            {"fishing": [1.0, 0.0]},
+            coarse_threshold=0.5,
+        )
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        with _LogSink() as sink:
+            self.assertIsNone(
+                gate.judge_candidate_embedding(
+                    "https://a", "data:a", term="fishing"
+                )
+            )
+        # 放行路径恰好一行，cos 为粗筛查询余弦（同向向量对 cos=1.0）。
+        self.assertEqual(
+            sink.messages,
+            ["embedding gate passed candidate: term='fishing', cos=1.0"],
+        )
+        # skip_coarse=True（补升复判路径）不走粗筛：静默放行。
+        with _LogSink() as sink_skip:
+            self.assertIsNone(
+                gate.judge_candidate_embedding(
+                    "https://b", "data:a", term="fishing", skip_coarse=True
+                )
+            )
+        self.assertEqual(sink_skip.messages, [])
+
+    def test_duplicate_only_gate_never_logs_pass_line(self):
+        """审计缺口 G3 负例：粗筛关闭（查重-only）时放行不打通过行——
+        放行候选由下游 vlm filter verdict 行覆盖，门内保持静默。"""
+        img_stub = _VectorStub({"data:a": [1.0, 0.0]})
+        gate = EmbeddingGate(model="m", api_key="k", threshold=0.68)
+        patcher = patch.object(image_embedding, "embed_image", img_stub)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        with _LogSink() as sink:
+            self.assertIsNone(
+                gate.judge_candidate_embedding(
+                    "https://a", "data:a", term="fishing"
+                )
+            )
+        self.assertEqual(sink.messages, [])
 
 
 class TestGateConfig(unittest.TestCase):
