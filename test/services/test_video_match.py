@@ -71,14 +71,14 @@ class TestGenerateSegmentQueries(unittest.TestCase):
         # 规格约束：单片段恰好一次 LLM 调用。
         self.assertEqual(calls["n"], 1)
 
-    def test_cjk_term_dropped_and_valid_terms_survive(self):
-        """单个词条带 CJK 时只丢该词，其余词条按原序存活。"""
+    def test_cjk_term_stripped_and_valid_terms_survive(self):
+        """混排词条剔除 CJK 保留英文部分；纯 CJK 词条降级为主题锚点词。"""
         with patch.object(
             video_match.llm,
             "generate_response",
             return_value=json.dumps(
                 {
-                    "terms": ["ocean waves", "海浪 coast", "stormy coast"],
+                    "terms": ["ocean waves", "海浪 coast", "海啸"],
                     "coarse_query": "The sea under a stormy sky.",
                     "fine_query": "Waves crashing against a rocky shore.",
                 }
@@ -86,7 +86,9 @@ class TestGenerateSegmentQueries(unittest.TestCase):
         ):
             result = generate_segment_queries("sea", "A sentence about the sea.")
 
-        self.assertEqual(result.terms, ["ocean waves sea", "stormy coast sea"])
+        self.assertEqual(
+            result.terms, ["ocean waves sea", "coast sea", "sea"]
+        )
         self.assertEqual(result.coarse_query, "The sea under a stormy sky.")
         self.assertEqual(result.fine_query, "Waves crashing against a rocky shore.")
 
@@ -182,8 +184,8 @@ class TestGenerateSegmentQueries(unittest.TestCase):
 
         self.assertEqual(result.terms, ["t1 panda", "t2 panda", "t3 panda"])
 
-    def test_zero_valid_terms_yields_empty_list_but_keeps_queries(self):
-        """全部词条被 CJK 过滤时 terms 为空列表；查询字段不受影响（降级由调用方处理）。"""
+    def test_cjk_terms_degrade_to_subject_anchor_or_empty(self):
+        """纯 CJK 词条剔后剩主题锚点词（英文主题）；CJK 主题词时词条为空列表。"""
         with patch.object(
             video_match.llm,
             "generate_response",
@@ -197,9 +199,27 @@ class TestGenerateSegmentQueries(unittest.TestCase):
         ):
             result = generate_segment_queries("sea", "A sentence.")
 
-        self.assertEqual(result.terms, [])
+        # 原始规整不去重（去重由 _search_terms_for_queries 在调用侧完成）。
+        self.assertEqual(result.terms, ["sea", "sea"])
         self.assertEqual(result.coarse_query, "The sea.")
         self.assertEqual(result.fine_query, "Waves.")
+
+        with patch.object(
+            video_match.llm,
+            "generate_response",
+            return_value=json.dumps(
+                {
+                    "terms": ["海浪", "珊瑚礁"],
+                    "coarse_query": "The sea.",
+                    "fine_query": "Waves.",
+                }
+            ),
+        ):
+            cjk_result = generate_segment_queries("海洋", "A sentence.")
+
+        self.assertEqual(cjk_result.terms, [])
+        self.assertEqual(cjk_result.coarse_query, "The sea.")
+        self.assertEqual(cjk_result.fine_query, "Waves.")
 
     def test_markdown_fenced_json_is_parsed(self):
         """模型用 ```json 围栏包裹 JSON（前后带说明文字）时必须正确解析。"""

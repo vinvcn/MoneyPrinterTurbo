@@ -152,9 +152,11 @@ def _normalize_terms(raw_terms: object, subject: str) -> list[str]:
     terms: list[str] = []
     for term in cleaned:
         final_term = f"{term} {subject}".strip() if append_subject else term
-        # 逐词过滤：单个词条含 CJK 只丢弃该词，分段靠剩余词条存活。
-        if _contains_cjk(final_term):
-            logger.warning(f"segment term contains CJK, discarding: term={final_term!r}")
+        # 逐词过滤：剔除词条内的 CJK 片段（混排词条保留英文部分），
+        # 剔除后为空才丢弃该词，分段靠剩余词条存活。
+        final_term = english_search_term(final_term)
+        if not final_term:
+            logger.warning(f"segment term contains only CJK, discarding: term={term!r}")
             continue
         terms.append(final_term)
     return terms

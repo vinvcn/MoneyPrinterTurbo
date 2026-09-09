@@ -35,17 +35,26 @@ _CJK_PATTERN = re.compile(r"[一-鿿぀-ヿ가-힯]")
 _MAX_FILTER_RECORDS = 12
 
 
+# 可搜索字符集：ASCII 字母/数字/空格与常规 ASCII 标点。其余（CJK 汉字、
+# CJK/全角标点、emoji 等）从搜索词中剔除，避免 "。" 之类残留成垃圾查询。
+_SEARCHABLE_CHARS = re.compile(
+    r"[A-Za-z0-9\s!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~]+"
+)
+
+
 def _english_search_term(term: str) -> str:
     """
-    返回可安全发给搜索 API 的英文搜索词；含 CJK 字符时返回空串。
+    返回可安全发给搜索 API 的英文搜索词。
 
-    空串会让该搜索词被跳过（例如中文片段原文），落到下一个自有词条或
-    英文主题词，而不是把必然低召回的混合查询发给供应商。
+    非 ASCII 字母/数字/常规标点的字符整体剔除而不是整串作废：混排词条
+    保留英文部分（"大熊猫 panda daily" → "panda daily"，剔除位补空格
+    防粘连）；剔除后为空（纯 CJK）仍返回空串，由调用方走零搜索/丢弃
+    路径。数字与常规标点原样保留，供 "4k"、"close-up" 这类片段存活。
     """
     candidate = (term or "").strip()
-    if not candidate or _CJK_PATTERN.search(candidate):
+    if not candidate:
         return ""
-    return candidate
+    return " ".join(_SEARCHABLE_CHARS.findall(candidate)).strip()
 
 
 def english_search_term(term: str) -> str:

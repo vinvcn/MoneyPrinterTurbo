@@ -33,10 +33,12 @@ class TestRecordsConversion(unittest.TestCase):
         self.assertEqual(second.search_attempts, [])
 
     def test_english_search_term_filters_cjk(self):
-        """CJK 过滤规则：含中日韩字符或空白词条返回空串，纯英文原样返回。"""
+        """CJK 过滤规则：剔除 CJK 字符保留英文部分，纯 CJK 或空白返回空串。"""
         self.assertEqual(sm.english_search_term("city skyline"), "city skyline")
         self.assertEqual(sm.english_search_term("  city skyline  "), "city skyline")
-        self.assertEqual(sm.english_search_term("city skyline 城市"), "")
+        self.assertEqual(sm.english_search_term("city skyline 城市"), "city skyline")
+        self.assertEqual(sm.english_search_term("大熊猫 panda daily"), "panda daily")
+        self.assertEqual(sm.english_search_term("panda大熊猫4k"), "panda 4k")
         self.assertEqual(sm.english_search_term("这是中文"), "")
         self.assertEqual(sm.english_search_term(""), "")
         self.assertEqual(sm.english_search_term(None), "")
