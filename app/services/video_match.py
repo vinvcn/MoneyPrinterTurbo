@@ -43,10 +43,6 @@ _MAX_RETRIES = 2
 # 每段最多提炼的搜索词数量；第一个词为主搜索词，其余为备用词。
 _MAX_TERMS = 3
 
-# 字符级 CJK 判定：与 segment_material 保持同一正则——搜索
-# API（Pexels/Pixabay/Coverr）仅接受英文查询，含中日韩字符的词召回极差。
-_CJK_PATTERN = re.compile(r"[一-鿿぀-ヿ가-힯]")
-
 
 @dataclass
 class SegmentQueries:
@@ -58,11 +54,6 @@ class SegmentQueries:
     coarse_query: str | None
     # 精确视觉时刻描述（英文一句话，精排重排）；LLM 失败/字段缺失时为 None。
     fine_query: str | None
-
-
-def _contains_cjk(text: str) -> bool:
-    """判断文本是否包含中日韩字符（搜索 API 仅接受英文查询）。"""
-    return bool(_CJK_PATTERN.search(text or ""))
 
 
 def _build_prompt(subject: str, segment_text: str) -> str:
@@ -95,7 +86,7 @@ For one narration segment, generate stock-video search terms plus two English sc
 
 ## Constrains:
 1. return ONLY a json object with exactly three keys: "terms", "coarse_query", "fine_query". you must not return anything else. you must not return the script.
-2. "terms" must be a json-array of 1-3 search terms: each term consists of 1-3 words, always translate the main subject of the video into English and append it, and the terms must describe DIFFERENT visual angles, scenes, or shot types of the segment's moment — never synonyms or minor rephrasings, because near-duplicate terms return the same stock-footage candidate pool.
+2. "terms" must be a json-array of 1-3 search terms: each term consists of 1-3 words, and the terms must describe DIFFERENT visual angles, scenes, or shot types of the segment's moment — never synonyms or minor rephrasings, because near-duplicate terms return the same stock-footage candidate pool.
 3. "coarse_query" must be one English sentence broadly describing the segment's visual scene (environment, subjects, mood) for coarse embedding retrieval.
 4. "fine_query" must be one English sentence precisely describing the segment's key visual moment (action, composition, details) for fine visual reranking.
 5. every value must be pure English (A-Z letters, spaces and punctuation only). never include any Chinese or other non-English characters, even if the subject or the narration is written in Chinese.
@@ -128,10 +119,11 @@ def _clean_query(value: object) -> str | None:
     return cleaned or None
 
 
-def _normalize_terms(raw_terms: object, subject: str) -> list[str]:
+def _normalize_terms(raw_terms: object) -> list[str]:
     """
-    词条规整：截断、追加英文主题词、
-    逐词 CJK 过滤；全部词条被过滤时返回空列表（降级由调用方处理）。
+    词条规整：截断、逐词 CJK 过滤；全部词条被过滤时返回空列表
+    （降级由调用方处理）。主题词不程序化追加——主题经 prompt Context
+    影响 LLM 书写的词条本身。
     """
     if not isinstance(raw_terms, list):
         return []
@@ -139,22 +131,11 @@ def _normalize_terms(raw_terms: object, subject: str) -> list[str]:
     # 超量词条截断；主词在前，顺序与模型输出一致。
     cleaned = cleaned[:_MAX_TERMS]
 
-    # 主题词含 CJK 时直接放弃追加（没有可追加的英文主题），让词条保持
-    # 纯英文，而不是发出必然低召回的混合查询。
-    append_subject = bool(subject)
-    if subject and _contains_cjk(subject):
-        logger.warning(
-            "video subject contains CJK, appending it would break "
-            f"English-only search: subject={subject!r}"
-        )
-        append_subject = False
-
     terms: list[str] = []
     for term in cleaned:
-        final_term = f"{term} {subject}".strip() if append_subject else term
         # 逐词过滤：剔除词条内的 CJK 片段（混排词条保留英文部分），
         # 剔除后为空才丢弃该词，分段靠剩余词条存活。
-        final_term = english_search_term(final_term)
+        final_term = english_search_term(term)
         if not final_term:
             logger.warning(f"segment term contains only CJK, discarding: term={term!r}")
             continue
@@ -162,7 +143,7 @@ def _normalize_terms(raw_terms: object, subject: str) -> list[str]:
     return terms
 
 
-def _parse_segment_queries(response: object, subject: str) -> SegmentQueries | None:
+def _parse_segment_queries(response: object) -> SegmentQueries | None:
     """
     从模型回复解析查询包；无法得到 JSON 对象时返回 None 触发重试。
 
@@ -186,7 +167,7 @@ def _parse_segment_queries(response: object, subject: str) -> SegmentQueries | N
         return None
 
     return SegmentQueries(
-        terms=_normalize_terms(data.get("terms"), subject),
+        terms=_normalize_terms(data.get("terms")),
         coarse_query=_clean_query(data.get("coarse_query")),
         fine_query=_clean_query(data.get("fine_query")),
     )
@@ -197,7 +178,8 @@ def generate_segment_queries(subject: str, segment_text: str) -> SegmentQueries:
     为单个片段生成素材匹配查询包（terms + coarse_query + fine_query）。
 
     Args:
-        subject: 视频主题，翻译成英文后附加进每个搜索词（含 CJK 时不追加）。
+        subject: 视频主题，仅经 prompt Context 影响 LLM 书写的词条
+            （非程序化追加）；queries.terms 为空时由调用方以主题词兜底。
         segment_text: 该片段的旁白原文。
 
     Returns:
@@ -211,7 +193,7 @@ def generate_segment_queries(subject: str, segment_text: str) -> SegmentQueries:
 
     for attempt in range(1, _MAX_RETRIES + 1):
         response = llm.generate_response(prompt)
-        parsed = _parse_segment_queries(response, subject)
+        parsed = _parse_segment_queries(response)
         if parsed is not None:
             return parsed
         logger.warning(

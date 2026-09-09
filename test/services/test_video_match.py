@@ -54,9 +54,9 @@ class TestGenerateSegmentQueries(unittest.TestCase):
             result,
             SegmentQueries(
                 terms=[
-                    "panda eating bamboo panda",
-                    "bamboo forest panda",
-                    "panda cub playing panda",
+                    "panda eating bamboo",
+                    "bamboo forest",
+                    "panda cub playing",
                 ],
                 coarse_query=(
                     "A giant panda sits in a lush green bamboo forest "
@@ -72,7 +72,7 @@ class TestGenerateSegmentQueries(unittest.TestCase):
         self.assertEqual(calls["n"], 1)
 
     def test_cjk_term_stripped_and_valid_terms_survive(self):
-        """混排词条剔除 CJK 保留英文部分；纯 CJK 词条降级为主题锚点词。"""
+        """混排词条剔除 CJK 保留英文部分；纯 CJK 词条剔后为空直接丢弃。"""
         with patch.object(
             video_match.llm,
             "generate_response",
@@ -86,9 +86,8 @@ class TestGenerateSegmentQueries(unittest.TestCase):
         ):
             result = generate_segment_queries("sea", "A sentence about the sea.")
 
-        self.assertEqual(
-            result.terms, ["ocean waves sea", "coast sea", "sea"]
-        )
+        # "海啸" 剔除后为空 → 丢弃（无主题锚点兜底）；词条不带主题后缀。
+        self.assertEqual(result.terms, ["ocean waves", "coast"])
         self.assertEqual(result.coarse_query, "The sea under a stormy sky.")
         self.assertEqual(result.fine_query, "Waves crashing against a rocky shore.")
 
@@ -101,7 +100,7 @@ class TestGenerateSegmentQueries(unittest.TestCase):
         ):
             result = generate_segment_queries("sea", "A sentence.")
 
-        self.assertEqual(result.terms, ["ocean waves sea", "stormy coast sea"])
+        self.assertEqual(result.terms, ["ocean waves", "stormy coast"])
         self.assertIsNone(result.coarse_query)
         self.assertIsNone(result.fine_query)
 
@@ -145,27 +144,27 @@ class TestGenerateSegmentQueries(unittest.TestCase):
         ):
             result = generate_segment_queries("s", "A sentence.")
 
-        self.assertEqual(result.terms, ["valid term s"])
+        self.assertEqual(result.terms, ["valid term"])
         self.assertEqual(calls["n"], 2)
 
-    def test_subject_appending_follows_existing_cjk_rule(self):
-        """英文主题词追加进每个词条；CJK 主题词不追加（既有规则镜像）。"""
+    def test_terms_are_never_subject_suffixed(self):
+        """词条永不追加主题词：英文主题与 CJK 主题都不拼接（双重追加隐患
+        已移除，主题只经 prompt Context 影响词条）。"""
         with patch.object(
             video_match.llm,
             "generate_response",
-            return_value=json.dumps({"terms": ["term one", "term two"]}),
+            return_value=json.dumps({"terms": ["ocean waves", "stormy coast"]}),
         ):
-            english = generate_segment_queries("world", "A sentence.")
-        self.assertEqual(english.terms, ["term one world", "term two world"])
+            english = generate_segment_queries("sea", "A sentence.")
+        self.assertEqual(english.terms, ["ocean waves", "stormy coast"])
 
         with patch.object(
             video_match.llm,
             "generate_response",
-            return_value=json.dumps({"terms": ["stellar collapse", "dying star"]}),
+            return_value=json.dumps({"terms": ["ocean waves", "stormy coast"]}),
         ):
-            cjk = generate_segment_queries("黑洞", "A sentence.")
-        # 中文主题词不再拼接，词条保持纯英文。
-        self.assertEqual(cjk.terms, ["stellar collapse", "dying star"])
+            cjk = generate_segment_queries("海洋", "A sentence.")
+        self.assertEqual(cjk.terms, ["ocean waves", "stormy coast"])
 
     def test_more_than_three_terms_clamped_to_three(self):
         """超过 3 个词条截断为前 3 个，顺序保持模型输出。"""
@@ -182,10 +181,11 @@ class TestGenerateSegmentQueries(unittest.TestCase):
         ):
             result = generate_segment_queries("panda", "A sentence.")
 
-        self.assertEqual(result.terms, ["t1 panda", "t2 panda", "t3 panda"])
+        self.assertEqual(result.terms, ["t1", "t2", "t3"])
 
-    def test_cjk_terms_degrade_to_subject_anchor_or_empty(self):
-        """纯 CJK 词条剔后剩主题锚点词（英文主题）；CJK 主题词时词条为空列表。"""
+    def test_cjk_terms_stripped_to_empty(self):
+        """纯 CJK 词条剔除后为空 → 全部丢弃，terms=[]（不再降级为主题
+        锚点词）；英文与 CJK 主题行为一致。"""
         with patch.object(
             video_match.llm,
             "generate_response",
@@ -199,8 +199,7 @@ class TestGenerateSegmentQueries(unittest.TestCase):
         ):
             result = generate_segment_queries("sea", "A sentence.")
 
-        # 原始规整不去重（去重由 _search_terms_for_queries 在调用侧完成）。
-        self.assertEqual(result.terms, ["sea", "sea"])
+        self.assertEqual(result.terms, [])
         self.assertEqual(result.coarse_query, "The sea.")
         self.assertEqual(result.fine_query, "Waves.")
 
@@ -234,7 +233,7 @@ class TestGenerateSegmentQueries(unittest.TestCase):
         with patch.object(video_match.llm, "generate_response", return_value=fenced):
             result = generate_segment_queries("city", "A sentence.")
 
-        self.assertEqual(result.terms, ["city skyline city", "night traffic city"])
+        self.assertEqual(result.terms, ["city skyline", "night traffic"])
         self.assertEqual(result.coarse_query, "A city skyline at dusk.")
         self.assertEqual(
             result.fine_query, "Cars streaming through downtown streets at night."
@@ -667,19 +666,19 @@ class TestMatchSegments(unittest.TestCase):
         """D=12.816/W=3 → 配额 5：fine 序走查拿满即提前退出，判定次数
         ≤ walk 预算；采纳候选经 save_video + register_accepted 入册。"""
         pages = {
-            ("panda one panda", 1): [
+            ("panda one", 1): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
                 for i in range(6)
             ],
-            ("panda one panda", 2): [
+            ("panda one", 2): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
                 for i in (6, 7)
             ],
-            ("panda two panda", 1): [
+            ("panda two", 1): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda two", f"img-{i}")
                 for i in (8, 9)
             ],
-            ("panda two panda", 2): [
+            ("panda two", 2): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda two", f"img-{i}")
                 for i in (10, 11)
             ],
@@ -717,8 +716,8 @@ class TestMatchSegments(unittest.TestCase):
         # 提前退出：判定次数 = 配额 5 ≤ walk 预算 10；判定回带出处词条。
         self.assertEqual(
             run.judge_calls,
-            [(f"https://v.example/u{i}.mp4", "panda two panda") for i in (11, 10, 9, 8)]
-            + [("https://v.example/u7.mp4", "panda one panda")],
+            [(f"https://v.example/u{i}.mp4", "panda two") for i in (11, 10, 9, 8)]
+            + [("https://v.example/u7.mp4", "panda one")],
         )
         # 采纳即回调查重门注册（accepted-only 契约由 match 层保证）；
         # 粗排预热共享缓存：同 URL 全链路零重复嵌入。
@@ -733,12 +732,12 @@ class TestMatchSegments(unittest.TestCase):
             [("A precise moment.", [f"https://v.example/u{i}.mp4" for i in range(12)])],
         )
         self.assertEqual(run.image_calls, [])
-        self.assertEqual(result.resolved_term, "panda two panda")
+        self.assertEqual(result.resolved_term, "panda two")
         self.assertEqual(result.fallback_level, "self")
-        self.assertEqual(result.search_term, "panda one panda")
+        self.assertEqual(result.search_term, "panda one")
         self.assertEqual(
             [(a["term"], a["found"]) for a in result.search_attempts],
-            [("panda one panda", True), ("panda two panda", True)],
+            [("panda one", True), ("panda two", True)],
         )
         self.assertEqual(len(result.vlm_filter), 5)
 
@@ -746,7 +745,7 @@ class TestMatchSegments(unittest.TestCase):
         """部分命中：image-gen 回填一次覆盖未填充尾部窗口，时长 = 尾窗和；
         SegmentMaterials 同时反映视频 clip 与生成 clip 的来源。"""
         pages = {
-            ("panda one panda", 1): [
+            ("panda one", 1): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
                 for i in range(4)
             ],
@@ -781,14 +780,14 @@ class TestMatchSegments(unittest.TestCase):
             result.clip_sources[-1], {"url": "", "local_file": "gen-0.mp4"}
         )
         self.assertEqual(result.image_gen, [{"model": "Kwai-Kolors/Kolors", "source": "kolors"}])
-        self.assertEqual(result.resolved_term, "panda one panda")
+        self.assertEqual(result.resolved_term, "panda one")
         self.assertEqual(result.fallback_level, "self")
         self.assertEqual(len(result.vlm_filter), 4)
 
     def test_vlm_disabled_skips_search_and_backfills_whole_segment(self):
         """VLM 关闭（judge=None）：零搜索、零下载，整段 image-gen（强制立场）。"""
         pages = {
-            ("panda one panda", 1): [
+            ("panda one", 1): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
                 for i in range(4)
             ],
@@ -824,19 +823,19 @@ class TestMatchSegments(unittest.TestCase):
         """粗排查询向量不可得：fail-open 返回 interleave pool[:30]，精排
         与走查照常完成——流水线绝不因粗排失败阻塞。"""
         pages = {
-            ("panda one panda", 1): [
+            ("panda one", 1): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
                 for i in (0, 1, 2)
             ],
-            ("panda two panda", 1): [
+            ("panda two", 1): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda two", f"img-{i}")
                 for i in (3, 4, 5)
             ],
-            ("panda one panda", 2): [
+            ("panda one", 2): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
                 for i in (6, 7)
             ],
-            ("panda two panda", 2): [
+            ("panda two", 2): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda two", f"img-{i}")
                 for i in (8, 9)
             ],
@@ -868,7 +867,7 @@ class TestMatchSegments(unittest.TestCase):
         """[material_rerank] enabled=false：精排整段跳过（零调用），走查
         消费粗排序并被 walk 预算截断。"""
         pages = {
-            ("panda one panda", 1): [
+            ("panda one", 1): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
                 for i in range(6)
             ],
@@ -898,7 +897,7 @@ class TestMatchSegments(unittest.TestCase):
     def test_fine_fail_open_uses_coarse_order(self):
         """精排调用本身抛异常：告警后按粗排序走查，cap 仍然生效。"""
         pages = {
-            ("panda one panda", 1): [
+            ("panda one", 1): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
                 for i in range(6)
             ],
@@ -932,11 +931,11 @@ class TestMatchSegments(unittest.TestCase):
         """同一 URL 被两个词条同时返回：按 URL 去重保首个（interleave 序
         中先出现的词条持有该候选）。"""
         pages = {
-            ("panda one panda", 1): [
+            ("panda one", 1): [
                 _video_item("https://v.example/dup.mp4", "panda one", "img-dup"),
                 _video_item("https://v.example/a.mp4", "panda one", "img-a"),
             ],
-            ("panda two panda", 1): [
+            ("panda two", 1): [
                 _video_item("https://v.example/dup.mp4", "panda two", "img-dup"),
                 _video_item("https://v.example/b.mp4", "panda two", "img-b"),
             ],
@@ -957,7 +956,7 @@ class TestMatchSegments(unittest.TestCase):
                 "https://v.example/b.mp4",
             ],
         )
-        self.assertEqual(pool[0]["term"], "panda one panda")
+        self.assertEqual(pool[0]["term"], "panda one")
         # 去重后配额照常拿满，dup URL 只下载一次。
         self.assertEqual(
             run.results[0].clips,
@@ -970,12 +969,12 @@ class TestMatchSegments(unittest.TestCase):
         """前面 segment 已采纳的 URL：后续 segment 的候选池不含它，不重复
         判定、不重复下载（跨段 used 排除镜像旧机制）。"""
         pages = {
-            ("t one panda", 1): [
+            ("t one", 1): [
                 _video_item("https://v.example/x.mp4", "t one", "img-x"),
                 _video_item("https://v.example/a.mp4", "t one", "img-a"),
                 _video_item("https://v.example/b.mp4", "t one", "img-b"),
             ],
-            ("t two panda", 1): [
+            ("t two", 1): [
                 _video_item("https://v.example/x.mp4", "t two", "img-x"),
                 _video_item("https://v.example/c.mp4", "t two", "img-c"),
                 _video_item("https://v.example/d.mp4", "t two", "img-d"),
@@ -1017,7 +1016,7 @@ class TestMatchSegments(unittest.TestCase):
         """两段生成同一词条：(词条, 页) 备忘使命中缓存的关键词组合只透传
         一次供应商调用；第二段从剩余新鲜候选拿满名额。"""
         pages = {
-            ("city walk panda", 1): [
+            ("city walk", 1): [
                 _video_item(f"https://v.example/u{i}.mp4", "city walk", f"img-{i}")
                 for i in range(6)
             ],
@@ -1036,7 +1035,12 @@ class TestMatchSegments(unittest.TestCase):
         )
 
         self.assertEqual(
-            run.searched, [("city walk panda", 1), ("city walk panda", 2)]
+            run.searched, [("city walk", 1), ("city walk", 2)]
+        )
+        # 搜索边界契约：search_videos 收到的词条 == LLM 干净词条（无主题
+        # 后缀，无双重追加）。
+        self.assertEqual(
+            sorted({term for term, _page in run.searched}), ["city walk"]
         )
         self.assertEqual(
             run.results[0].clips,
@@ -1055,7 +1059,7 @@ class TestMatchSegments(unittest.TestCase):
         for duration, expected in ((12.816, 5), (9.48, 3)):
             with self.subTest(duration=duration):
                 pages = {
-                    ("panda one panda", 1): [
+                    ("panda one", 1): [
                         _video_item(
                             f"https://v.example/u{i}.mp4", "panda one", f"img-{i}"
                         )
@@ -1080,7 +1084,7 @@ class TestMatchSegments(unittest.TestCase):
     def test_judge_exception_skips_candidate_and_continues(self):
         """单候选判定抛异常 = 跳过该候选继续走查（fail-open），绝不阻塞。"""
         pages = {
-            ("panda one panda", 1): [
+            ("panda one", 1): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
                 for i in range(4)
             ],
