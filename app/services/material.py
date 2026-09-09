@@ -1,6 +1,7 @@
 import os
 import random
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, List
 from urllib.parse import quote_plus, urlencode, urlsplit, urlunsplit
@@ -922,6 +923,112 @@ def search_videos_with_cache_for_source(
         )
 
     return search_videos
+
+
+def _available_video_providers() -> list[tuple[str, Callable]]:
+    """
+    返回当前配置了 API key 的在线素材供应商（固定声明序）。
+
+    可用性只看 key 配置存在非空：pexels / pixabay / coverr 三个 key
+    列表任一缺失或为空即跳过对应供应商，不做连通性探测。
+    """
+    providers: list[tuple[str, Callable]] = []
+    if config.app.get("pexels_api_keys"):
+        providers.append(("pexels", search_videos_pexels))
+    if config.app.get("pixabay_api_keys"):
+        providers.append(("pixabay", search_videos_pixabay))
+    if config.app.get("coverr_api_keys"):
+        providers.append(("coverr", search_videos_coverr))
+    return providers
+
+
+def assert_search_provider_available() -> None:
+    """
+    segment-first 搜索前置检查：一个在线供应商都不可用时快速失败。
+
+    报错镜像 get_api_key 的提示风格，并一次性列出全部三个 key 配置，
+    避免用户配好一个后又撞到下一个缺失提示。
+    """
+    if _available_video_providers():
+        return
+    raise ValueError(
+        "\n\n##### no video provider API keys are set #####\n\n"
+        "Segment-first material search queries every keyed provider "
+        "(pexels_api_keys, pixabay_api_keys, coverr_api_keys) in "
+        "parallel; at least one must be set.\n"
+        f"Please set it in the config.toml file: {config.config_file}\n"
+    )
+
+
+def _candidate_cap() -> int:
+    """[material_rerank] max_candidates_per_provider；缺失、非法或小于 1 时回落 20。"""
+    try:
+        cap = int(config.material_rerank.get("max_candidates_per_provider", 20))
+    except (TypeError, ValueError):
+        return 20
+    if cap < 1:
+        return 20
+    return cap
+
+
+def search_videos_multi_provider(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect,
+    page: int = 1,
+) -> List[MaterialInfo]:
+    """
+    segment-first 并行搜索：一次 (词条, 页) 取数同时查询所有已配置 key
+    的供应商，合并结果供候选池聚簇。
+
+    每个供应商的结果在 24h 搜索缓存层返回后做头部截断（磁盘缓存保留
+    完整列表，截断只影响本次进入候选池的数量），再按供应商声明序拼接；
+    单个供应商抛异常按空结果处理（fail-open），不阻断其余供应商。
+    """
+    providers = _available_video_providers()
+    if not providers:
+        # 防御分支：task.py 预检正常先拦，这里兜底直接调用等场景。
+        assert_search_provider_available()
+
+    cap = _candidate_cap()
+    merged: List[MaterialInfo] = []
+    per_provider: dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=len(providers)) as executor:
+        # 提交顺序即声明序：dict 保持插入序，结果按同一序合并。
+        futures = {
+            executor.submit(
+                _search_videos_with_cache,
+                provider=provider,
+                search_videos=search_fn,
+                search_term=search_term,
+                minimum_duration=minimum_duration,
+                video_aspect=video_aspect,
+                page=page,
+            ): provider
+            for provider, search_fn in providers
+        }
+        for future, provider in futures.items():
+            try:
+                items = future.result()
+            except Exception as exc:
+                # 供应商函数内部已 fail-open，这里兜 get_api_key 轮换竞态
+                # 等意外抛出：单个供应商故障不阻断其余供应商。
+                logger.warning(
+                    "provider search failed, fail-open: "
+                    f"provider={provider}, error={type(exc).__name__}: {exc}"
+                )
+                continue
+            capped = items[:cap]
+            per_provider[provider] = len(capped)
+            merged.extend(capped)
+
+    logger.info(
+        f"segment search fan-out: term={search_term!r}, page={page}, "
+        f"providers=[{', '.join(name for name, _ in providers)}], "
+        f"per_provider={{{', '.join(f'{name}: {per_provider.get(name, 0)}' for name, _ in providers)}}}, "
+        f"merged={len(merged)}"
+    )
+    return merged
 
 
 def download_videos(

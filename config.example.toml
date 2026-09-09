@@ -34,6 +34,7 @@ tls_verify = true
 # -----------------------------------------------------------------------------
 
 # Available values: "pexels", "pixabay", "coverr", "local".
+# segment-first 素材流程并行查询所有已配置 API key 的供应商，video_source 仅作用于经典流程。
 video_source = "pexels"
 
 # API key lists support key rotation. Use straight ASCII double quotes and
@@ -421,6 +422,8 @@ model = "Qwen/Qwen3-VL-Reranker-8B"
 vlm_walk_limit = 10
 # 每个搜索词在每个供应商最多抓取的页数；默认 2，设 1 可将每个供应商的搜索请求减半
 max_search_pages = 2
+# 每个供应商每个搜索页进入候选池的上限；截取各供应商返回列表的头部
+max_candidates_per_provider = 20
 timeout = 120
 api_key = ""
 base_url = ""

@@ -13,6 +13,7 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.services import task as tm
+from app.config import config
 from app.models.schema import MaterialInfo, VideoParams
 from app.services.state import MemoryState, RedisState
 from app.utils import utils
@@ -1848,6 +1849,162 @@ class TestTaskService(unittest.TestCase):
         result = tm.start(task_id=task_id, params=params)
         print(result)
     
+
+class TestSegmentFirstSearchPreFlight(unittest.TestCase):
+    """
+    segment-first 搜索供应商预检（spec: multi-provider-search C2）。
+
+    VLM-on 才会搜索在线素材：零 key 必须在搜索开始前快速失败并给出
+    可操作信息；VLM-off 时整段走 image-gen 回填，预检必须跳过。
+    """
+
+    def setUp(self):
+        self.original_app_config = dict(config.app)
+        with tm._cross_post_registry_lock:
+            tm._cross_post_futures.clear()
+
+    def tearDown(self):
+        config.app.clear()
+        config.app.update(self.original_app_config)
+        with tm._cross_post_registry_lock:
+            tm._cross_post_futures.clear()
+
+    @staticmethod
+    def _audio_result():
+        return SimpleNamespace(
+            segments=[
+                {
+                    "index": 0,
+                    "text": "First coffee sentence.",
+                    "audio_file": "audio-segment-0.mp3",
+                    "start_ms": 0,
+                    "duration_ms": 1000,
+                },
+            ],
+            audio_file="audio.mp3",
+            total_duration_ms=1000,
+            ok=True,
+            failed_index=None,
+            error="",
+        )
+
+    @staticmethod
+    def _materials():
+        return [
+            SimpleNamespace(
+                index=0,
+                search_term="First coffee sentence.",
+                resolved_term="First coffee sentence.",
+                fallback_level="self",
+                clips=["/m/gen-0.mp4"],
+                search_attempts=[],
+                clip_sources=[{"url": "", "local_file": "gen-0.mp4"}],
+                vlm_filter=[],
+                image_gen=[{"model": "stub", "source": "kolors"}],
+            ),
+        ]
+
+    def _clear_all_provider_keys(self):
+        config.app.pop("pexels_api_keys", None)
+        config.app.pop("pixabay_api_keys", None)
+        config.app.pop("coverr_api_keys", None)
+
+    def test_vlm_on_without_provider_keys_fails_fast_before_search(self):
+        """VLM-on + 零 key：任务必须在任何搜索发生前快速失败，报错信息
+        可操作（三个 key 配置名 + config 路径都在消息里）。"""
+        params = VideoParams(
+            video_subject="黑洞",
+            video_script="宇宙中存在着一种天体，它的引力强大到连光都无法逃脱，这就是黑洞。",
+        )
+        state = MemoryState()
+        self._clear_all_provider_keys()
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(tm, "segment_pipeline_enabled", return_value=True),
+            patch.object(tm.segmenter, "segment_script") as segment_script,
+            patch.object(
+                tm.segment_audio,
+                "prepare_segment_audio",
+                return_value=self._audio_result(),
+            ),
+            patch.object(tm, "save_script_data"),
+            patch.object(tm.vlm_judge, "is_enabled", return_value=True),
+            patch.object(
+                tm.video_match,
+                "match_segments",
+                return_value=self._materials(),
+            ) as match_segments,
+        ):
+            segment_script.return_value = [
+                SimpleNamespace(index=0, text="First coffee sentence.", estimated_duration=1.0),
+            ]
+            result = tm.start("preflight-zero-keys", params)
+
+        self.assertEqual(result["failed_stage"], "pipeline")
+        message = result["error"]
+        self.assertIn("ValueError", message)
+        for fragment in (
+            "pexels_api_keys",
+            "pixabay_api_keys",
+            "coverr_api_keys",
+            config.config_file,
+        ):
+            self.assertIn(fragment, message)
+        # 预检先于搜索：素材匹配从未被触发。
+        match_segments.assert_not_called()
+
+    def test_vlm_off_skips_preflight_even_without_provider_keys(self):
+        """VLM-off：不搜索素材（整段 image-gen 回填），零 key 也不得触发预检失败。"""
+        params = VideoParams(
+            video_subject="黑洞",
+            video_script="宇宙中存在着一种天体，它的引力强大到连光都无法逃脱，这就是黑洞。",
+        )
+        state = MemoryState()
+        fake_combine_targets = {}
+
+        def fake_combine(**kwargs):
+            fake_combine_targets.update({s["index"]: s for s in kwargs["segments"]})
+            return kwargs["combined_video_path"]
+
+        self._clear_all_provider_keys()
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(tm, "segment_pipeline_enabled", return_value=True),
+            patch.object(tm.segmenter, "segment_script") as segment_script,
+            patch.object(
+                tm.segment_audio,
+                "prepare_segment_audio",
+                return_value=self._audio_result(),
+            ),
+            patch.object(tm, "save_script_data"),
+            patch.object(tm.vlm_judge, "is_enabled", return_value=False),
+            patch.object(
+                tm.video_match,
+                "match_segments",
+                return_value=self._materials(),
+            ) as match_segments,
+            patch.object(tm.video, "combine_videos", side_effect=fake_combine),
+            patch.object(tm.video, "generate_video", return_value=True),
+            patch.object(
+                tm.upload_post.upload_post_service,
+                "is_configured",
+                return_value=False,
+            ),
+        ):
+            segment_script.return_value = [
+                SimpleNamespace(index=0, text="First coffee sentence.", estimated_duration=1.0),
+            ]
+            result = tm.start("preflight-vlm-off", params)
+
+        self.assertTrue(result["videos"])
+        match_segments.assert_called_once()
+        self.assertIsNone(match_segments.call_args.kwargs["judge_candidate"])
+        task_record = state.get_task("preflight-vlm-off")
+        self.assertEqual(task_record["state"], tm.const.TASK_STATE_COMPLETE)
+        self.assertNotIn("failed_stage", task_record)
+
 
 if __name__ == "__main__":
     unittest.main()

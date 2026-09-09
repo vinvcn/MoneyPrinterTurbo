@@ -861,11 +861,17 @@ class TestMatchSegments(unittest.TestCase):
             )
 
         result = run.results[0]
-        interleave = [f"https://v.example/u{i}.mp4" for i in range(10)]
-        self.assertEqual([c["url"] for c in run.captured["pool"]], interleave)
-        # 精排收到的仍是完整 interleave 池（粗排 fail-open 不缩水）。
-        self.assertEqual(run.rerank_calls[0][1], interleave)
-        self.assertEqual(result.clips, [f"/saved/u{i}.mp4" for i in range(5)])
+        # T2 池 shuffle 后的种子序（random.seed(20260909)）：u0..u9 的固定
+        # 置换；粗排 fail-open 时精排收到的仍是完整池（不缩水）。
+        shuffled = [
+            f"https://v.example/u{i}.mp4"
+            for i in (7, 8, 5, 3, 0, 4, 6, 2, 9, 1)
+        ]
+        self.assertEqual([c["url"] for c in run.captured["pool"]], shuffled)
+        self.assertEqual(run.rerank_calls[0][1], shuffled)
+        self.assertEqual(
+            result.clips, [f"/saved/u{i}.mp4" for i in (7, 8, 5, 3, 0)]
+        )
         self.assertEqual(len(run.judge_calls), 5)
         self.assertTrue(
             any(
@@ -965,19 +971,21 @@ class TestMatchSegments(unittest.TestCase):
         )
 
         pool = run.captured["pool"]
+        # T2 池 shuffle 后的种子序（random.seed(20260909)）：[dup,a,b] 的
+        # 固定置换；dup 的持有者仍是 panda one（去重保首个不受打乱影响）。
         self.assertEqual(
             [c["url"] for c in pool],
             [
-                "https://v.example/dup.mp4",
                 "https://v.example/a.mp4",
                 "https://v.example/b.mp4",
+                "https://v.example/dup.mp4",
             ],
         )
         self.assertEqual(pool[0]["term"], "panda one")
         # 去重后配额照常拿满，dup URL 只下载一次。
         self.assertEqual(
             run.results[0].clips,
-            ["/saved/dup.mp4", "/saved/a.mp4", "/saved/b.mp4"],
+            ["/saved/a.mp4", "/saved/b.mp4", "/saved/dup.mp4"],
         )
         self.assertEqual(run.saved.count("https://v.example/dup.mp4"), 1)
         self.assertEqual(len(run.judge_calls), 3)
@@ -1013,13 +1021,15 @@ class TestMatchSegments(unittest.TestCase):
             judge="relevant",
         )
 
+        # T2 池 shuffle 后的种子序（random.seed(20260909)）：两段 clips 各是
+        # 其打乱后池序的头部切片（[x,a,b]→[a,b,x]，[c,d,e]→[d,e,c]）。
         self.assertEqual(
             run.results[0].clips,
-            ["/saved/x.mp4", "/saved/a.mp4", "/saved/b.mp4"],
+            ["/saved/a.mp4", "/saved/b.mp4", "/saved/x.mp4"],
         )
         self.assertEqual(
             run.results[1].clips,
-            ["/saved/c.mp4", "/saved/d.mp4", "/saved/e.mp4"],
+            ["/saved/d.mp4", "/saved/e.mp4", "/saved/c.mp4"],
         )
         # x 全程只下载一次、只判定一次（seg1 的池里根本没有它）。
         self.assertEqual(run.saved.count("https://v.example/x.mp4"), 1)
@@ -1064,13 +1074,16 @@ class TestMatchSegments(unittest.TestCase):
         self.assertEqual(
             sorted({term for term, _page in run.searched}), ["city walk"]
         )
+        # T2 池 shuffle 后的种子序（random.seed(20260909)）：两段 clips 各是
+        # 其打乱后池序的头部切片（seg0 池 u0..u5 → [u3,u4,u2]；seg1 剩余
+        # {u0,u1,u5} → [u5,u0,u1]）。
         self.assertEqual(
             run.results[0].clips,
-            ["/saved/u0.mp4", "/saved/u1.mp4", "/saved/u2.mp4"],
+            ["/saved/u3.mp4", "/saved/u4.mp4", "/saved/u2.mp4"],
         )
         self.assertEqual(
             run.results[1].clips,
-            ["/saved/u3.mp4", "/saved/u4.mp4", "/saved/u5.mp4"],
+            ["/saved/u5.mp4", "/saved/u0.mp4", "/saved/u1.mp4"],
         )
         self.assertEqual(len(run.saved), 6)
 
@@ -1099,13 +1112,15 @@ class TestMatchSegments(unittest.TestCase):
             )
 
         self.assertEqual(run.searched, [("city walk", 1)])
+        # T2 池 shuffle 后的种子序（random.seed(20260909)）：与跨段备忘测试
+        # 同一夹具形状，同一打乱结果（seg0 [u3,u4,u2]；seg1 [u5,u0,u1]）。
         self.assertEqual(
             run.results[0].clips,
-            ["/saved/u0.mp4", "/saved/u1.mp4", "/saved/u2.mp4"],
+            ["/saved/u3.mp4", "/saved/u4.mp4", "/saved/u2.mp4"],
         )
         self.assertEqual(
             run.results[1].clips,
-            ["/saved/u3.mp4", "/saved/u4.mp4", "/saved/u5.mp4"],
+            ["/saved/u5.mp4", "/saved/u0.mp4", "/saved/u1.mp4"],
         )
         self.assertEqual(len(run.saved), 6)
 

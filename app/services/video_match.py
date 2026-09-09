@@ -14,6 +14,7 @@ llm.generate_response 调用同时产出三类查询；响应无法解析出 JSO
 """
 
 import json
+import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -570,6 +571,10 @@ def match_segments(
                         pool_urls.add(url)
                         pool.append(_candidate_from_item(item, term))
                 active_terms = still_active
+
+            # 多供应商合并后池序带固定拼接偏差（供应商声明序 × 词条序 × 页序），
+            # 粗排前打乱消除拼接偏差；测试用 random.seed 固定。
+            random.shuffle(pool)
 
             # 3. 粗排：coarse_query 余弦排序 + 查重门走查 → top-30 非重复。
             #    重复计数由 coarse_rank 的既有汇总行落日志（grep 锚点
