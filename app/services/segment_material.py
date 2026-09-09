@@ -14,6 +14,7 @@ import re
 
 from loguru import logger
 
+from app.config import config
 from app.services import task_artifacts
 
 # Number of clips to download per segment. The assembler cycles through them
@@ -24,6 +25,19 @@ CLIPS_PER_SEGMENT = 3
 # VLM 过滤拒收当前页全部候选时的最大翻页数（issue #9 D6）。Pixabay/Pexels
 # 支持 page 参数；Coverr 分页无文档确认，远端实现按单页处理。
 MAX_SEARCH_PAGES = 2
+
+
+def _search_pages() -> int:
+    """[material_rerank] max_search_pages；缺失、非法或小于 1 时回落 2。"""
+    try:
+        search_pages = int(
+            config.material_rerank.get("max_search_pages", MAX_SEARCH_PAGES)
+        )
+    except (TypeError, ValueError):
+        return MAX_SEARCH_PAGES
+    if search_pages < 1:
+        return MAX_SEARCH_PAGES
+    return search_pages
 
 # 字符级 CJK 判定：搜索 API（Pexels/Pixabay/Coverr）仅接受英文查询，含
 # 中日韩字符的词召回极差。素材层是最后一道防线——即使上游 LLM 词条、

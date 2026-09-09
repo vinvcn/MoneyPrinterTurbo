@@ -573,6 +573,8 @@ material_rerank = _SynchronizedConfig(
             "enabled": True,
             "model": "Qwen/Qwen3-VL-Reranker-8B",
             "vlm_walk_limit": 10,
+            # 每个搜索词在每个供应商最多抓取的页数；默认 2，设 1 可将每个供应商的搜索请求减半
+            "max_search_pages": 2,
             "timeout": 120,
             "api_key": "",
             "base_url": "",

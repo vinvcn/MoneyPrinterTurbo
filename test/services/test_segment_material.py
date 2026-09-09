@@ -5,7 +5,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from app.config import config
 from app.services import segment_material as sm
+from app.services.segment_material import MAX_SEARCH_PAGES, _search_pages
 
 
 class TestRecordsConversion(unittest.TestCase):
@@ -71,6 +73,36 @@ class TestPersistSegmentMaterialSources(unittest.TestCase):
         ):
             # 不抛异常：清单是辅助记录，绝不中断视频生成。
             sm.persist_segment_material_sources("task-1", materials)
+
+
+class TestSearchPages(unittest.TestCase):
+    """_search_pages 读取语义：键缺失、非法或小于 1 时回落 MAX_SEARCH_PAGES
+    （镜像 material_rerank._walk_limit 的 fail-open 先例）。全部用例通过
+    patch.dict 隔离 live config——开发机 config.toml 后续加入
+    max_search_pages = 1 也不会翻转任何断言。"""
+
+    def test_absent_key_falls_back_to_constant(self):
+        """键缺失 → 回落 MAX_SEARCH_PAGES；clear=True 构造"无键"字典，
+        不依赖 live config 的当前状态（用户后续加 max_search_pages = 1
+        也不会翻转本测试）。"""
+        with patch.dict(config.material_rerank, {}, clear=True):
+            self.assertEqual(_search_pages(), MAX_SEARCH_PAGES)
+
+    def test_valid_value_one_is_honored(self):
+        with patch.dict(config.material_rerank, {"max_search_pages": 1}):
+            self.assertEqual(_search_pages(), 1)
+
+    def test_zero_falls_back_to_default(self):
+        with patch.dict(config.material_rerank, {"max_search_pages": 0}):
+            self.assertEqual(_search_pages(), MAX_SEARCH_PAGES)
+
+    def test_non_numeric_falls_back_to_default(self):
+        with patch.dict(config.material_rerank, {"max_search_pages": "abc"}):
+            self.assertEqual(_search_pages(), MAX_SEARCH_PAGES)
+
+    def test_valid_value_three_is_honored(self):
+        with patch.dict(config.material_rerank, {"max_search_pages": 3}):
+            self.assertEqual(_search_pages(), 3)
 
 
 if __name__ == "__main__":

@@ -28,9 +28,9 @@ from app.services import llm
 from app.services import material_rerank
 from app.services.segment_material import (
     CLIPS_PER_SEGMENT,
-    MAX_SEARCH_PAGES,
     SegmentMaterials,
     _MAX_FILTER_RECORDS,
+    _search_pages,
     english_search_term,
 )
 from app.services.video import segment_window_plan
@@ -513,6 +513,8 @@ def match_segments(
     # VLM 走查预算：与旧实现同一先例——直接读 material_rerank._walk_limit
     # （私有访问先例已在 segment_material.py 建立），每次运行只读一次。
     walk_limit = material_rerank._walk_limit()
+    # 搜索翻页数：每次运行只读一次，镜像 walk_limit 先例。
+    search_pages = _search_pages()
 
     material_directory = str(config.app.get("material_directory", "")).strip()
     if material_directory == "task":
@@ -551,7 +553,7 @@ def match_segments(
             pool: list[dict] = []
             pool_urls: set[str] = set()
             active_terms = list(terms)
-            for page in range(1, MAX_SEARCH_PAGES + 1):
+            for page in range(1, search_pages + 1):
                 if not active_terms:
                     break
                 still_active: list[str] = []

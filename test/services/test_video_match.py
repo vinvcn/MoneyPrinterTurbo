@@ -1,5 +1,6 @@
 import json
 import math
+import random
 import sys
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from app.config import config
 from app.models.schema import MaterialInfo
 from app.services import image_embedding, video_match
 from app.services.image_embedding import EmbeddingGate
@@ -696,16 +698,19 @@ class TestMatchSegments(unittest.TestCase):
             b = math.sqrt(1.0 - a * a)
             phi = azimuth.get(i, 0.0)
             vectors[f"img-{i}"] = [a, b * math.cos(phi), b * math.sin(phi)]
-        run = self._run(
-            segments=[{"index": 0, "text": "panda", "duration": 12.816}],
-            llm_payloads=[self._queries_json(["panda one", "panda two"])],
-            pages_by_term=pages,
-            judge="relevant",
-            walk_limit=10,
-            rerank=lambda _query, items: list(reversed(items)),
-            vectors=vectors,
-            gate=True,
-        )
+        # 钉死 2 页：夹具含第 2 页候选，live config 后续改 max_search_pages 也不翻转。
+        random.seed(20260909)
+        with patch.dict(config.material_rerank, {"max_search_pages": 2}):
+            run = self._run(
+                segments=[{"index": 0, "text": "panda", "duration": 12.816}],
+                llm_payloads=[self._queries_json(["panda one", "panda two"])],
+                pages_by_term=pages,
+                judge="relevant",
+                walk_limit=10,
+                rerank=lambda _query, items: list(reversed(items)),
+                vectors=vectors,
+                gate=True,
+            )
 
         result = run.results[0]
         # 配额 = max(3, len(plan(12.816, 3))) = 5，走查按 fine 逆序拿满。
@@ -758,13 +763,16 @@ class TestMatchSegments(unittest.TestCase):
             return _verdict_record("relevant")
 
         segment = {"index": 0, "text": "panda", "duration": 12.816}
-        run = self._run(
-            segments=[segment],
-            llm_payloads=[self._queries_json(["panda one"])],
-            pages_by_term=pages,
-            judge=judge,
-            vectors=vectors,
-        )
+        # 钉死 2 页：夹具按 2 页翻页语义构造，live config 改值不翻转。
+        random.seed(20260909)
+        with patch.dict(config.material_rerank, {"max_search_pages": 2}):
+            run = self._run(
+                segments=[segment],
+                llm_payloads=[self._queries_json(["panda one"])],
+                pages_by_term=pages,
+                judge=judge,
+                vectors=vectors,
+            )
 
         result = run.results[0]
         # 配额 5，视频命中 2（u2/u3 判 irrelevant），尾部窗口 [3,3,0.816]。
@@ -840,14 +848,17 @@ class TestMatchSegments(unittest.TestCase):
                 for i in (8, 9)
             ],
         }
-        run = self._run(
-            segments=[{"index": 0, "text": "panda", "duration": 12.816}],
-            llm_payloads=[self._queries_json(["panda one", "panda two"])],
-            pages_by_term=pages,
-            judge="relevant",
-            walk_limit=10,
-            embed_text_fails=True,
-        )
+        # 钉死 2 页：interleave 池含第 2 页候选，live config 改值不翻转。
+        random.seed(20260909)
+        with patch.dict(config.material_rerank, {"max_search_pages": 2}):
+            run = self._run(
+                segments=[{"index": 0, "text": "panda", "duration": 12.816}],
+                llm_payloads=[self._queries_json(["panda one", "panda two"])],
+                pages_by_term=pages,
+                judge="relevant",
+                walk_limit=10,
+                embed_text_fails=True,
+            )
 
         result = run.results[0]
         interleave = [f"https://v.example/u{i}.mp4" for i in range(10)]
@@ -873,6 +884,8 @@ class TestMatchSegments(unittest.TestCase):
             ],
         }
         vectors = {f"img-{i}": _vec_with_cos(0.9 - 0.1 * i) for i in range(6)}
+        # 固定随机序：T2 引入池 shuffle 后，粗排序断言仍确定。
+        random.seed(20260909)
         run = self._run(
             segments=[{"index": 0, "text": "panda", "duration": 3.744}],
             llm_payloads=[self._queries_json(["panda one"])],
@@ -907,6 +920,8 @@ class TestMatchSegments(unittest.TestCase):
         def exploding_rerank(query, items):
             raise RuntimeError("reranker exploded")
 
+        # 固定随机序：T2 引入池 shuffle 后，粗排序断言仍确定。
+        random.seed(20260909)
         run = self._run(
             segments=[{"index": 0, "text": "panda", "duration": 3.744}],
             llm_payloads=[self._queries_json(["panda one"])],
@@ -940,6 +955,8 @@ class TestMatchSegments(unittest.TestCase):
                 _video_item("https://v.example/b.mp4", "panda two", "img-b"),
             ],
         }
+        # 固定随机序：T2 引入池 shuffle 后，pool 顺序断言仍确定。
+        random.seed(20260909)
         run = self._run(
             segments=[{"index": 0, "text": "panda", "duration": 3.744}],
             llm_payloads=[self._queries_json(["panda one", "panda two"])],
@@ -981,6 +998,8 @@ class TestMatchSegments(unittest.TestCase):
                 _video_item("https://v.example/e.mp4", "t two", "img-e"),
             ],
         }
+        # 固定随机序：T2 引入池 shuffle 后，逐段 clips 顺序断言仍确定。
+        random.seed(20260909)
         run = self._run(
             segments=[
                 {"index": 0, "text": "first", "duration": 3.744},
@@ -1021,18 +1040,21 @@ class TestMatchSegments(unittest.TestCase):
                 for i in range(6)
             ],
         }
-        run = self._run(
-            segments=[
-                {"index": 0, "text": "walk one", "duration": 3.744},
-                {"index": 1, "text": "walk two", "duration": 3.744},
-            ],
-            llm_payloads=[
-                self._queries_json(["city walk"]),
-                self._queries_json(["city walk"]),
-            ],
-            pages_by_term=pages,
-            judge="relevant",
-        )
+        # 钉死 2 页：断言精确到 (词条, 页) 序列，live config 改值不翻转。
+        random.seed(20260909)
+        with patch.dict(config.material_rerank, {"max_search_pages": 2}):
+            run = self._run(
+                segments=[
+                    {"index": 0, "text": "walk one", "duration": 3.744},
+                    {"index": 1, "text": "walk two", "duration": 3.744},
+                ],
+                llm_payloads=[
+                    self._queries_json(["city walk"]),
+                    self._queries_json(["city walk"]),
+                ],
+                pages_by_term=pages,
+                judge="relevant",
+            )
 
         self.assertEqual(
             run.searched, [("city walk", 1), ("city walk", 2)]
@@ -1042,6 +1064,41 @@ class TestMatchSegments(unittest.TestCase):
         self.assertEqual(
             sorted({term for term, _page in run.searched}), ["city walk"]
         )
+        self.assertEqual(
+            run.results[0].clips,
+            ["/saved/u0.mp4", "/saved/u1.mp4", "/saved/u2.mp4"],
+        )
+        self.assertEqual(
+            run.results[1].clips,
+            ["/saved/u3.mp4", "/saved/u4.mp4", "/saved/u5.mp4"],
+        )
+        self.assertEqual(len(run.saved), 6)
+
+    def test_max_search_pages_one_limits_search_to_first_page(self):
+        """[material_rerank] max_search_pages=1：每个词条只抓第 1 页，第 2 页
+        永不透传（页数可配置契约的集成面；复用跨段备忘的夹具形状）。"""
+        pages = {
+            ("city walk", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "city walk", f"img-{i}")
+                for i in range(6)
+            ],
+        }
+        random.seed(20260909)
+        with patch.dict(config.material_rerank, {"max_search_pages": 1}):
+            run = self._run(
+                segments=[
+                    {"index": 0, "text": "walk one", "duration": 3.744},
+                    {"index": 1, "text": "walk two", "duration": 3.744},
+                ],
+                llm_payloads=[
+                    self._queries_json(["city walk"]),
+                    self._queries_json(["city walk"]),
+                ],
+                pages_by_term=pages,
+                judge="relevant",
+            )
+
+        self.assertEqual(run.searched, [("city walk", 1)])
         self.assertEqual(
             run.results[0].clips,
             ["/saved/u0.mp4", "/saved/u1.mp4", "/saved/u2.mp4"],
@@ -1096,6 +1153,8 @@ class TestMatchSegments(unittest.TestCase):
                 raise RuntimeError("vlm exploded")
             return _verdict_record("relevant")
 
+        # 固定随机序：T2 引入池 shuffle 后，clips 顺序断言仍确定。
+        random.seed(20260909)
         run = self._run(
             segments=[{"index": 0, "text": "panda", "duration": 3.744}],
             llm_payloads=[self._queries_json(["panda one"])],
