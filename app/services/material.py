@@ -562,15 +562,22 @@ def search_videos_pixabay(
                     item.provider = "pixabay"
                     item.url = video["url"]
                     item.duration = duration
-                    # picture_id 可拼出 vimeocdn 预览缩略图。295x166 版本低于
-                    # VLM 过滤的最小分辨率阈值，这里直接取 640x360 版本；
-                    # 实际分辨率仍由过滤层在下载缩略图后校验。
+                    # 预览缩略图：picture_id 存在时拼 vimeocdn 640x360（295x166
+                    # 低于 VLM 过滤的最小分辨率阈值）；pixabay API 已不再返回
+                    # picture/picture_id（2026-09 实测响应无此二键），此时按
+                    # CDN 约定从所选清晰度 URL 推导同帧 JPEG（.mp4 → .jpg，
+                    # 实测可下载且被多模态嵌入端点接受）。实际分辨率仍由
+                    # 过滤层在下载缩略图后校验。
                     thumbnail_url = ""
                     picture_id = str(v.get("picture_id") or "")
                     if picture_id:
                         thumbnail_url = (
                             f"https://i.vimeocdn.com/video/{picture_id}_640x360.jpg"
                         )
+                    else:
+                        stem = str(video["url"] or "").rsplit(".", 1)[0]
+                        if stem:
+                            thumbnail_url = f"{stem}.jpg"
                     item.source_info = {
                         "provider": "pixabay",
                         "search_term": search_term,

@@ -405,6 +405,90 @@ class TestMaterialTlsVerification(unittest.TestCase):
             ["https://example.com/coverr-landscape.mp4"],
         )
 
+    def test_search_pixabay_derives_thumbnail_from_rendition_url(self):
+        """pixabay API 已不再返回 picture/picture_id：缩略图按 CDN 约定从
+        清晰度 URL 推导（.mp4 → .jpg），保证粗排/查重门拿到可嵌入预览。"""
+        config.app["pixabay_api_keys"] = ["pixabay-key"]
+        config.proxy.clear()
+
+        fake_response = SimpleNamespace(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            text="",
+            json=lambda: {
+                "hits": [
+                    {
+                        "id": 7,
+                        "duration": 9,
+                        "videos": {
+                            "large": {
+                                "width": 1920,
+                                "height": 1080,
+                                "url": "https://cdn.pixabay.com/video/2021/07/14/81457-576317119_large.mp4",
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        with patch(
+            "app.services.material.requests.get", return_value=fake_response
+        ):
+            results = material.search_videos_pixabay(
+                "panda",
+                minimum_duration=1,
+                video_aspect=material.VideoAspect.square,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(
+            results[0].source_info["thumbnail_url"],
+            "https://cdn.pixabay.com/video/2021/07/14/81457-576317119_large.jpg",
+        )
+
+    def test_search_pixabay_prefers_picture_id_when_present(self):
+        """picture_id 仍在时优先 vimeocdn 拼接（旧字段兼容，回滚安全）。"""
+        config.app["pixabay_api_keys"] = ["pixabay-key"]
+        config.proxy.clear()
+
+        fake_response = SimpleNamespace(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            text="",
+            json=lambda: {
+                "hits": [
+                    {
+                        "id": 8,
+                        "duration": 9,
+                        "picture_id": "123456789",
+                        "videos": {
+                            "large": {
+                                "width": 1920,
+                                "height": 1080,
+                                "url": "https://cdn.pixabay.com/video/2021/07/14/81457-576317119_large.mp4",
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        with patch(
+            "app.services.material.requests.get", return_value=fake_response
+        ):
+            results = material.search_videos_pixabay(
+                "panda",
+                minimum_duration=1,
+                video_aspect=material.VideoAspect.square,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(
+            results[0].source_info["thumbnail_url"],
+            "https://i.vimeocdn.com/video/123456789_640x360.jpg",
+        )
+
     def test_search_pixabay_does_not_log_api_key(self):
         config.app["pixabay_api_keys"] = ["pixabay-secret-key"]
         config.proxy.clear()

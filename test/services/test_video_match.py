@@ -408,6 +408,29 @@ class TestCoarseRank(unittest.TestCase):
         self.assertNotIn("https://x/f", cache)
         self.assertEqual(len(cache), 3)
 
+    def test_empty_data_uri_sinks_without_embed_call(self):
+        """空 data_uri（缩略图缺失）直接沉底：不发起必然 400 的嵌入调用，
+        查重门走查同样零调用放行（门内空 URI fail-open）。"""
+        pool = [
+            {"asset_id": "ok", "url": "https://x/ok", "data_uri": "data:ok"},
+            {"asset_id": "empty", "url": "https://x/empty", "data_uri": ""},
+            {"asset_id": "missing", "url": "https://x/missing"},
+        ]
+        vectors = {"data:ok": _vec_with_cos(0.9)}
+        cache: dict[str, list[float]] = {}
+        gate = EmbeddingGate(
+            model="m", api_key="k", threshold=0.68, vector_cache=cache
+        )
+        selected, dup_skips, stub = self._rank(pool, cache, gate, vectors)
+        self.assertEqual(
+            [c["url"] for c in selected],
+            ["https://x/ok", "https://x/empty", "https://x/missing"],
+        )
+        self.assertEqual(dup_skips, [])
+        # 空 URI 候选全程零嵌入调用；成功候选恰好一次（粗排与门共享缓存）。
+        self.assertEqual(stub.calls, ["data:ok"])
+        self.assertEqual(len(cache), 1)
+
     def test_embed_text_none_fails_open_to_pool_slice(self):
         """查询向量不可得：返回 pool[:30]（interleave 路径）+ fail-open 告警。"""
         pool = [_candidate(i) for i in range(35)]

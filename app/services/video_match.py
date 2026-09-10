@@ -269,7 +269,9 @@ def coarse_rank(
     for cand in pool:
         url = str(cand.get("url") or "")
         vec = cache.get(url)
-        if vec is None:
+        # 空 data_uri（缩略图缺失）发起嵌入必然 400：跳过调用直接沉底，
+        # 不空耗 API 配额。
+        if vec is None and str(cand.get("data_uri") or ""):
             vec = image_embedding.embed_image(
                 data_uri=str(cand.get("data_uri") or ""),
                 model=model,

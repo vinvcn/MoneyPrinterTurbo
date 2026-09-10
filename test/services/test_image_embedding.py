@@ -190,6 +190,15 @@ def _gate_with(vectors, threshold=0.68):
 
 
 class TestEmbeddingGate(unittest.TestCase):
+    def test_empty_data_uri_passes_through_without_embed(self):
+        """空 data_uri（缩略图缺失）直接放行：不发起必然 400 的嵌入调用。"""
+        gate, stub, patcher = _gate_with({"data:a": [1.0, 0.0]})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.assertIsNone(gate.judge_candidate_embedding("https://empty", ""))
+        self.assertIsNone(gate.judge_candidate_embedding("https://missing", None))
+        self.assertEqual(stub.calls, [])
+
     def test_lifecycle_cache_then_register(self):
         """判定时缓存向量；采纳后无需再嵌入即可比对出重复。"""
         gate, stub, patcher = _gate_with(

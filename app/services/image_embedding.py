@@ -268,6 +268,10 @@ class EmbeddingGate:
         真正被采纳的 URL 生效。term 保留在调用契约上（审计记录携带搜索
         词），门内不再使用。
         """
+        if not str(data_uri or ""):
+            # 空 data_uri 无法嵌入：直接放行（fail-open），不发起必然
+            # 400 的调用；候选交由 VLM 走查的首帧兜底自行取图。
+            return None
         vec = self._candidates.get(url)
         if vec is None and self._shared_cache is not None:
             vec = self._shared_cache.get(url)
