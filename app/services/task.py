@@ -1136,7 +1136,14 @@ def _run_segment_first_pipeline(
         return _mark_task_failed(task_id, "script", "script produced no segments")
 
     segment_records = [
-        {"index": segment.index, "text": segment.text} for segment in segments
+        {
+            "index": segment.index,
+            "text": segment.text,
+            # B3 契约：素材层配额按窗口数计算，需要时长才能算出真实窗口
+            # 计划；先用分段器估算，TTS 完成后再用真实音频时长覆盖。
+            "duration": segment.estimated_duration,
+        }
+        for segment in segments
     ]
     logger.info(
         f"segmented script: task_id={task_id}, segments={len(segment_records)}"
@@ -1181,6 +1188,15 @@ def _run_segment_first_pipeline(
 
     audio_file = audio_result.audio_file
     audio_duration = math.ceil(audio_result.total_duration_ms / 1000) or 1
+    # 真实 TTS 时长覆盖估算值：素材层配额与装配层窗口计划看到同一份数据
+    # （B3 契约），长段才能拿到足额的候选名额。
+    tts_duration_by_index = {
+        s.get("index"): s.get("duration_ms", 0) / 1000 for s in audio_result.segments
+    }
+    for record in segment_records:
+        real = tts_duration_by_index.get(record.get("index"))
+        if real:
+            record["duration"] = real
 
     if stop_at == "audio":
         sm.state.update_task(
