@@ -465,6 +465,10 @@ def save_config():
         config_to_save["siliconflow"] = dict(siliconflow)
         config_to_save["elevenlabs"] = dict(elevenlabs)
         config_to_save["chatterbox"] = dict(chatterbox)
+        config_to_save["vlm"] = dict(vlm)
+        config_to_save["image_gen"] = dict(image_gen)
+        config_to_save["image_embedding"] = dict(image_embedding)
+        config_to_save["material_rerank"] = dict(material_rerank)
         config_to_save["ui"] = dict(ui)
         serialized_config = toml.dumps(config_to_save)
 
@@ -519,6 +523,62 @@ azure = _SynchronizedConfig(_cfg.get("azure", {}))
 siliconflow = _SynchronizedConfig(_cfg.get("siliconflow", {}))
 elevenlabs = _SynchronizedConfig(_cfg.get("elevenlabs", {}))
 chatterbox = _SynchronizedConfig(_cfg.get("chatterbox", {}))
+vlm = _SynchronizedConfig(
+    _cfg.get(
+        "vlm",
+        {
+            # [vlm] 段缺失时按"未启用"处理：segment-first 素材流程不发起
+            # 任何 VLM 请求，行为与引入过滤器之前完全一致。
+            "enabled": False,
+        },
+    )
+)
+image_gen = _SynchronizedConfig(
+    _cfg.get(
+        "image_gen",
+        {
+            # [image_gen] 段缺失时按默认 Kolors 参数处理：subject 层仍会
+            # 生成图片（api_key 缺省回落 [vlm] api_key，同一 SiliconFlow
+            # 账号无需重复填写）。
+            "api_key": "",
+            "model": "Kwai-Kolors/Kolors",
+            "image_size_portrait": "720x1280",
+            "image_size_landscape": "1280x720",
+            "num_inference_steps": 20,
+            "guidance_scale": 7.5,
+        },
+    )
+)
+image_embedding = _SynchronizedConfig(
+    _cfg.get(
+        "image_embedding",
+        {
+            # [image_embedding] 段缺失时按"查重门关闭"处理：segment-first
+            # 素材流程不发起任何嵌入请求，行为与引入查重门之前完全一致。
+            "model": "tongyi-embedding-vision-flash",
+            "api_key": "",
+            "base_url": "",
+            "duplicate_gate": False,
+            "duplicate_threshold": 0.68,
+        },
+    )
+)
+material_rerank = _SynchronizedConfig(
+    _cfg.get(
+        "material_rerank",
+        {
+            # [material_rerank] 段缺失时按"启用"处理：segment-first 素材流程
+            # 使用 reranker 对每个搜索页的候选做视觉精判。
+            # VLM 最多按 fine 排序走查前 10 个候选，配额满即提前退出
+            "enabled": True,
+            "model": "Qwen/Qwen3-VL-Reranker-8B",
+            "vlm_walk_limit": 10,
+            "timeout": 120,
+            "api_key": "",
+            "base_url": "",
+        },
+    )
+)
 ui = _SynchronizedConfig(
     _cfg.get(
         "ui",

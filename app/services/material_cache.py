@@ -67,10 +67,14 @@ def _cached_source_info(item: MaterialInfo) -> dict | None:
     }
     asset_id = source.get("asset_id")
     source_page = _safe_public_url(source.get("source_page"))
+    thumbnail_url = _safe_public_url(source.get("thumbnail_url"))
     if asset_id not in (None, ""):
         cached["asset_id"] = str(asset_id)
     if source_page:
         cached["source_page"] = source_page
+    if thumbnail_url:
+        # 预览缩略图同样只允许无查询参数的公开地址，供 VLM 下载前过滤复用。
+        cached["thumbnail_url"] = thumbnail_url
 
     raw_creator = source.get("creator")
     if isinstance(raw_creator, dict):
@@ -114,12 +118,14 @@ def _cache_key(
     search_term: str,
     minimum_duration: int,
     video_aspect: VideoAspect | str,
+    page: int = 1,
 ) -> str:
     """
     根据会影响搜索结果的业务参数生成稳定文件名。
 
     API Key 只负责鉴权，不影响公开搜索结果，因此不能写入缓存键或缓存内容。
     使用 SHA-256 可以避免关键词直接出现在文件名中，同时保持路径长度固定。
+    ``page`` 参与键计算：VLM 过滤翻页后第二页候选不会覆盖第一页缓存。
     """
     aspect_value = getattr(video_aspect, "value", video_aspect)
     cache_key = json.dumps(
@@ -128,6 +134,7 @@ def _cache_key(
             "search_term": str(search_term).strip(),
             "minimum_duration": int(minimum_duration),
             "video_aspect": str(aspect_value),
+            "page": max(1, int(page)),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -141,12 +148,14 @@ def _cache_path(
     search_term: str,
     minimum_duration: int,
     video_aspect: VideoAspect | str,
+    page: int = 1,
 ) -> Path:
     digest = _cache_key(
         provider=provider,
         search_term=search_term,
         minimum_duration=minimum_duration,
         video_aspect=video_aspect,
+        page=page,
     )
     return _cache_dir() / f"{digest}.json"
 
@@ -156,6 +165,7 @@ def get_material_search_cache_lock(
     search_term: str,
     minimum_duration: int,
     video_aspect: VideoAspect | str,
+    page: int = 1,
 ) -> threading.Lock:
     """返回当前搜索条件对应的进程内锁分片。"""
     digest = _cache_key(
@@ -163,6 +173,7 @@ def get_material_search_cache_lock(
         search_term=search_term,
         minimum_duration=minimum_duration,
         video_aspect=video_aspect,
+        page=page,
     )
     return _CACHE_LOCKS[int(digest[:8], 16) % len(_CACHE_LOCKS)]
 
@@ -183,6 +194,7 @@ def load_material_search_cache(
     search_term: str,
     minimum_duration: int,
     video_aspect: VideoAspect | str,
+    page: int = 1,
     *,
     now: float | None = None,
 ) -> list[MaterialInfo] | None:
@@ -191,6 +203,7 @@ def load_material_search_cache(
 
     ``None`` 表示缓存未命中，需要请求远端 API；空列表不作为有效缓存返回，
     避免网络错误或上游异常被误缓存后持续阻断后续任务。
+    ``page`` 参与缓存键，不同页的候选互不覆盖。
     """
     if str(provider).strip().lower() == "coverr":
         # Coverr 的下载地址包含绑定 API Key 的签名 JWT。它只用于当前请求，
@@ -202,6 +215,7 @@ def load_material_search_cache(
                     search_term=search_term,
                     minimum_duration=minimum_duration,
                     video_aspect=video_aspect,
+                    page=page,
                 )
             )
         except Exception as exc:
@@ -217,6 +231,7 @@ def load_material_search_cache(
             search_term=search_term,
             minimum_duration=minimum_duration,
             video_aspect=video_aspect,
+            page=page,
         )
     except Exception as exc:
         # 缓存目录创建、路径解析等异常不能阻断远端素材搜索。这里保留完整异常
@@ -307,6 +322,7 @@ def save_material_search_cache(
     minimum_duration: int,
     video_aspect: VideoAspect | str,
     items: Iterable[MaterialInfo],
+    page: int = 1,
 ) -> bool:
     """
     原子保存一次成功的非空素材搜索结果。
@@ -314,6 +330,7 @@ def save_material_search_cache(
     多个任务可能并发搜索相同关键词。先写入同目录唯一临时文件，再通过
     ``os.replace`` 发布，可以保证读进程只会看到完整旧文件或完整新文件；
     即使两个写进程同时完成，最终内容也都是同一缓存键对应的合法结果。
+    ``page`` 参与缓存键，不同页的候选互不覆盖。
     """
     if str(provider).strip().lower() == "coverr":
         return False
@@ -341,6 +358,7 @@ def save_material_search_cache(
             search_term=search_term,
             minimum_duration=minimum_duration,
             video_aspect=video_aspect,
+            page=page,
         )
         cleanup_expired_material_search_cache()
         payload = {

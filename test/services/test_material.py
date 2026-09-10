@@ -744,7 +744,19 @@ class TestMaterialTlsVerification(unittest.TestCase):
             ],
         )
         self.assertEqual(result, ["/tmp/a1.mp4", "/tmp/b1.mp4", "/tmp/a2.mp4"])
-        recorded_sources = patch_script.call_args.kwargs["material_sources"]
+        # 现在同一个 patch_script mock 会收到两次调用：先记录素材来源，
+        # 再记录搜索审计（search_responses）。按调用次序取出各自的载荷。
+        self.assertEqual(patch_script.call_count, 2)
+        recorded_sources = patch_script.call_args_list[0].kwargs["material_sources"]
+        recorded_searches = patch_script.call_args_list[1].kwargs["search_responses"]
+        self.assertEqual(
+            [record["search_term"] for record in recorded_searches],
+            ["opening city", "middle office"],
+        )
+        self.assertEqual(
+            [c["url"] for c in recorded_searches[0]["candidates"]][:2],
+            ["https://v.example/a1.mp4", "https://v.example/a2.mp4"],
+        )
         self.assertEqual(
             [source["asset_id"] for source in recorded_sources],
             ["a1", "b1", "a2"],

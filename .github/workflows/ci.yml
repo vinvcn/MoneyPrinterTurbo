@@ -32,6 +32,9 @@ jobs:
       MPT_TEST_REDIS_HOST: 127.0.0.1
       MPT_TEST_REDIS_PORT: 6379
       MPT_TEST_REDIS_DB: 15
+      # segment-first 流水线的行为由独立测试覆盖；CI 主套件固定走旧流水线，
+      # 保证存量用例不依赖配置开关的环境差异。
+      MPT_SEGMENT_FIRST_PIPELINE: "0"
 
     steps:
       - name: Check out repository
@@ -100,9 +103,12 @@ jobs:
       - name: Compile Python sources
         run: uv run --no-sync python -m compileall app cli.py main.py webui test
 
-- name: Run core service smoke tests
+      - name: Run core service smoke tests
         # 兼容 pytest 与现有 unittest.TestCase：同时覆盖 upstream 的核心服务
         # 冒烟测试与 fork 的幂等提交回归测试。
+        # segment-first 流水线由独立测试覆盖，这里固定走旧流水线。
+        env:
+          MPT_SEGMENT_FIRST_PIPELINE: "0"
         run: >-
           uv run --no-sync python -X utf8 -m pytest -q
           test/services/test_config.py

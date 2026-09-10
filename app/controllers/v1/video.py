@@ -14,21 +14,6 @@ from fastapi.params import File
 from fastapi.responses import FileResponse, StreamingResponse
 from loguru import logger
 
-
-def _sanitize_for_log(task: dict) -> dict:
-    """Return a copy of task with large base64 fields truncated for logging."""
-    sanitized = deepcopy(task)
-    params = sanitized.get("params")
-    if isinstance(params, dict) and "sample_audio_base64" in params:
-        val = params["sample_audio_base64"]
-        if isinstance(val, str) and len(val) > 100:
-            params["sample_audio_base64"] = val[:60] + f"...[{len(val)} chars]"
-    elif hasattr(params, "sample_audio_base64"):
-        val = params.sample_audio_base64
-        if isinstance(val, str) and len(val) > 100:
-            params.sample_audio_base64 = val[:60] + f"...[{len(val)} chars]"
-    return sanitized
-
 from app.config import config
 from app.controllers import base
 from app.controllers.manager.base_manager import TaskQueueFullError
@@ -55,6 +40,21 @@ from app.services import bgm as bgm_service
 from app.services import state as sm
 from app.services import task as tm
 from app.utils import file_security, utils
+
+
+def _sanitize_for_log(task: dict) -> dict:
+    """Return a copy of task with large base64 fields truncated for logging."""
+    sanitized = deepcopy(task)
+    params = sanitized.get("params")
+    if isinstance(params, dict) and "sample_audio_base64" in params:
+        val = params["sample_audio_base64"]
+        if isinstance(val, str) and len(val) > 100:
+            params["sample_audio_base64"] = val[:60] + f"...[{len(val)} chars]"
+    elif hasattr(params, "sample_audio_base64"):
+        val = params.sample_audio_base64
+        if isinstance(val, str) and len(val) > 100:
+            params.sample_audio_base64 = val[:60] + f"...[{len(val)} chars]"
+    return sanitized
 
 # 认证依赖项
 # router = new_router(dependencies=[Depends(base.verify_token)])
