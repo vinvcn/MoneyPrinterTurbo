@@ -64,21 +64,75 @@ def _image_size_for(video_aspect: Any) -> str:
     return str(config.image_gen.get(key) or default)
 
 
-def refine_scene_prompt(segment_text: str) -> str:
+def refine_scene_prompt(segment_text: str, subject_term: str = "") -> str:
     """
-    把旁白精炼成英文静态画面描述；LLM 失败或输出为空时降级旁白原文
-    （Kolors 对中文 prompt 同样可用，降级不阻塞生成）。
+    把旁白转成详细的 AI 图片生成 prompt；LLM 失败或输出为空时
+    降级旁白原文（Kolors 对中文 prompt 同样可用）。
+    subject_term 用于约束画面不偏离视频主题。
     """
     narration = (segment_text or "").strip()
     if not narration:
         return ""
+    subject_constraint = ""
+    if subject_term:
+        subject_constraint = (
+            f"\n\n## Topic Constraint\n\n"
+            f"The video's core topic is: **{subject_term}**\n\n"
+            f"Every element in the frame — subject, environment, props, mood — "
+            f"must clearly relate to this topic. Do NOT introduce unrelated "
+            f"objects, settings, or themes. If the narration describes a "
+            f"metaphor or abstract concept, visualize it in a way that "
+            f"reinforces the topic rather than drifting to something else. "
+            f"The image should feel like it belongs in a video about "
+            f"'{subject_term}', not a random stock photo.\n"
+        )
     prompt = (
-        "# Role: Text-to-Image Scene Writer\n\n"
-        "Condense the narration below into ONE short English visual scene "
-        "description (max 40 words): concrete subject, setting, lighting, "
-        "camera shot. Photographic style. Output ONLY the description "
-        "itself — no quotes, no explanations, no text-in-image requests.\n\n"
-        f"Narration: {narration}"
+        "# Role: Cinematic Scene Designer for AI Image Generation\n\n"
+        "You are designing a prompt for a text-to-image AI model (Kolors). "
+        "Your job is to transform a short narration into a rich, visually "
+        "compelling image generation prompt that produces a frame worthy of "
+        "a professional short film.\n\n"
+        "## Instructions\n\n"
+        "Read the narration below and imagine it as a single cinematic frame. "
+        "Then write a detailed image generation prompt covering ALL of the "
+        "following aspects:\n\n"
+        "1. **Subject**: What is the main focus? Describe the character, object, "
+        "or scene element with specific details (appearance, action, expression, "
+        "posture, clothing, age, etc.).\n"
+        "2. **Environment**: Where does this take place? Describe the setting "
+        "(interior/exterior, location type, architectural style, natural "
+        "landmarks, furniture, props, etc.).\n"
+        "3. **Lighting**: What is the lighting mood? (golden hour, harsh "
+        "midnight, soft diffused window light, neon glow, volumetric fog "
+        "backlight, cinematic rim light, etc.)\n"
+        "4. **Composition**: How is the frame arranged? (rule of thirds, "
+        "centered subject, leading lines, depth layers, foreground interest, "
+        "negative space, low angle, bird's eye, dutch angle, etc.)\n"
+        "5. **Color Palette**: What are the dominant tones and color "
+        "relationships? (warm amber and teal, muted pastels, high-contrast "
+        "monochrome, saturated primaries, etc.)\n"
+        "6. **Atmosphere**: What is the mood and feeling? (serene, tense, "
+        "nostalgic, mysterious, joyful, melancholic, etc.) Add atmospheric "
+        "elements (mist, rain, dust particles, lens flare, bokeh, etc.).\n"
+        "7. **Camera & Lens**: What camera and lens would capture this? "
+        "(35mm cinematic, 85mm portrait with shallow depth of field, "
+        "wide-angle 24mm, macro, anamorphic, etc.)\n"
+        "8. **Style**: What is the visual style? (photorealistic, film grain, "
+        "Kodak Portra 400, editorial photography, etc.)\n"
+        f"{subject_constraint}"
+        "\n## Rules\n\n"
+        "- Output ONLY the image generation prompt itself — no quotes, no "
+        "explanatory text, no labels like 'Subject:' or 'Lighting:'.\n"
+        "- Write in fluent, comma-separated natural language (Kolors reads "
+        "this better than bullet points).\n"
+        "- Do NOT include any text, captions, watermarks, or logos in the "
+        "image — the frame must be purely visual.\n"
+        "- Avoid overly abstract or conceptual descriptions; be concrete "
+        "and visually specific so the AI can render a clear image.\n"
+        "- The final prompt should be detailed enough to produce a "
+        "high-quality, publication-ready photograph or cinematic frame.\n\n"
+        "## Narration\n\n"
+        f'"{narration}"'
     )
     response = llm.generate_response(prompt)
     if response.startswith("Error: "):
@@ -304,7 +358,7 @@ def make_subject_clip(
         "error": "",
     }
 
-    prompt = refine_scene_prompt(segment_text)
+    prompt = refine_scene_prompt(segment_text, subject_term)
     record["prompt"] = prompt
     if not prompt:
         record["error"] = "empty_prompt"
