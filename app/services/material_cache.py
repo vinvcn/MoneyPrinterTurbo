@@ -273,6 +273,7 @@ def load_material_search_cache(
             raise ValueError("invalid cache payload")
 
         items = []
+        backfilled = 0
         for raw_item in payload["items"]:
             if not isinstance(raw_item, dict):
                 raise ValueError("invalid material item")
@@ -304,6 +305,7 @@ def load_material_search_cache(
                 stem = str(item_url or "").rsplit(".", 1)[0]
                 if stem:
                     source_info["thumbnail_url"] = f"{stem}.jpg"
+                    backfilled += 1
             items.append(
                 MaterialInfo(
                     provider=item_provider,
@@ -319,6 +321,11 @@ def load_material_search_cache(
         _remove_invalid_cache(cache_path)
         return None
 
+    if backfilled:
+        logger.info(
+            "backfilled legacy pixabay thumbnails from rendition urls: "
+            f"count={backfilled}, file={cache_path.name}"
+        )
     logger.info(
         f"material search cache hit: provider={provider}, "
         f"term={search_term!r}, items={len(items)}"

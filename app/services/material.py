@@ -578,6 +578,10 @@ def search_videos_pixabay(
                         stem = str(video["url"] or "").rsplit(".", 1)[0]
                         if stem:
                             thumbnail_url = f"{stem}.jpg"
+                            logger.debug(
+                                "pixabay thumbnail derived from rendition url: "
+                                f"asset_id={v.get('id')}, thumbnail_url={thumbnail_url}"
+                            )
                     item.source_info = {
                         "provider": "pixabay",
                         "search_term": search_term,
@@ -972,8 +976,13 @@ def _candidate_cap() -> int:
     try:
         cap = int(config.material_rerank.get("max_candidates_per_provider", 20))
     except (TypeError, ValueError):
+        logger.warning(
+            "invalid max_candidates_per_provider, fallback to 20: "
+            f"raw={config.material_rerank.get('max_candidates_per_provider')!r}"
+        )
         return 20
     if cap < 1:
+        logger.warning(f"max_candidates_per_provider below 1, fallback to 20: raw={cap}")
         return 20
     return cap
 
@@ -998,6 +1007,11 @@ def search_videos_multi_provider(
         assert_search_provider_available()
 
     cap = _candidate_cap()
+    logger.info(
+        f"segment search fan-out begin: term={search_term!r}, page={page}, "
+        f"providers=[{', '.join(name for name, _ in providers)}], "
+        f"per_provider_cap={cap}"
+    )
     merged: List[MaterialInfo] = []
     per_provider: dict[str, int] = {}
     with ThreadPoolExecutor(max_workers=len(providers)) as executor:
@@ -1026,6 +1040,11 @@ def search_videos_multi_provider(
                 )
                 continue
             capped = items[:cap]
+            if len(items) > cap:
+                logger.info(
+                    "provider results head-capped: "
+                    f"provider={provider}, raw={len(items)}, kept={cap}"
+                )
             per_provider[provider] = len(capped)
             merged.extend(capped)
 

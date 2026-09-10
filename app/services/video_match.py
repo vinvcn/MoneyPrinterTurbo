@@ -556,6 +556,9 @@ def match_segments(
             pool: list[dict] = []
             pool_urls: set[str] = set()
             active_terms = list(terms)
+            raw_seen = 0
+            dedup_dropped = 0
+            used_dropped = 0
             for page in range(1, search_pages + 1):
                 if not active_terms:
                     break
@@ -567,12 +570,24 @@ def match_segments(
                         continue
                     still_active.append(term)
                     for item in page_items:
+                        raw_seen += 1
                         url = str(item.url or "")
-                        if not url or url in used_urls or url in pool_urls:
+                        if not url:
+                            continue
+                        if url in used_urls:
+                            used_dropped += 1
+                            continue
+                        if url in pool_urls:
+                            dedup_dropped += 1
                             continue
                         pool_urls.add(url)
                         pool.append(_candidate_from_item(item, term))
                 active_terms = still_active
+            logger.info(
+                "candidate pool assembled: "
+                f"segment={segment_index}, raw={raw_seen}, kept={len(pool)}, "
+                f"dedup_dropped={dedup_dropped}, used_dropped={used_dropped}"
+            )
 
             # 多供应商合并后池序带固定拼接偏差（供应商声明序 × 词条序 × 页序），
             # 粗排前打乱消除拼接偏差；测试用 random.seed 固定。

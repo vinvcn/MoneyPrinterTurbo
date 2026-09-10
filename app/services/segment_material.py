@@ -29,13 +29,18 @@ MAX_SEARCH_PAGES = 2
 
 def _search_pages() -> int:
     """[material_rerank] max_search_pages；缺失、非法或小于 1 时回落 2。"""
+    raw = config.material_rerank.get("max_search_pages", MAX_SEARCH_PAGES)
     try:
-        search_pages = int(
-            config.material_rerank.get("max_search_pages", MAX_SEARCH_PAGES)
-        )
+        search_pages = int(raw)
     except (TypeError, ValueError):
+        logger.warning(
+            f"invalid max_search_pages, fallback to {MAX_SEARCH_PAGES}: raw={raw!r}"
+        )
         return MAX_SEARCH_PAGES
     if search_pages < 1:
+        logger.warning(
+            f"max_search_pages below 1, fallback to {MAX_SEARCH_PAGES}: raw={raw}"
+        )
         return MAX_SEARCH_PAGES
     return search_pages
 
