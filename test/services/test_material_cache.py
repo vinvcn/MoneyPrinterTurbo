@@ -34,6 +34,7 @@ class TestMaterialSearchCache(unittest.TestCase):
                 "provider": "pixabay",
                 "search_term": "nature",
                 "asset_id": "123",
+                "thumbnail_url": "https://i.vimeocdn.com/video/123456_640x360.jpg",
                 "source_page": "https://pixabay.com/videos/example-123/",
                 "creator": {
                     "id": "456",
@@ -89,6 +90,65 @@ class TestMaterialSearchCache(unittest.TestCase):
         self.assertEqual(
             loaded[0].source_info["creator"]["profile_page"],
             "https://pixabay.com/users/creator-456/",
+        )
+
+    def test_load_backfills_derived_thumbnail_for_legacy_pixabay_entries(self):
+        """8468334 之前写入的 pixabay 缓存条目没有缩略图（当时 API 已不返回
+        picture/picture_id）：加载时按 CDN 约定从下载 URL 推导，保证旧条目
+        同样进入粗排嵌入；已有缩略图或其它 provider 不受影响。"""
+        legacy = MaterialInfo(
+            provider="pixabay",
+            url="https://cdn.pixabay.com/video/2024/07/09/220352_large.mp4",
+            duration=9,
+            source_info={"provider": "pixabay", "asset_id": "220352"},
+        )
+        with_thumb = MaterialInfo(
+            provider="pixabay",
+            url="https://cdn.pixabay.com/video/2020/01/01/1000-1_large.mp4",
+            duration=9,
+            source_info={
+                "provider": "pixabay",
+                "thumbnail_url": "https://i.vimeocdn.com/video/999_640x360.jpg",
+            },
+        )
+        pexels = MaterialInfo(
+            provider="pexels",
+            url="https://videos.pexels.com/video-files/1/1-hd_1080_1920_30fps.mp4",
+            duration=9,
+            source_info={"provider": "pexels"},
+        )
+        saved = material_cache.save_material_search_cache(
+            provider="pixabay",
+            search_term="panda",
+            minimum_duration=5,
+            video_aspect=VideoAspect.landscape,
+            items=[legacy, with_thumb, pexels],
+        )
+        self.assertTrue(saved)
+        loaded = material_cache.load_material_search_cache(
+            provider="pixabay",
+            search_term="panda",
+            minimum_duration=5,
+            video_aspect=VideoAspect.landscape,
+        )
+        assert loaded is not None
+        self.assertEqual(len(loaded), 3)
+        by_url = {item.url: item for item in loaded}
+        self.assertEqual(
+            by_url["https://cdn.pixabay.com/video/2024/07/09/220352_large.mp4"].source_info[
+                "thumbnail_url"
+            ],
+            "https://cdn.pixabay.com/video/2024/07/09/220352_large.jpg",
+        )
+        self.assertEqual(
+            by_url["https://cdn.pixabay.com/video/2020/01/01/1000-1_large.mp4"].source_info[
+                "thumbnail_url"
+            ],
+            "https://i.vimeocdn.com/video/999_640x360.jpg",
+        )
+        self.assertNotIn(
+            "thumbnail_url",
+            by_url["https://videos.pexels.com/video-files/1/1-hd_1080_1920_30fps.mp4"].source_info,
         )
 
     def test_expired_cache_is_removed_and_treated_as_miss(self):

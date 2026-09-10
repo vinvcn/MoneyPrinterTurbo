@@ -294,6 +294,16 @@ def load_material_search_cache(
                 raise ValueError("invalid material fields")
             source_info = dict(source_info)
             source_info["search_term"] = search_term
+            if (
+                item_provider.strip().lower() == "pixabay"
+                and not str(source_info.get("thumbnail_url") or "").strip()
+            ):
+                # 8468334 之前写入的缓存条目没有缩略图（pixabay API 已不再
+                # 返回 picture/picture_id）：按 CDN 约定从下载 URL 推导同帧
+                # JPEG，让旧条目同样进入粗排嵌入。
+                stem = str(item_url or "").rsplit(".", 1)[0]
+                if stem:
+                    source_info["thumbnail_url"] = f"{stem}.jpg"
             items.append(
                 MaterialInfo(
                     provider=item_provider,
