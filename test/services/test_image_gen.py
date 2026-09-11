@@ -257,5 +257,213 @@ class TestMakeSubjectClip(unittest.TestCase):
         self.assertEqual(record["error"], "no_image_source")
 
 
+class TestBackfillFraming(unittest.TestCase):
+    def test_backfill_framings_list_order(self):
+        expected = [
+            "Wide establishing shot",
+            "Close-up shot with shallow depth of field",
+            "Low-angle shot",
+            "Medium shot from behind the subject",
+            "Detail shot emphasizing texture and hands",
+        ]
+        self.assertEqual(image_gen._BACKFILL_FRAMINGS, expected)
+
+    def test_backfill_framing_rotation(self):
+        # slot=0, segment_index=0 -> index 0
+        self.assertEqual(image_gen.backfill_framing(0), "Wide establishing shot")
+        # slot=5, segment_index=1 -> index (5+1)%5=1
+        self.assertEqual(
+            image_gen.backfill_framing(5, 1),
+            "Close-up shot with shallow depth of field",
+        )
+
+    def test_backfill_framing_wraps(self):
+        self.assertEqual(
+            image_gen.backfill_framing(4, 0),
+            "Detail shot emphasizing texture and hands",
+        )
+        self.assertEqual(
+            image_gen.backfill_framing(0, 5),
+            "Wide establishing shot",
+        )
+
+
+class TestMakeSubjectClipFraming(unittest.TestCase):
+    def test_refined_prompt_skips_refine(self):
+        """(a) refined_prompt="X", framing="F" -> refine NOT called,
+        prompt == "F, X", record["framing"]=="F", record["prompt"]=="F, X"."""
+        refine_spy = unittest.mock.MagicMock(return_value="should-not-be-called")
+        with (
+            patch.object(image_gen, "refine_scene_prompt", refine_spy),
+            patch.object(
+                image_gen,
+                "generate_kolors_image",
+                return_value="/materials/gen.png",
+            ),
+            patch.object(
+                image_gen, "still_to_clip", return_value="/materials/gen.mp4"
+            ),
+        ):
+            clip, record = image_gen.make_subject_clip(
+                "seg text",
+                "subject",
+                "9:16",
+                "/materials",
+                refined_prompt="A pre-refined prompt",
+                framing="Close-up shot with shallow depth of field",
+            )
+        self.assertFalse(refine_spy.called, "refine_scene_prompt should NOT be called")
+        self.assertEqual(record["prompt"], "Close-up shot with shallow depth of field, A pre-refined prompt")
+        self.assertEqual(record["framing"], "Close-up shot with shallow depth of field")
+
+    def test_refined_prompt_none_calls_refine(self):
+        """(b) refined_prompt=None -> refine called with (segment_text, subject_term)."""
+        with patch.object(
+            image_gen, "refine_scene_prompt", return_value="refined"
+        ) as mock_refine, patch.object(
+            image_gen,
+            "generate_kolors_image",
+            return_value="/materials/gen.png",
+        ), patch.object(
+            image_gen, "still_to_clip", return_value="/materials/gen.mp4"
+        ):
+            clip, record = image_gen.make_subject_clip(
+                "seg text", "subject", "9:16", "/materials", refined_prompt=None
+            )
+        mock_refine.assert_called_once_with("seg text", "subject")
+        self.assertEqual(record["prompt"], "refined")
+
+    def test_refined_prompt_empty_calls_refine(self):
+        """(c) refined_prompt="" -> refine called (empty string is not pre-refined)."""
+        with patch.object(
+            image_gen, "refine_scene_prompt", return_value="refined"
+        ) as mock_refine, patch.object(
+            image_gen,
+            "generate_kolors_image",
+            return_value="/materials/gen.png",
+        ), patch.object(
+            image_gen, "still_to_clip", return_value="/materials/gen.mp4"
+        ):
+            clip, record = image_gen.make_subject_clip(
+                "seg text", "subject", "9:16", "/materials", refined_prompt=""
+            )
+        mock_refine.assert_called_once()
+        self.assertEqual(record["prompt"], "refined")
+
+    def test_framing_prefixes_prompt(self):
+        """Framing is prepended to the prompt."""
+        with patch.object(
+            image_gen, "refine_scene_prompt", return_value="a scene"
+        ), patch.object(
+            image_gen,
+            "generate_kolors_image",
+            return_value="/materials/gen.png",
+        ), patch.object(
+            image_gen, "still_to_clip", return_value="/materials/gen.mp4"
+        ):
+            _, record = image_gen.make_subject_clip(
+                "seg", "subj", "9:16", "/materials", framing="Low-angle shot"
+            )
+        self.assertEqual(record["framing"], "Low-angle shot")
+        self.assertEqual(record["prompt"], "Low-angle shot, a scene")
+
+    def test_record_has_framing_key(self):
+        """record always contains 'framing' key."""
+        with patch.object(
+            image_gen, "refine_scene_prompt", return_value="x"
+        ), patch.object(
+            image_gen,
+            "generate_kolors_image",
+            return_value="/materials/gen.png",
+        ), patch.object(
+            image_gen, "still_to_clip", return_value="/materials/gen.mp4"
+        ):
+            _, record = image_gen.make_subject_clip(
+                "seg", "subj", "9:16", "/materials"
+            )
+        self.assertIn("framing", record)
+        self.assertEqual(record["framing"], "")
+
+    def test_all_sources_fail_framing_still_set(self):
+        """Failure path: all sources fail -> record["source"]=="failed",
+        record["framing"] still set, returns ("", record)."""
+        with patch.object(
+            image_gen, "refine_scene_prompt", return_value="x"
+        ), patch.object(
+            image_gen, "generate_kolors_image", return_value=""
+        ), patch.object(
+            image_gen, "search_provider_photo", return_value=""
+        ):
+            clip, record = image_gen.make_subject_clip(
+                "seg",
+                "subj",
+                "9:16",
+                "/materials",
+                framing="Wide establishing shot",
+            )
+        self.assertEqual(clip, "")
+        self.assertEqual(record["source"], "failed")
+        self.assertEqual(record["framing"], "Wide establishing shot")
+
+
+class TestStillToClipKey(unittest.TestCase):
+    def _make_image(self, path):
+        import subprocess
+        from app.utils import utils as _utils
+
+        subprocess.run(
+            [
+                _utils.get_ffmpeg_binary(),
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=320x240:d=0.1",
+                "-frames:v",
+                "1",
+                path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+    def test_default_key_same_as_current_naming(self):
+        """(d) default key="" must reproduce the CURRENT naming."""
+        from app.utils import utils as _utils
+
+        img = os.path.join(self._tmp(), "naming_test.png")
+        self._make_image(img)
+        old_name = f"imgclip-{_utils.md5(img)}.mp4"
+        new_name = os.path.basename(
+            image_gen.still_to_clip(img, self._tmp(), duration=0.4)
+        )
+        self.assertEqual(new_name, old_name)
+
+    def test_different_key_produces_different_filename(self):
+        """(d) same image, different (framing, duration) -> distinct clip filenames."""
+        img = os.path.join(self._tmp(), "key_test.png")
+        self._make_image(img)
+        clip1 = image_gen.still_to_clip(img, self._tmp(), duration=0.4, key="Wide:3.0")
+        clip2 = image_gen.still_to_clip(img, self._tmp(), duration=0.4, key="Close-up:5.0")
+        self.assertTrue(clip1)
+        self.assertTrue(clip2)
+        self.assertNotEqual(os.path.basename(clip1), os.path.basename(clip2))
+
+    def test_same_key_produces_same_filename(self):
+        """(d) same image, same (framing, duration) -> same filename."""
+        img = os.path.join(self._tmp(), "key_same_test.png")
+        self._make_image(img)
+        clip1 = image_gen.still_to_clip(img, self._tmp(), duration=0.4, key="Wide:3.0")
+        clip2 = image_gen.still_to_clip(img, self._tmp(), duration=0.4, key="Wide:3.0")
+        self.assertTrue(clip1)
+        self.assertTrue(clip2)
+        self.assertEqual(os.path.basename(clip1), os.path.basename(clip2))
+
+    def _tmp(self):
+        d = os.path.join(os.path.dirname(__file__), "..", "..", "storage", "test-image-gen")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,18 @@ _CLIP_DURATION_SECONDS = 15.5  # segmenter 单段上限 15s + 装配安全余量
 _KOLORS_ATTEMPTS = 3  # 初始 + 重试 2 次（G4 决策）
 _REQUEST_TIMEOUT = (30, 90)
 
+_BACKFILL_FRAMINGS = [
+    "Wide establishing shot",
+    "Close-up shot with shallow depth of field",
+    "Low-angle shot",
+    "Medium shot from behind the subject",
+    "Detail shot emphasizing texture and hands",
+]
+
+
+def backfill_framing(slot: int, segment_index: int = 0) -> str:
+    return _BACKFILL_FRAMINGS[(slot + segment_index) % len(_BACKFILL_FRAMINGS)]
+
 
 def _tls_verify() -> bool:
     # 与 material._get_tls_verify 同语义：默认校验，config.app.tls_verify=false
@@ -282,7 +294,7 @@ def search_provider_photo(query: str, video_aspect: Any, save_dir: str) -> str:
     return ""
 
 
-def still_to_clip(image_path: str, save_dir: str, duration: float = _CLIP_DURATION_SECONDS) -> str:
+def still_to_clip(image_path: str, save_dir: str, duration: float = _CLIP_DURATION_SECONDS, key: str = "") -> str:
     """
     静态图 → 整段时长 mp4（ffmpeg loop）。装配器按段窗口裁切，因此固定
     时长即可，无需向素材层传递段时长。转换失败返回 ""。
@@ -290,9 +302,10 @@ def still_to_clip(image_path: str, save_dir: str, duration: float = _CLIP_DURATI
     if not image_path or not os.path.exists(image_path):
         return ""
     os.makedirs(save_dir, exist_ok=True)
+    md5_input = image_path if not key else f"{image_path}:{key}"
     clip_path = os.path.join(
         save_dir,
-        f"imgclip-{utils.md5(image_path)}.mp4",
+        f"imgclip-{utils.md5(md5_input)}.mp4",
     )
     command = [
         utils.get_ffmpeg_binary(),
@@ -335,6 +348,8 @@ def make_subject_clip(
     video_aspect: Any,
     save_dir: str,
     duration: float | None = None,
+    refined_prompt: str | None = None,
+    framing: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """
     subject 层图片 clip 获取的编排入口（由 task.py 注入为
@@ -356,9 +371,15 @@ def make_subject_clip(
         "clip": "",
         "attempts": 0,
         "error": "",
+        "framing": framing,
     }
 
-    prompt = refine_scene_prompt(segment_text, subject_term)
+    if refined_prompt:
+        prompt = refined_prompt
+    else:
+        prompt = refine_scene_prompt(segment_text, subject_term)
+    if framing:
+        prompt = f"{framing}, {prompt}"
     record["prompt"] = prompt
     if not prompt:
         record["error"] = "empty_prompt"
@@ -393,6 +414,7 @@ def make_subject_clip(
         image_path,
         save_dir,
         duration=_CLIP_DURATION_SECONDS if duration is None else float(duration),
+        key=f"{framing}:{duration}",
     )
     record["clip"] = os.path.basename(clip_path) if clip_path else ""
     if not clip_path:
