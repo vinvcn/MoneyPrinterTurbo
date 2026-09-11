@@ -964,6 +964,7 @@ def _combine_videos_segment_first(
         # 计划有效性：某个窗口因素材源提前耗尽而短放时，计划窗口与实际
         # 剩余时长不再对齐，此后退回旧的"按剩余时长切满窗"自适应循环。
         plan_intact = True
+        hole_slots = set(segment.get("holes") or [])
         while segment_remaining > _SEGMENT_FILL_TOLERANCE:
             if plan_index < len(windows) and plan_intact:
                 window_seconds = windows[plan_index]
@@ -972,6 +973,31 @@ def _combine_videos_segment_first(
                 # 取剩余输出时长，兜底但不再超配。
                 window_seconds = min(max_clip_duration, segment_remaining)
             plan_index += 1
+            # Metis B3: explicit backfill holes → black placeholder of the
+            # full planned window_seconds.  The hole does NOT consume a source
+            # clip, does NOT touch window_offset / plan_intact, and the
+            # source_file_path="" bypasses used_clip_paths dedupe.
+            if (plan_index - 1) in hole_slots:
+                hole_file = (
+                    f"{output_dir}/temp-clip-{clip_sequence + 1}.mp4"
+                )
+                hole_clip = ColorClip(
+                    size=(video_width, video_height), color=(0, 0, 0)
+                ).with_duration(window_seconds)
+                hole_clip.write_videofile(hole_file, fps=fps, logger=None)
+                close_clip(hole_clip)
+                processed_clips.append(
+                    SubClippedVideoClip(
+                        file_path=hole_file,
+                        duration=window_seconds,
+                        width=video_width,
+                        height=video_height,
+                        source_file_path="",
+                    )
+                )
+                clip_sequence += 1
+                segment_remaining -= window_seconds
+                continue
             video_path = next(clip_cycle)
             start_offset = (
                 window_offset.get(video_path, 0.0) if advance_clip_window else 0.0

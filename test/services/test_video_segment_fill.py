@@ -124,3 +124,117 @@ def test_speed_scaled_windows_fill_segment_duration(tmp_path):
     with VideoFileClip(str(combined)) as clip:
         combined_duration = clip.duration
     assert combined_duration == pytest.approx(2.0, abs=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Backfill hole tests (Metis B3)
+# ---------------------------------------------------------------------------
+
+
+def test_holes_produce_black_placeholder_for_plan_slot(tmp_path):
+    """(a) Segment with clips=[A,B], plan [3,3,3], holes=[1] → slot 1 is a
+    3.0s black placeholder; slots 0/2 cut from A/B (source NOT consumed by hole);
+    sum of placed durations == segment_duration ± _SEGMENT_FILL_TOLERANCE.
+    Per-window black clips skip _normalize_segment_clip/transitions exactly like
+    the existing whole-segment placeholder (Metis D — pinned).
+    """
+    segment_duration = 9.0
+    source_a = _write_source_clip(tmp_path / "src_a.mp4", 6.0)
+    source_b = _write_source_clip(tmp_path / "src_b.mp4", 6.0)
+    audio_file = _write_silent_wav(tmp_path / "narration.wav", 20.0)
+    segment = {
+        "index": 0,
+        "duration": segment_duration,
+        "clips": [source_a, source_b],
+        "holes": [1],
+    }
+    combined = tmp_path / "combined.mp4"
+    _combine_videos_segment_first(
+        combined_video_path=str(combined),
+        segments=[segment],
+        audio_file=audio_file,
+        video_aspect=VideoAspect.portrait,
+        video_transition_mode=None,
+        max_clip_duration=3.0,
+        threads=2,
+        clip_speed=1.0,
+        advance_clip_window=True,
+        dedupe_clips_across_segments=True,
+    )
+    durations = _temp_clip_durations(tmp_path)
+    assert len(durations) == 3
+    # Slot 1 is a black placeholder of exactly the planned window_seconds (3.0).
+    assert durations[1] == pytest.approx(3.0, abs=0.05)
+    # Sum of placed durations matches segment_duration.
+    assert sum(durations) == pytest.approx(segment_duration, abs=0.05)
+    with VideoFileClip(str(combined)) as clip:
+        assert clip.duration == pytest.approx(segment_duration, abs=0.1)
+    # source_file_path="" for the hole → bypasses used_clip_paths dedupe.
+    for idx in [0, 2]:
+        clip_file = tmp_path / f"temp-clip-{idx + 1}.mp4"
+        with VideoFileClip(str(clip_file)) as c:
+            assert c.duration > 0
+
+
+def test_empty_holes_produces_no_black_clips(tmp_path):
+    """(b) holes=[] → placements byte-identical to current behavior (existing
+    tests keep passing unchanged); no black placeholders injected.
+    """
+    source = _write_source_clip(tmp_path / "src.mp4", 6.0)
+    audio_file = _write_silent_wav(tmp_path / "narration.wav", 20.0)
+    segment = {
+        "index": 0,
+        "duration": 2.5,
+        "clips": [source],
+        "holes": [],
+    }
+    combined = tmp_path / "combined.mp4"
+    _combine_videos_segment_first(
+        combined_video_path=str(combined),
+        segments=[segment],
+        audio_file=audio_file,
+        video_aspect=VideoAspect.portrait,
+        video_transition_mode=None,
+        max_clip_duration=1.0,
+        threads=2,
+        clip_speed=1.0,
+        advance_clip_window=True,
+        dedupe_clips_across_segments=True,
+    )
+    durations = _temp_clip_durations(tmp_path)
+    expected = segment_window_plan(2.5, 1.0)
+    assert len(durations) == len(expected)
+    assert sum(durations) == pytest.approx(2.5, abs=0.05)
+
+
+def test_out_of_range_holes_ignored_safely(tmp_path):
+    """(c) holes referencing out-of-range plan indices → ignored safely (no
+    crash), placements as if no holes.
+    """
+    source = _write_source_clip(tmp_path / "src.mp4", 6.0)
+    audio_file = _write_silent_wav(tmp_path / "narration.wav", 20.0)
+    segment = {
+        "index": 0,
+        "duration": 2.5,
+        "clips": [source],
+        "holes": [99, -1],
+    }
+    combined = tmp_path / "combined.mp4"
+    _combine_videos_segment_first(
+        combined_video_path=str(combined),
+        segments=[segment],
+        audio_file=audio_file,
+        video_aspect=VideoAspect.portrait,
+        video_transition_mode=None,
+        max_clip_duration=1.0,
+        threads=2,
+        clip_speed=1.0,
+        advance_clip_window=True,
+        dedupe_clips_across_segments=True,
+    )
+    durations = _temp_clip_durations(tmp_path)
+    expected = segment_window_plan(2.5, 1.0)
+    assert len(durations) == len(expected)
+    assert sum(durations) == pytest.approx(2.5, abs=0.05)
+    with VideoFileClip(str(combined)) as clip:
+        assert clip.duration == pytest.approx(2.5, abs=0.1)
