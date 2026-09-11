@@ -2,6 +2,8 @@ import json
 import math
 import random
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.config import config
 from app.models.schema import MaterialInfo
-from app.services import image_embedding, video_match
+from app.services import image_embedding, image_gen, video_match
 from app.services.image_embedding import EmbeddingGate
 from app.services.video_match import SegmentQueries, generate_segment_queries
 
@@ -556,12 +558,15 @@ class TestMatchSegments(unittest.TestCase):
         generate_image=None,
         gate: bool = False,
         embed_text_fails: bool = False,
+        refine_result: str = "a refined cinematic scene prompt",
     ) -> SimpleNamespace:
         """以确定性桩运行 match_segments，返回全部调用记录与结果。"""
         searched: list[tuple[str, int]] = []
         saved_urls: list[str] = []
         judge_calls: list[tuple[str, str]] = []
-        image_calls: list[tuple[dict, float]] = []
+        image_lock = threading.Lock()
+        image_calls: list[tuple[dict, float, str, str]] = []
+        refine_calls: list[tuple[str, str]] = []
         rerank_calls: list[tuple[str, list[str]]] = []
         captured: dict = {}
         llm_queue = list(llm_payloads)
@@ -592,11 +597,18 @@ class TestMatchSegments(unittest.TestCase):
                 return list(items)
             return rerank(query, items)
 
-        def fake_image(segment, duration):
-            image_calls.append((segment, duration))
+        def fake_refine(segment_text, subject_term=""):
+            refine_calls.append((segment_text, subject_term))
+            return refine_result
+
+        def fake_image(segment, duration, refined_prompt, framing):
+            # 并发安全（回填走线程池）：计数在锁内；clip 名由 framing 派生
+            # 而非调用序（并发下调用序不确定，slot 序断言靠 framing 映射）。
+            with image_lock:
+                image_calls.append((segment, duration, refined_prompt, framing))
             return (
-                f"/saved/gen-{segment.get('index', 0)}.mp4",
-                {"model": "Kwai-Kolors/Kolors", "source": "kolors"},
+                f"/saved/gen-{framing.split()[0].lower()}.mp4",
+                {"model": "Kwai-Kolors/Kolors", "source": "kolors", "framing": framing},
             )
 
         def fake_download_thumbnail(url):
@@ -653,6 +665,11 @@ class TestMatchSegments(unittest.TestCase):
             patch.object(
                 video_match.material_rerank, "rerank_candidates", fake_rerank
             ),
+            patch.object(
+                video_match.image_gen,
+                "refine_scene_prompt",
+                side_effect=fake_refine,
+            ),
             patch.object(video_match, "logger") as mock_logger,
         ):
             results = video_match.match_segments(
@@ -673,6 +690,7 @@ class TestMatchSegments(unittest.TestCase):
             saved=saved_urls,
             judge_calls=judge_calls,
             image_calls=image_calls,
+            refine_calls=refine_calls,
             rerank_calls=rerank_calls,
             captured=captured,
             gate=gate_obj,
@@ -769,9 +787,150 @@ class TestMatchSegments(unittest.TestCase):
         )
         self.assertEqual(len(result.vlm_filter), 5)
 
-    def test_partial_fill_backfills_remaining_windows(self):
-        """部分命中：image-gen 回填一次覆盖未填充尾部窗口，时长 = 尾窗和；
-        SegmentMaterials 同时反映视频 clip 与生成 clip 的来源。"""
+    def test_backfill_generates_one_clip_per_remaining_window(self):
+        """(a)(b)(d)(k) 全走查拒绝：每个剩余计划窗口独立一次 generate_image，
+        per-slot 时长 == 窗口时长，refined_prompt 全窗口共享一份（refine 恰好
+        一次），景别按 slot 轮转，clips 按 slot 序追加，holes 为空，汇总行
+        clips=5/5 照常落日志。"""
+        pages = {
+            ("panda one", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
+                for i in range(2)
+            ],
+        }
+        vectors = {f"img-{i}": _vec_with_cos(0.9 - 0.1 * i) for i in range(2)}
+        segment = {"index": 0, "text": "panda", "duration": 12.816}
+        random.seed(20260909)
+        run = self._run(
+            segments=[segment],
+            llm_payloads=[self._queries_json(["panda one"])],
+            pages_by_term=pages,
+            judge="irrelevant",
+            vectors=vectors,
+        )
+
+        result = run.results[0]
+        # D=12.816/W=3 → 窗口 [3,3,3,3,0.816]，配额 5；视频全军覆没 → 5 窗全回填。
+        self.assertEqual(len(run.image_calls), 5)
+        windows = [3.0, 3.0, 3.0, 3.0, 0.816]
+        self.assertEqual(
+            sorted(round(d, 6) for _, d, _, _ in run.image_calls),
+            sorted(windows),
+        )
+        # refined_prompt 恰好一份共享（同串对象语义：全部相等且非空）。
+        refined_prompts = {p for _, _, p, _ in run.image_calls}
+        self.assertEqual(refined_prompts, {"a refined cinematic scene prompt"})
+        # 景别按 slot 轮转（segment_index=0 不错位）。
+        framings = [f for _, _, _, f in run.image_calls]
+        self.assertEqual(
+            sorted(framings), sorted(image_gen._BACKFILL_FRAMINGS[:5])
+        )
+        # clips 按 slot 序追加（桩的 clip 名由 framing 派生，slot ↔ framing
+        # 一一对应：slot i → framings[i]）。
+        self.assertEqual(
+            result.clips,
+            [
+                f"/saved/gen-{image_gen._BACKFILL_FRAMINGS[i].split()[0].lower()}.mp4"
+                for i in range(5)
+            ],
+        )
+        self.assertEqual(result.holes, [])
+        self.assertEqual(len(result.image_gen), 5)
+        self.assertEqual(
+            result.clip_sources[-1],
+            {"url": "", "local_file": "gen-detail.mp4"},
+        )
+        # refine 每段恰好一次，用 video_match 本地的 subject（英文归一词）。
+        self.assertEqual(run.refine_calls, [("panda", "panda")])
+        # 审计行：回填总行 + 逐窗口 engaged 行 + 汇总行。
+        info = self._info_messages(run)
+        self.assertTrue(
+            any(
+                "video match: image-gen backfill windows=5 refine=once" in m
+                for m in info
+            )
+        )
+        engaged = [m for m in info if "image-gen fallback engaged" in m]
+        self.assertEqual(len(engaged), 5)
+        self.assertIn("slot=0", engaged[0])
+        self.assertIn(f"framing={image_gen._BACKFILL_FRAMINGS[0]!r}", engaged[0])
+        self.assertTrue(
+            any("material resolution summary: clips=5/5" in m for m in info)
+        )
+
+    def test_backfill_mixed_case_extra_slots_use_last_window_duration(self):
+        """(h) 混合情形（0 < 命中 < 窗口数 < 配额）：windows=[3,1]、1 个视频
+        命中、配额 3 → 2 个回填 slot，时长 [1.0, 1.0]（尾窗 + 最后一窗兜底）。"""
+        pages = {
+            ("panda one", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
+                for i in range(2)
+            ],
+        }
+        vectors = {f"img-{i}": _vec_with_cos(0.9 - 0.1 * i) for i in range(2)}
+
+        def judge(item, segment_text, search_term):
+            if item.url.endswith("u1.mp4"):
+                return _verdict_record("irrelevant")
+            return _verdict_record("relevant")
+
+        random.seed(20260909)
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 4.0}],
+            llm_payloads=[self._queries_json(["panda one"])],
+            pages_by_term=pages,
+            judge=judge,
+            vectors=vectors,
+        )
+
+        result = run.results[0]
+        # D=4/W=3 → windows [3,1]，命中 1（u1 判 irrelevant），配额 3 →
+        # remaining=2，tail=[1.0] → slots [1.0, 1.0]。
+        self.assertEqual(sorted(d for _, d, _, _ in run.image_calls), [1.0, 1.0])
+        self.assertEqual(
+            result.clips,
+            ["/saved/u0.mp4", "/saved/gen-wide.mp4", "/saved/gen-close-up.mp4"],
+        )
+        self.assertEqual(result.holes, [])
+        self.assertTrue(
+            any("image-gen backfill windows=2 refine=once" in m for m in self._info_messages(run))
+        )
+
+    def test_backfill_parallelism_capped_at_three(self):
+        """(c) 5 个回填 slot 走 max_workers=3 线程池：线程安全计数器观测到的
+        峰值并发 ≤ 3，且 ≥ 2（确实并行而非串行）。"""
+        lock = threading.Lock()
+        state = {"active": 0, "max_active": 0, "calls": 0}
+
+        def slow_image(segment, duration, refined_prompt, framing):
+            with lock:
+                state["active"] += 1
+                state["calls"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+            time.sleep(0.05)
+            with lock:
+                state["active"] -= 1
+            return (
+                f"/saved/gen-{framing.split()[0].lower()}.mp4",
+                {"source": "kolors", "framing": framing},
+            )
+
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 12.816}],
+            llm_payloads=[self._queries_json(["panda one"])],
+            pages_by_term={},
+            judge=None,
+            generate_image=slow_image,
+        )
+
+        self.assertEqual(state["calls"], 5)
+        self.assertLessEqual(state["max_active"], 3)
+        self.assertGreaterEqual(state["max_active"], 2)
+        self.assertEqual(len(run.results[0].clips), 5)
+
+    def test_refine_once_per_segment_and_never_when_quota_filled(self):
+        """(d) refine 每段至多一次；配额被视频素材拿满（remaining==0）时
+        零 refine、零 generate_image。"""
         pages = {
             ("panda one", 1): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
@@ -779,44 +938,114 @@ class TestMatchSegments(unittest.TestCase):
             ],
         }
         vectors = {f"img-{i}": _vec_with_cos(0.9 - 0.1 * i) for i in range(4)}
-
-        def judge(item, segment_text, search_term):
-            if item.url.endswith(("u2.mp4", "u3.mp4")):
-                return _verdict_record("irrelevant")
-            return _verdict_record("relevant")
-
-        segment = {"index": 0, "text": "panda", "duration": 12.816}
-        # 钉死 2 页：夹具按 2 页翻页语义构造，live config 改值不翻转。
         random.seed(20260909)
-        with patch.dict(config.material_rerank, {"max_search_pages": 2}):
-            run = self._run(
-                segments=[segment],
-                llm_payloads=[self._queries_json(["panda one"])],
-                pages_by_term=pages,
-                judge=judge,
-                vectors=vectors,
+        filled = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 3.744}],
+            llm_payloads=[self._queries_json(["panda one"])],
+            pages_by_term=pages,
+            judge="relevant",
+            vectors=vectors,
+        )
+        # D=3.744 → 单窗，配额 3：3 个视频命中拿满 → 不进回填分支。
+        self.assertEqual(filled.results[0].clips, [f"/saved/u{i}.mp4" for i in range(3)])
+        self.assertEqual(filled.image_calls, [])
+        self.assertEqual(filled.refine_calls, [])
+
+        backfilled = self._run(
+            segments=[
+                {"index": 0, "text": "panda", "duration": 3.744},
+                {"index": 1, "text": "second", "duration": 3.744},
+            ],
+            llm_payloads=[
+                self._queries_json(["panda one"]),
+                self._queries_json(["panda one"]),
+            ],
+            pages_by_term={},
+            judge=None,
+        )
+        # 两段各自整段回填：每段恰好一次 refine（共 2 次），每次带本段旁白。
+        self.assertEqual(len(backfilled.image_calls), 6)
+        self.assertEqual(len(backfilled.refine_calls), 2)
+        self.assertEqual(
+            [text for text, _term in backfilled.refine_calls], ["panda", "second"]
+        )
+
+    def test_backfill_failure_tail_slot_records_hole(self):
+        """(e) 尾部 slot 生成抛异常：该计划窗口记入 holes（= 已填窗口数 +
+        slot），其余窗口 clip 完好；失败只隔离在本段，后续 segment 照常
+        全量回填成功。"""
+        pages = {}
+        boom_framing = image_gen._BACKFILL_FRAMINGS[2]
+
+        def exploding_image(segment, duration, refined_prompt, framing):
+            if segment.get("index") == 0 and framing == boom_framing:
+                raise RuntimeError("kolors exploded")
+            return (
+                f"/saved/gen-{framing.split()[0].lower()}.mp4",
+                {"source": "kolors", "framing": framing},
             )
 
+        run = self._run(
+            segments=[
+                {"index": 0, "text": "panda", "duration": 12.816},
+                {"index": 1, "text": "second", "duration": 12.816},
+            ],
+            llm_payloads=[
+                self._queries_json(["panda one"]),
+                self._queries_json(["panda one"]),
+            ],
+            pages_by_term=pages,
+            judge=None,
+            generate_image=exploding_image,
+        )
+
         result = run.results[0]
-        # 配额 5，视频命中 2（u2/u3 判 irrelevant），尾部窗口 [3,3,0.816]。
-        self.assertEqual(len(run.judge_calls), 4)
-        self.assertEqual(len(run.image_calls), 1)
-        segment_arg, duration_arg = run.image_calls[0]
-        self.assertEqual(segment_arg, segment)
-        self.assertAlmostEqual(duration_arg, 6.816, places=6)
+        # 5 窗全回填（已填 0），slot 2 失败 → hole 计划窗口 2；其余 4 个 clip。
+        self.assertEqual(result.holes, [2])
         self.assertEqual(
-            result.clips, ["/saved/u0.mp4", "/saved/u1.mp4", "/saved/gen-0.mp4"]
+            result.clips,
+            [
+                f"/saved/gen-{image_gen._BACKFILL_FRAMINGS[i].split()[0].lower()}.mp4"
+                for i in (0, 1, 3, 4)
+            ],
         )
-        self.assertEqual(
-            result.clip_sources[-1], {"url": "", "local_file": "gen-0.mp4"}
+        # 后续 segment 不受前段失败影响：5 窗全部成功，零 hole。
+        self.assertEqual(run.results[1].holes, [])
+        self.assertEqual(len(run.results[1].clips), 5)
+        self.assertTrue(
+            any(
+                "image-gen backfill failed: slot=2 error=RuntimeError: kolors exploded"
+                in m
+                for m in self._warning_messages(run)
+            )
         )
-        self.assertEqual(result.image_gen, [{"model": "Kwai-Kolors/Kolors", "source": "kolors"}])
-        self.assertEqual(result.resolved_term, "panda one")
-        self.assertEqual(result.fallback_level, "self")
-        self.assertEqual(len(result.vlm_filter), 4)
+        self.assertTrue(
+            any("material resolution summary: clips=4/5" in m for m in self._info_messages(run))
+        )
+
+    def test_refine_empty_marks_all_tail_windows_as_holes(self):
+        """(f) refine 返回空串：全部尾部计划窗口记 holes，零 generate_image、
+        零 clip 追加，流水线继续完成（fail-open）。"""
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 12.816}],
+            llm_payloads=[self._queries_json(["panda one"])],
+            pages_by_term={},
+            judge=None,
+            refine_result="",
+        )
+
+        result = run.results[0]
+        self.assertEqual(run.image_calls, [])
+        self.assertEqual(run.refine_calls, [("panda", "panda")])
+        self.assertEqual(result.holes, [0, 1, 2, 3, 4])
+        self.assertEqual(result.clips, [])
+        self.assertTrue(
+            any("material resolution summary: clips=0/5" in m for m in self._info_messages(run))
+        )
 
     def test_vlm_disabled_skips_search_and_backfills_whole_segment(self):
-        """VLM 关闭（judge=None）：零搜索、零下载，整段 image-gen（强制立场）。"""
+        """(g) VLM 关闭（judge=None）：零搜索、零下载，配额 = needed_clips
+        个回填调用逐窗口覆盖全部计划窗口。"""
         pages = {
             ("panda one", 1): [
                 _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
@@ -834,12 +1063,14 @@ class TestMatchSegments(unittest.TestCase):
         self.assertEqual(run.searched, [])
         self.assertEqual(run.saved, [])
         self.assertEqual(run.judge_calls, [])
-        # 整段回填：时长 = 全部窗口之和 ≈ 段时长。
-        self.assertEqual(len(run.image_calls), 1)
-        segment_arg, duration_arg = run.image_calls[0]
-        self.assertEqual(segment_arg["index"], 0)
-        self.assertAlmostEqual(duration_arg, 12.816, places=3)
-        self.assertEqual(result.clips, ["/saved/gen-0.mp4"])
+        # 配额 5 = needed_clips：5 次调用逐窗覆盖（时长多重集 == 窗口计划）。
+        self.assertEqual(len(run.image_calls), 5)
+        self.assertEqual(
+            sorted(round(d, 6) for _, d, _, _ in run.image_calls),
+            sorted([3.0, 3.0, 3.0, 3.0, 0.816]),
+        )
+        self.assertEqual(result.holes, [])
+        self.assertEqual(len(result.clips), 5)
         self.assertEqual(result.fallback_level, "subject")
         self.assertEqual(result.resolved_term, "panda")
         self.assertEqual(result.search_attempts, [])
@@ -849,6 +1080,89 @@ class TestMatchSegments(unittest.TestCase):
                 for m in self._info_messages(run)
             )
         )
+
+    def test_backfill_failed_extra_slot_records_no_hole(self):
+        """(i) 多样性名额 slot（slot ≥ len(tail)，超出计划窗口）失败：不记
+        hole，其余 clip 完好，流水线照常完成。"""
+        boom_framing = image_gen._BACKFILL_FRAMINGS[1]
+
+        def exploding_image(segment, duration, refined_prompt, framing):
+            if framing == boom_framing:
+                raise RuntimeError("extra slot exploded")
+            return (
+                f"/saved/gen-{framing.split()[0].lower()}.mp4",
+                {"source": "kolors", "framing": framing},
+            )
+
+        pages = {
+            ("panda one", 1): [
+                _video_item(f"https://v.example/u{i}.mp4", "panda one", f"img-{i}")
+                for i in range(2)
+            ],
+        }
+        vectors = {f"img-{i}": _vec_with_cos(0.9 - 0.1 * i) for i in range(2)}
+
+        def judge(item, segment_text, search_term):
+            if item.url.endswith("u1.mp4"):
+                return _verdict_record("irrelevant")
+            return _verdict_record("relevant")
+
+        random.seed(20260909)
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 4.0}],
+            llm_payloads=[self._queries_json(["panda one"])],
+            pages_by_term=pages,
+            judge=judge,
+            vectors=vectors,
+            generate_image=exploding_image,
+        )
+
+        result = run.results[0]
+        # windows=[3,1]、命中 1 → tail=[1.0] 长 1，slot 1 是名额多余部分；
+        # slot 1 失败 → 不对应任何计划窗口 → holes 为空。
+        self.assertEqual(result.holes, [])
+        self.assertEqual(result.clips, ["/saved/u0.mp4", "/saved/gen-wide.mp4"])
+        self.assertTrue(
+            any(
+                "image-gen backfill failed: slot=1 error=RuntimeError: extra slot exploded"
+                in m
+                for m in self._warning_messages(run)
+            )
+        )
+        self.assertTrue(
+            any("material resolution summary: clips=2/3" in m for m in self._info_messages(run))
+        )
+
+    def test_backfill_empty_tail_uses_last_window_duration(self):
+        """(j) 空尾（视频拿满全部窗口、名额仍差）：剩余调用全部用最后一窗
+        时长，holes 为空。"""
+        # D=3.744 → 单窗 [3.744]，配额 3：仅 1 个候选 → 命中 1、remaining=2、
+        # tail=[] → 2 个 slot 全部 3.744。
+        pages = {
+            ("panda one", 1): [
+                _video_item("https://v.example/u0.mp4", "panda one", "img-0"),
+            ],
+        }
+        vectors = {"img-0": _vec_with_cos(0.9)}
+        random.seed(20260909)
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 3.744}],
+            llm_payloads=[self._queries_json(["panda one"])],
+            pages_by_term=pages,
+            judge="relevant",
+            vectors=vectors,
+        )
+
+        result = run.results[0]
+        self.assertEqual(len(run.image_calls), 2)
+        self.assertEqual(
+            [d for _, d, _, _ in run.image_calls], [3.744, 3.744]
+        )
+        self.assertEqual(
+            result.clips,
+            ["/saved/u0.mp4", "/saved/gen-wide.mp4", "/saved/gen-close-up.mp4"],
+        )
+        self.assertEqual(result.holes, [])
 
     def test_coarse_failure_flows_interleave_pool_to_fine(self):
         """粗排查询向量不可得：fail-open 返回 interleave pool[:30]，精排
@@ -1213,7 +1527,7 @@ class TestMatchSegments(unittest.TestCase):
 
     def test_empty_pool_and_failed_queries_backfill_whole_segment(self):
         """畸形输入：LLM 查询包全失败 + 搜索空手 → 主题词兜底搜索、空池
-        直接整段回填，流水线不崩、不阻塞。"""
+        直接整段回填（每窗一调用），流水线不崩、不阻塞。"""
         run = self._run(
             segments=[{"index": 0, "text": "panda", "duration": 3.744}],
             llm_payloads=["total garbage", "still garbage"],
@@ -1225,9 +1539,20 @@ class TestMatchSegments(unittest.TestCase):
         # 词条为空 → 主题词兜底；第 1 页即空 → 不翻第 2 页。
         self.assertEqual(run.searched, [("panda", 1)])
         self.assertEqual(run.judge_calls, [])
-        self.assertEqual(len(run.image_calls), 1)
-        self.assertAlmostEqual(run.image_calls[0][1], 3.744, places=3)
-        self.assertEqual(result.clips, ["/saved/gen-0.mp4"])
+        # D=3.744 → 单窗 [3.744]，配额 3，已填 0 → 3 个 slot 全部 3.744。
+        self.assertEqual(len(run.image_calls), 3)
+        self.assertEqual(
+            [d for _, d, _, _ in run.image_calls], [3.744, 3.744, 3.744]
+        )
+        self.assertEqual(
+            result.clips,
+            [
+                "/saved/gen-wide.mp4",
+                "/saved/gen-close-up.mp4",
+                "/saved/gen-low-angle.mp4",
+            ],
+        )
+        self.assertEqual(result.holes, [])
         self.assertEqual(result.fallback_level, "subject")
         self.assertEqual(
             result.search_attempts,

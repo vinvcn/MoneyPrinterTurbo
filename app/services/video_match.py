@@ -16,6 +16,7 @@ llm.generate_response 调用同时产出三类查询；响应无法解析出 JSO
 import json
 import random
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -25,6 +26,7 @@ from loguru import logger
 from app.config import config
 from app.models.schema import MaterialInfo
 from app.services import image_embedding
+from app.services import image_gen
 from app.services import llm
 from app.services import material_rerank
 from app.services.segment_material import (
@@ -43,6 +45,10 @@ _MAX_RETRIES = 2
 
 # 每段最多提炼的搜索词数量；第一个词为主搜索词，其余为备用词。
 _MAX_TERMS = 3
+
+# image-gen 回填的并行上限：每个剩余窗口独立生成一次，线程池同时最多
+# 3 个在途生成（Kolors + ffmpeg 落盘，单次可达分钟级）。
+_BACKFILL_CONCURRENCY = 3
 
 
 @dataclass
@@ -437,12 +443,16 @@ def match_segments(
             注入 vector_cache 即可，本函数取回同一 dict 供粗排预热，
             同一 URL 全链路只嵌入一次（plan finding G）。
         generate_image: image-gen 回填回调，契约
-            generate_image(segment, duration) -> (clip_path, audit_record)。
+            generate_image(segment, duration, refined_prompt, framing)
+            -> (clip_path, audit_record)。
             segment 是完整片段 dict（接线层自行取旁白原文与主题词），
-            duration 是待回填窗口的时长和（秒）——image_gen.make_subject_clip
-            已支持 duration 覆盖参数，接线层用 partial/lambda 绑定
-            video_aspect 与 save_dir 后注入。名额未满时调用一次，覆盖
-            全部剩余窗口；回调缺失或失败时段保持视频短缺，不阻塞。
+            duration 是该回填窗口的时长（秒），refined_prompt 是每段一次
+            LLM 精炼的画面 prompt（本模块经 image_gen.refine_scene_prompt
+            生成，同段全部窗口共享同一份），framing 是本窗口的景别模板
+            （image_gen.backfill_framing 按窗口序号轮转）。每个未填充窗口
+            各调用一次（≤ _BACKFILL_CONCURRENCY 并发，slot 序收集结果）；
+            回调缺失或单窗口失败时该窗口记入 holes（尾部计划窗口，装配层
+            黑场占位），绝不阻塞流水线。
 
     Returns:
         与输入等长的 SegmentMaterials 列表（字段与旧实现一致）。
@@ -767,44 +777,90 @@ def match_segments(
                 for term in terms
             ]
 
-        # 6. image-gen 回填：未满名额的窗口尾部交给生成概念图（VLM 关闭
-        #    时整段回填走同一分支）。单次调用覆盖全部剩余窗口；回填时长
-        #    = 未填充尾部窗口的时长和（多样性下限超出窗口数的短段按最后
-        #    一窗兜底，避免 0 时长 clip）。
+        # 6. image-gen 回填：未满名额的每个计划窗口独立生成一次（VLM 关闭
+        #    时整段回填走同一分支）。prompt 每段只精炼一次，景别按窗口序号
+        #    轮转，≤3 并发，结果按 slot 序追加；多样性名额超出窗口数的部分
+        #    按最后一窗时长兜底（避免 0 时长 clip）。失败窗口（仅尾部计划
+        #    窗口）记入 holes，由装配层黑场占位；绝不阻塞流水线。
         remaining = needed_clips - len(clips)
+        holes: list[int] = []
         if remaining > 0 and generate_image is not None:
-            tail = windows[len(clips):] or windows[-1:]
-            backfill_duration = sum(tail) if tail else float(clip_duration or 0.0)
+            filled = len(clips)
+            tail = windows[filled:]
+            last_window = windows[-1] if windows else float(clip_duration or 0.0)
+            slot_durations = list(tail) + [last_window] * max(
+                0, remaining - len(tail)
+            )
             logger.info(
                 f"segment {segment_index}: video match: image-gen backfill "
-                f"windows={len(tail)} duration={backfill_duration:.3f}"
+                f"windows={len(slot_durations)} refine=once"
             )
-            image_clip = ""
-            image_record: dict | None = None
-            try:
-                image_clip, image_record = generate_image(segment, backfill_duration)
-            except Exception as exc:
-                logger.warning(
-                    "video match: image-gen backfill failed: "
-                    f"segment={segment_index}, "
-                    f"error={type(exc).__name__}, detail={exc}"
-                )
-            if image_clip:
-                clips.append(image_clip)
-                clip_sources.append(
-                    {"url": "", "local_file": Path(image_clip).name}
-                )
-                if not resolved_term:
-                    resolved_term = subject
-                    fallback_level = "subject"
-                # 审计缺口 G4（适配）：回填 clip 成功时标明该段画面（部分）
-                # 来自生成概念图；只记文件名，不记 prompt/图像内容。
-                logger.info(
-                    f"segment {segment_index}: "
-                    f"image-gen fallback engaged: clip={Path(image_clip).name}"
-                )
-            if image_record:
-                image_gen_records.append(image_record)
+            refined = image_gen.refine_scene_prompt(segment_text, subject)
+            if refined == "":
+                # 精炼空手：尾部计划窗口全部黑场占位，不生成、不追加 clip。
+                holes = [filled + i for i in range(len(tail))]
+            else:
+                results_by_slot: dict[int, tuple[str, str, dict]] = {}
+                with ThreadPoolExecutor(max_workers=_BACKFILL_CONCURRENCY) as pool:
+                    futures = {
+                        pool.submit(
+                            generate_image,
+                            segment,
+                            slot_durations[slot],
+                            refined,
+                            image_gen.backfill_framing(slot, int(segment_index)),
+                        ): slot
+                        for slot in range(len(slot_durations))
+                    }
+                    for future in as_completed(futures):
+                        slot = futures[future]
+                        try:
+                            clip_path, record = future.result()
+                        except Exception as exc:
+                            logger.warning(
+                                f"segment {segment_index}: image-gen backfill "
+                                f"failed: slot={slot} "
+                                f"error={type(exc).__name__}: {exc}"
+                            )
+                            continue
+                        if clip_path:
+                            results_by_slot[slot] = (
+                                image_gen.backfill_framing(
+                                    slot, int(segment_index)
+                                ),
+                                clip_path,
+                                record,
+                            )
+                        else:
+                            logger.warning(
+                                f"segment {segment_index}: image-gen backfill "
+                                f"failed: slot={slot} error=empty_clip: "
+                                f"{record.get('error', 'no clip returned')}"
+                            )
+
+                for slot in range(len(slot_durations)):
+                    if slot not in results_by_slot:
+                        # 失败/空手：仅尾部计划窗口记 hole（多样性名额超出
+                        # 窗口数的部分不对应任何计划窗口，黑场无从谈起）。
+                        if slot < len(tail):
+                            holes.append(filled + slot)
+                        continue
+                    framing, clip_path, record = results_by_slot[slot]
+                    clips.append(clip_path)
+                    clip_sources.append(
+                        {"url": "", "local_file": Path(clip_path).name}
+                    )
+                    image_gen_records.append(record)
+                    if not resolved_term:
+                        resolved_term = subject
+                        fallback_level = "subject"
+                    # 审计缺口 G4（适配）：逐窗口标明该段画面（部分）来自
+                    # 生成概念图；只记文件名与景别，不记 prompt/图像内容。
+                    logger.info(
+                        f"segment {segment_index}: "
+                        f"image-gen fallback engaged: slot={slot} "
+                        f"framing={framing!r} clip={Path(clip_path).name}"
+                    )
 
         # 审计缺口 G1：每段一行汇总（成功/部分/空手都触发），格式与旧实现
         # 一致（grep 锚点 "material resolution summary:" 供下游日志断言）；
@@ -829,6 +885,7 @@ def match_segments(
                 clip_sources=clip_sources,
                 vlm_filter=vlm_filter_records[:_MAX_FILTER_RECORDS],
                 image_gen=image_gen_records,
+                holes=holes,
             )
         )
         if not clips:
