@@ -116,6 +116,9 @@ class SegmentMaterials:
     # record when the segment fell through to the generated concept image,
     # empty otherwise.
     image_gen: List[dict] = field(default_factory=list)
+    # Plan-window indices whose material is missing (failed backfill windows).
+    # Empty when all windows were filled or no backfill was attempted.
+    holes: List[int] = field(default_factory=list)
 
 
 def persist_segment_material_sources(
@@ -173,6 +176,7 @@ def segments_to_records(materials: List[SegmentMaterials]) -> List[dict[str, Any
             "clip_sources": [dict(s) for s in m.clip_sources],
             "vlm_filter": [dict(f) for f in m.vlm_filter],
             "image_gen": [dict(g) for g in m.image_gen],
+            "holes": list(m.holes),
         }
         for m in materials
     ]

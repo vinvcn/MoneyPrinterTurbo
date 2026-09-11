@@ -105,5 +105,47 @@ class TestSearchPages(unittest.TestCase):
             self.assertEqual(_search_pages(), 3)
 
 
+class TestSegmentsToRecordsHoles(unittest.TestCase):
+    """Roundtrip test for the holes field added to SegmentMaterials."""
+
+    def test_holes_with_value(self):
+        """SegmentMaterials with holes=[2] serializes 'holes': [2]."""
+        materials = [
+            sm.SegmentMaterials(
+                index=0,
+                search_term="a",
+                resolved_term="a",
+                fallback_level="self",
+                clips=["/x/a1.mp4"],
+                holes=[2],
+            )
+        ]
+        records = sm.segments_to_records(materials)
+        self.assertIn("holes", records[0])
+        self.assertEqual(records[0]["holes"], [2])
+
+    def test_holes_default_empty(self):
+        """Default-constructed SegmentMaterials serializes 'holes': []."""
+        materials = [
+            sm.SegmentMaterials(
+                index=0,
+                search_term="a",
+                resolved_term="a",
+                fallback_level="self",
+                clips=["/x/a1.mp4"],
+            )
+        ]
+        records = sm.segments_to_records(materials)
+        self.assertIn("holes", records[0])
+        self.assertEqual(records[0]["holes"], [])
+
+    def test_backward_compat_no_holes_kwarg(self):
+        """Constructing without holes works (backward compat)."""
+        m = sm.SegmentMaterials(index=0, search_term="x")
+        self.assertEqual(m.holes, [])
+        records = sm.segments_to_records([m])
+        self.assertEqual(records[0]["holes"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
