@@ -144,6 +144,7 @@ def persist_segment_material_sources(
                 "clip_sources": segment_materials.clip_sources,
                 "vlm_filter": segment_materials.vlm_filter,
                 "image_gen": segment_materials.image_gen,
+                "holes": list(segment_materials.holes),
             }
         )
     try:

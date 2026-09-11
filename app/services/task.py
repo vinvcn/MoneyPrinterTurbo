@@ -766,6 +766,7 @@ def _generate_final_videos_segment_first(
                 ),
                 0.0,
             ),
+            "holes": list(getattr(m, "holes", []) or []),
         }
         for m in materials
     ]
@@ -1281,16 +1282,20 @@ def _run_segment_first_pipeline(
         # 兜底解析，本流程覆盖为任务目录）。
         return material.save_video(video_url=video_url, save_dir=task_material_dir)
 
-    def generate_image(segment: dict, duration=None):
+    def generate_image(
+        segment: dict, duration=None, refined_prompt=None, framing=""
+    ):
         # image-gen 回填回调（match_segments 契约）：segment 是完整片段
-        # dict，duration 是待回填窗口的时长和；None 时 make_subject_clip
-        # 保持整段默认时长，行为与旧接线一致。
+        # dict，duration 是待回填窗口的时长；refined_prompt 非空时跳过
+        # 精炼（每段一次由调用方决定）；framing 为景别模板前缀。
         return image_gen.make_subject_clip(
             segment_text=str(segment.get("text") or ""),
             subject_term=english_subject,
             video_aspect=params.video_aspect,
             save_dir=task_material_dir,
             duration=duration,
+            refined_prompt=refined_prompt,
+            framing=framing,
         )
 
     # VLM-on 才会搜索素材：零 key 在搜索开始前快速失败并给出可操作提示；

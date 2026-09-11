@@ -1611,6 +1611,7 @@ class TestTaskService(unittest.TestCase):
                 ],
                 vlm_filter=[],
                 image_gen=[],
+                holes=[],
             ),
             SimpleNamespace(
                 index=1,
@@ -1626,6 +1627,7 @@ class TestTaskService(unittest.TestCase):
                 ],
                 vlm_filter=[],
                 image_gen=[],
+                holes=[],
             ),
         ]
         recorded_segments = {}
@@ -1676,6 +1678,47 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(len(task["segments"]), 2)
         self.assertEqual(task["segments"][0]["start_ms"], 0)
         self.assertEqual(task["segments"][1]["start_ms"], 2000)
+
+    def test_segment_first_segment_dicts_carry_holes(self):
+        """_generate_final_videos_segment_first builds segment dicts with
+        'holes' from the materials; holes=[1] propagates, default [] when
+        the attribute is absent."""
+        params = VideoParams(video_subject="Test", video_script="s")
+        audio_result = SimpleNamespace(
+            segments=[
+                {"index": 0, "duration_ms": 3000, "audio_file": "a0.mp3", "start_ms": 0, "text": "x"},
+                {"index": 1, "duration_ms": 3000, "audio_file": "a1.mp3", "start_ms": 3000, "text": "y"},
+            ],
+            audio_file="audio.mp3",
+        )
+        recorded = {}
+
+        def fake_combine(**kwargs):
+            recorded.update({s["index"]: s for s in kwargs["segments"]})
+            return kwargs["combined_video_path"]
+
+        mat_with_holes = SimpleNamespace(
+            index=0, clips=["/m/a.mp4"], holes=[1],
+            search_term="", resolved_term="", fallback_level="self",
+            search_attempts=[], clip_sources=[], vlm_filter=[], image_gen=[],
+        )
+        mat_without_holes = SimpleNamespace(
+            index=1, clips=["/m/b.mp4"],
+            search_term="", resolved_term="", fallback_level="self",
+            search_attempts=[], clip_sources=[], vlm_filter=[], image_gen=[],
+        )
+        with (
+            patch.object(tm, "save_script_data"),
+            patch.object(tm.video, "combine_videos", side_effect=fake_combine),
+            patch.object(tm.video, "generate_video", return_value=True),
+        ):
+            tm._generate_final_videos_segment_first(
+                "holes-test", params, [mat_with_holes, mat_without_holes],
+                audio_result, "", 6.0,
+            )
+
+        self.assertEqual(recorded[0]["holes"], [1])
+        self.assertEqual(recorded[1]["holes"], [])
 
     def test_segment_first_task_fails_when_segment_tts_fails(self):
         """某一段 TTS 失败时任务必须以明确的 failed_stage 结束。"""
@@ -1744,6 +1787,7 @@ class TestTaskService(unittest.TestCase):
                 clip_sources=[{"url": "", "local_file": "gen-0.mp4"}],
                 vlm_filter=[],
                 image_gen=[{"model": "stub", "source": "kolors"}],
+                holes=[],
             ),
         ]
         recorded_segments = {}
@@ -1901,6 +1945,7 @@ class TestSegmentFirstSearchPreFlight(unittest.TestCase):
                 clip_sources=[{"url": "", "local_file": "gen-0.mp4"}],
                 vlm_filter=[],
                 image_gen=[{"model": "stub", "source": "kolors"}],
+                holes=[],
             ),
         ]
 

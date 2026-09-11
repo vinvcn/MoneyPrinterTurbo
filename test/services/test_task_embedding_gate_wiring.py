@@ -29,7 +29,7 @@ class TestTaskGateWiring(unittest.TestCase):
 
         def fake_match(**kwargs):
             captured.update(kwargs)
-            return [SimpleNamespace(clips=["clip.mp4"])]
+            return [SimpleNamespace(clips=["clip.mp4"], holes=[])]
 
         gate_factory = MagicMock(return_value=gate)
         patchers = [

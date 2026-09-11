@@ -1,0 +1,21 @@
+================================================================================
+TASK 5 WIRED - DEFAULT PATH EVIDENCE
+================================================================================
+Test: test_segment_first_segment_dicts_carry_holes (second material)
+Timestamp: 2026-09-11
+
+Materials object without the holes attribute:
+  mat_without_holes = SimpleNamespace(index=1, clips=["/m/b.mp4"], ...)
+  → getattr(m, "holes", []) or [] → []
+  → dict holes = []
+
+persist_segment_material_sources consistency:
+  segment_materials.holes accessed directly on SegmentMaterials dataclass
+  → default_factory=list ensures [] when constructed without holes arg
+  → manifest record includes "holes": list(segment_materials.holes)
+  → state payload (segments_to_records) also emits "holes"
+  → manifest and state payload agree (Metis A3 contract)
+
+Test fakes updated:
+  All SimpleNamespace material fakes now include holes=[]
+  → persist_segment_material_sources accesses .holes without AttributeError
