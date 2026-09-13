@@ -112,9 +112,9 @@ class SegmentMaterials:
     # in judged order. Empty when the filter is disabled.
     vlm_filter: List[dict] = field(default_factory=list)
     # Subject-level image generation audit trail: {"model", "prompt",
-    # "source", "image_size", "image", "clip", "attempts"} — exactly one
-    # record when the segment fell through to the generated concept image,
-    # empty otherwise.
+    # "source", "image_size", "image", "clip", "attempts", "error",
+    # "framing"} — one record per generated backfill window, successes and
+    # failures alike; empty only when no image-gen backfill was attempted.
     image_gen: List[dict] = field(default_factory=list)
     # Plan-window indices whose material is missing (failed backfill windows).
     # Empty when all windows were filled or no backfill was attempted.

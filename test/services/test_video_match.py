@@ -1010,6 +1010,31 @@ class TestMatchSegments(unittest.TestCase):
                 for i in (0, 1, 3, 4)
             ],
         )
+        # 失败窗口同样落册：4 条成功 + 1 条合成失败记录（按 slot 序），合成
+        # 记录保持 image_gen.py 的 schema 键集，error 携带异常类型与消息。
+        self.assertEqual(len(result.image_gen), 5)
+        self.assertEqual(
+            [r["framing"] for r in result.image_gen],
+            [image_gen._BACKFILL_FRAMINGS[i] for i in range(5)],
+        )
+        failed_record = result.image_gen[2]
+        self.assertEqual(failed_record["source"], "failed")
+        self.assertEqual(failed_record["error"], "RuntimeError: kolors exploded")
+        self.assertEqual(failed_record["framing"], boom_framing)
+        self.assertEqual(
+            set(failed_record.keys()),
+            {
+                "model",
+                "image_size",
+                "source",
+                "prompt",
+                "image",
+                "clip",
+                "attempts",
+                "error",
+                "framing",
+            },
+        )
         # 后续 segment 不受前段失败影响：5 窗全部成功，零 hole。
         self.assertEqual(run.results[1].holes, [])
         self.assertEqual(len(run.results[1].clips), 5)
@@ -1023,6 +1048,59 @@ class TestMatchSegments(unittest.TestCase):
         self.assertTrue(
             any("material resolution summary: clips=4/5" in m for m in self._info_messages(run))
         )
+
+    def test_backfill_empty_clip_persists_failed_record(self):
+        """(e3) generate_image 返回空 clip（source=failed）：失败窗口同样写入
+        image_gen 记录，error 原样保留（缺失/空串回落 empty_clip）；clips 与
+        holes 语义完全不变。"""
+        for error in ("all_sources_failed", ""):
+            with self.subTest(error=error):
+
+                def empty_clip_image(
+                    segment, duration, refined_prompt, framing, error=error
+                ):
+                    return (
+                        "",
+                        {
+                            "model": "Kwai-Kolors/Kolors",
+                            "image_size": "720x1280",
+                            "source": "failed",
+                            "prompt": refined_prompt,
+                            "image": "",
+                            "clip": "",
+                            "attempts": 1,
+                            "error": error,
+                            "framing": framing,
+                        },
+                    )
+
+                run = self._run(
+                    segments=[{"index": 0, "text": "panda", "duration": 12.816}],
+                    llm_payloads=[self._queries_json(["panda one"])],
+                    pages_by_term={},
+                    judge=None,
+                    generate_image=empty_clip_image,
+                )
+
+                result = run.results[0]
+                # 5 窗全部空手：零 clip、全尾部窗口 holes、5 条失败记录。
+                self.assertEqual(result.clips, [])
+                self.assertEqual(result.holes, [0, 1, 2, 3, 4])
+                self.assertEqual(len(result.image_gen), 5)
+                self.assertEqual(
+                    [r["framing"] for r in result.image_gen],
+                    [image_gen._BACKFILL_FRAMINGS[i] for i in range(5)],
+                )
+                for record in result.image_gen:
+                    self.assertEqual(record["source"], "failed")
+                    self.assertEqual(record["error"], error or "empty_clip")
+                self.assertTrue(
+                    any(
+                        "image-gen backfill failed: slot=2 error=empty_clip:"
+                        in m
+                        for m in self._warning_messages(run)
+                    )
+                )
 
     def test_refine_empty_marks_all_tail_windows_as_holes(self):
         """(f) refine 返回空串：全部尾部计划窗口记 holes，零 generate_image、
@@ -1123,6 +1201,17 @@ class TestMatchSegments(unittest.TestCase):
         # slot 1 失败 → 不对应任何计划窗口 → holes 为空。
         self.assertEqual(result.holes, [])
         self.assertEqual(result.clips, ["/saved/u0.mp4", "/saved/gen-wide.mp4"])
+        # 名额多余 slot 的失败同样落册（1 成功 + 1 失败，按 slot 序），
+        # hole 语义不受影响。
+        self.assertEqual(len(result.image_gen), 2)
+        self.assertEqual(
+            [r["framing"] for r in result.image_gen],
+            [image_gen._BACKFILL_FRAMINGS[0], image_gen._BACKFILL_FRAMINGS[1]],
+        )
+        self.assertEqual(result.image_gen[1]["source"], "failed")
+        self.assertEqual(
+            result.image_gen[1]["error"], "RuntimeError: extra slot exploded"
+        )
         self.assertTrue(
             any(
                 "image-gen backfill failed: slot=1 error=RuntimeError: extra slot exploded"

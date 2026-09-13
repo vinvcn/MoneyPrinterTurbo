@@ -56,6 +56,7 @@ class TestPersistSegmentMaterialSources(unittest.TestCase):
                 clips=["/x/a1.mp4"],
                 resolved_term="a",
                 fallback_level="self",
+                image_gen=[{"source": "failed", "error": "empty_clip"}],
             )
         ]
         with patch.object(
@@ -65,6 +66,10 @@ class TestPersistSegmentMaterialSources(unittest.TestCase):
         self.assertEqual(persist.call_args.args[0], "task-1")
         record = persist.call_args.kwargs["segment_materials"][0]
         self.assertEqual(record["clips"], ["a1.mp4"])
+        # 失败窗口的 image_gen 记录原样进入清单（每段透传全部记录）。
+        self.assertEqual(
+            record["image_gen"], [{"source": "failed", "error": "empty_clip"}]
+        )
 
         with patch.object(
             sm.task_artifacts,

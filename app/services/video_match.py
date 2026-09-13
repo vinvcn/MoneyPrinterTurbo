@@ -818,6 +818,7 @@ def match_segments(
                 holes = [filled + i for i in range(len(tail))]
             else:
                 results_by_slot: dict[int, tuple[str, str, dict]] = {}
+                failed_records: dict[int, dict[str, str | int]] = {}
                 with ThreadPoolExecutor(max_workers=_BACKFILL_CONCURRENCY) as pool:
                     futures = {
                         pool.submit(
@@ -834,6 +835,19 @@ def match_segments(
                         try:
                             clip_path, record = future.result()
                         except Exception as exc:
+                            failed_records[slot] = {
+                                "model": "",
+                                "image_size": "",
+                                "source": "failed",
+                                "prompt": refined,
+                                "image": "",
+                                "clip": "",
+                                "attempts": 0,
+                                "error": f"{type(exc).__name__}: {exc}",
+                                "framing": image_gen.backfill_framing(
+                                    slot, int(segment_index)
+                                ),
+                            }
                             logger.warning(
                                 f"segment {segment_index}: image-gen backfill "
                                 f"failed: slot={slot} "
@@ -849,6 +863,11 @@ def match_segments(
                                 record,
                             )
                         else:
+                            failed_records[slot] = {
+                                **record,
+                                "source": "failed",
+                                "error": record.get("error") or "empty_clip",
+                            }
                             logger.warning(
                                 f"segment {segment_index}: image-gen backfill "
                                 f"failed: slot={slot} error=empty_clip: "
@@ -857,6 +876,9 @@ def match_segments(
 
                 for slot in range(len(slot_durations)):
                     if slot not in results_by_slot:
+                        failed_record = failed_records.get(slot)
+                        if failed_record is not None:
+                            image_gen_records.append(failed_record)
                         # 失败/空手：仅尾部计划窗口记 hole（多样性名额超出
                         # 窗口数的部分不对应任何计划窗口，黑场无从谈起）。
                         if slot < len(tail):
