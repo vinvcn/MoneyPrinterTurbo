@@ -1,6 +1,7 @@
 .DS_Store
 /config.toml
 /config.toml.bak
+/config.toml.*
 /storage/
 /.idea/
 /app/services/__pycache__
@@ -45,3 +46,4 @@ htmlcov/
 
 .worktree
 .worktrees/
+.omo/

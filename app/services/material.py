@@ -1,6 +1,7 @@
 import os
 import random
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, List
 from urllib.parse import quote_plus, urlencode, urlsplit, urlunsplit
@@ -107,6 +108,41 @@ def _material_source_record(item: MaterialInfo, local_path: str) -> dict[str, An
     return record
 
 
+def _material_search_record(
+    provider: str,
+    search_term: str,
+    items: List[MaterialInfo],
+) -> dict[str, Any]:
+    """
+    为一次搜索 API 调用生成审计记录：查询词与全部候选的下载直链。
+
+    搜索响应本身不落盘（可能包含与 API Key 绑定的签名参数），这里只保留
+    下载地址、时长和公开素材页，供后续排查"搜到了什么、链接还能不能用"。
+    """
+    candidates: list[dict[str, Any]] = []
+    for item in items:
+        if not item.url:
+            continue
+        candidate: dict[str, Any] = {
+            "url": item.url,
+            "duration": int(item.duration),
+        }
+        source = item.source_info if isinstance(item.source_info, dict) else {}
+        source_page = _safe_public_url(source.get("source_page"))
+        asset_id = source.get("asset_id")
+        if source_page:
+            candidate["source_page"] = source_page
+        if asset_id not in (None, ""):
+            candidate["asset_id"] = str(asset_id)
+        candidates.append(candidate)
+    return {
+        "provider": str(provider or ""),
+        "search_term": str(search_term or ""),
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+    }
+
+
 def _persist_material_sources(
     task_id: str,
     material_sources: list[dict[str, Any]],
@@ -133,6 +169,52 @@ def _persist_material_sources(
         # 防止未来实现调整或目录解析异常意外影响素材下载返回值。
         logger.warning(
             "failed to persist material source records: "
+            f"task_id={task_id}, error={type(exc).__name__}, detail={exc}"
+        )
+
+
+def _search_provider_of(search_videos: Callable[..., List[MaterialInfo]]) -> str:
+    """
+    从缓存包装的搜索函数中还原 provider 名称，用于搜索审计记录。
+
+    `search_videos_with_cache_for_source` 闭包会捕获 provider 参数；直接取
+    不到时退回 "unknown"，只影响审计字段，不影响下载流程。
+    """
+    provider = getattr(search_videos, "__closure__", None) or ()
+    for cell in provider:
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            continue
+        if isinstance(value, str) and value in {"pexels", "pixabay", "coverr"}:
+            return value
+    return "unknown"
+
+
+def _persist_search_records(
+    task_id: str,
+    search_records: list[dict[str, Any]],
+) -> None:
+    """
+    将搜索审计记录（关键词与候选下载直链）补充到任务清单。
+
+    与素材来源记录相同：辅助诊断能力，写盘失败只记日志，不影响下载返回值。
+    """
+    if not search_records:
+        return
+    try:
+        saved = task_artifacts.patch_script_data(
+            task_id,
+            search_responses=search_records,
+        )
+        if saved:
+            logger.info(
+                f"saved material search records: "
+                f"task_id={task_id}, count={len(search_records)}"
+            )
+    except Exception as exc:
+        logger.warning(
+            "failed to persist material search records: "
             f"task_id={task_id}, error={type(exc).__name__}, detail={exc}"
         )
 
@@ -295,6 +377,7 @@ def search_videos_pexels(
     search_term: str,
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
+    page: int = 1,
 ) -> List[MaterialInfo]:
     aspect = VideoAspect(video_aspect)
     video_orientation = aspect.name
@@ -304,8 +387,14 @@ def search_videos_pexels(
         "Authorization": api_key,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
     }
-    # Build URL
-    params = {"query": search_term, "per_page": 20, "orientation": video_orientation}
+    # Build URL。官方文档确认支持 page 参数（默认 1），供 VLM 过滤在第一页
+    # 候选被拒收后继续翻页。
+    params = {
+        "query": search_term,
+        "per_page": 20,
+        "orientation": video_orientation,
+        "page": max(1, int(page)),
+    }
     query_url = f"https://api.pexels.com/v1/videos/search?{urlencode(params)}"
     logger.info(f"searching videos on pexels: term={search_term!r}")
 
@@ -351,6 +440,9 @@ def search_videos_pexels(
                         ),
                         "source_page": _safe_public_url(v.get("url")),
                         "creator": _creator_info(v.get("user")),
+                        # 官方预览缩略图，供 VLM 下载前相关性过滤使用；
+                        # 实际分辨率在过滤层运行时校验。
+                        "thumbnail_url": _safe_public_url(v.get("image")),
                         "rendition": {
                             "id": (
                                 str(video.get("id"))
@@ -377,17 +469,20 @@ def search_videos_pixabay(
     search_term: str,
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
+    page: int = 1,
 ) -> List[MaterialInfo]:
     aspect = VideoAspect(video_aspect)
 
     video_width, video_height = aspect.to_resolution()
 
     api_key = get_api_key("pixabay_api_keys")
-    # Build URL
+    # Build URL。官方文档确认支持 page 参数（默认 1，per_query 上限 500 条），
+    # 供 VLM 过滤在第一页候选被拒收后继续翻页。
     params = {
         "q": search_term,
         "video_type": "all",  # Accepted values: "all", "film", "animation"
         "per_page": 50,
+        "page": max(1, int(page)),
         "key": api_key,
     }
     query_url = f"https://pixabay.com/api/videos/?{urlencode(params)}"
@@ -467,6 +562,26 @@ def search_videos_pixabay(
                     item.provider = "pixabay"
                     item.url = video["url"]
                     item.duration = duration
+                    # 预览缩略图：picture_id 存在时拼 vimeocdn 640x360（295x166
+                    # 低于 VLM 过滤的最小分辨率阈值）；pixabay API 已不再返回
+                    # picture/picture_id（2026-09 实测响应无此二键），此时按
+                    # CDN 约定从所选清晰度 URL 推导同帧 JPEG（.mp4 → .jpg，
+                    # 实测可下载且被多模态嵌入端点接受）。实际分辨率仍由
+                    # 过滤层在下载缩略图后校验。
+                    thumbnail_url = ""
+                    picture_id = str(v.get("picture_id") or "")
+                    if picture_id:
+                        thumbnail_url = (
+                            f"https://i.vimeocdn.com/video/{picture_id}_640x360.jpg"
+                        )
+                    else:
+                        stem = str(video["url"] or "").rsplit(".", 1)[0]
+                        if stem:
+                            thumbnail_url = f"{stem}.jpg"
+                            logger.debug(
+                                "pixabay thumbnail derived from rendition url: "
+                                f"asset_id={v.get('id')}, thumbnail_url={thumbnail_url}"
+                            )
                     item.source_info = {
                         "provider": "pixabay",
                         "search_term": search_term,
@@ -480,6 +595,7 @@ def search_videos_pixabay(
                                 "name": v.get("user"),
                             }
                         ),
+                        "thumbnail_url": thumbnail_url,
                         "rendition": {
                             "id": video_type,
                             "width": w,
@@ -516,6 +632,8 @@ def search_videos_coverr(
       - Coverr 支持通过 filter=is_vertical:true/false 筛选横竖屏素材；
         响应返回后仍根据 max_width/max_height 或 is_vertical 做本地校验
       - duration 字段同时存在 number 和 string 两种形态,本函数都接受
+      - 预览图字段名无文档保证,这里按 preview/thumbnail 依次尝试;过滤层
+        会在下载后校验实际分辨率,不达标自动回退到 mp4 首帧
 
     本函数使用 urls.mp4_download 字段作为下载地址 —— 按 Coverr 官方文档
     (https://api.coverr.co/docs/videos/#download-a-video) 的说法,
@@ -586,6 +704,10 @@ def search_videos_coverr(
                 "asset_id": str(video_id),
                 "source_page": _safe_public_url(v.get("canonical_url") or v.get("url")),
                 "creator": _creator_info(v.get("creator") or v.get("author")),
+                # Coverr 预览图分辨率无文档保证，过滤层运行时校验后再使用。
+                "thumbnail_url": _safe_public_url(
+                    v.get("preview") or v.get("thumbnail")
+                ),
                 "rendition": {
                     "id": "mp4_download",
                     "width": v.get("max_width"),
@@ -669,6 +791,7 @@ def _search_videos_with_cache(
     search_term: str,
     minimum_duration: int,
     video_aspect: VideoAspect,
+    page: int = 1,
 ) -> List[MaterialInfo]:
     """
     统一处理三个在线素材源的 24 小时搜索缓存。
@@ -676,12 +799,16 @@ def _search_videos_with_cache(
     缓存只包裹搜索 API，不改变后续视频下载与去重逻辑。远端返回空列表时不写
     缓存，因为现有 provider 接口使用空列表同时表示“没有结果”和“请求失败”；
     在两者尚未拆分为明确结果类型前，宁可下次重试，也不能把临时故障缓存一天。
+
+    ``page`` 参与缓存键：第一页与后续页的候选互不覆盖。页码不影响 Pixabay
+    与 Pexels 的远端请求语义（不支持翻页的实现直接忽略该参数）。
     """
     cache_args = {
         "provider": provider,
         "search_term": search_term,
         "minimum_duration": minimum_duration,
         "video_aspect": video_aspect,
+        "page": max(1, int(page)),
     }
 
     def load_cache_safely() -> List[MaterialInfo] | None:
@@ -730,11 +857,23 @@ def _search_videos_with_cache(
         if cached_items is not None:
             return cached_items
 
-        items = search_videos(
-            search_term=search_term,
-            minimum_duration=minimum_duration,
-            video_aspect=video_aspect,
-        )
+        try:
+            items = search_videos(
+                search_term=search_term,
+                minimum_duration=minimum_duration,
+                video_aspect=video_aspect,
+                page=page,
+            )
+        except TypeError as exc:
+            # 兼容不带 page 参数的远端搜索实现（测试替身、第三方扩展）：
+            # VLM 过滤的翻页场景传入 page 时，旧签名会直接 TypeError。
+            if "page" not in str(exc):
+                raise
+            items = search_videos(
+                search_term=search_term,
+                minimum_duration=minimum_duration,
+                video_aspect=video_aspect,
+            )
         # Provider 正常会写入当前关键词，但测试替身、第三方扩展或旧实现可能
         # 遗漏或携带错误值。缓存读取会根据缓存键恢复该字段，因此远端结果也在
         # 同一入口校正，保证首次搜索与缓存命中的任务来源记录保持一致。
@@ -756,16 +895,21 @@ def _search_videos_with_cache(
         return items
 
 
-def download_videos(
-    task_id: str,
-    search_terms: List[str],
-    source: str = "pexels",
-    video_aspect: VideoAspect = VideoAspect.portrait,
-    video_concat_mode: VideoConcatMode = VideoConcatMode.random,
-    audio_duration: float = 0.0,
-    max_clip_duration: int = 5,
-    match_script_order: bool = False,
-) -> List[str]:
+def search_videos_with_cache_for_source(
+    source: str,
+    page: int = 1,
+) -> Callable[..., List[MaterialInfo]]:
+    """
+    返回按指定素材源缓存的搜索函数，供新旧两条下载流程复用。
+
+    返回的函数签名与 provider 无关：search_term / minimum_duration /
+    video_aspect 三个参数在内部路由到对应的远端搜索，并继承 24 小时
+    搜索缓存和缓存锁，避免同一关键词被重复请求。
+
+    ``page`` 用于 VLM 下载前过滤的翻页场景：第一页候选全部被拒收时，
+    调用方可以用 page=2 再取一批候选。页码参与缓存键，不同页的结果
+    互不覆盖；不支持翻页的 provider（Coverr）远端实现会忽略页码。
+    """
     provider = "pexels"
     remote_search_videos = search_videos_pexels
     if source == "pixabay":
@@ -786,7 +930,144 @@ def download_videos(
             search_term=search_term,
             minimum_duration=minimum_duration,
             video_aspect=video_aspect,
+            page=page,
         )
+
+    return search_videos
+
+
+def _available_video_providers() -> list[tuple[str, Callable]]:
+    """
+    返回当前配置了 API key 的在线素材供应商（固定声明序）。
+
+    可用性只看 key 配置存在非空：pexels / pixabay / coverr 三个 key
+    列表任一缺失或为空即跳过对应供应商，不做连通性探测。
+    """
+    providers: list[tuple[str, Callable]] = []
+    if config.app.get("pexels_api_keys"):
+        providers.append(("pexels", search_videos_pexels))
+    if config.app.get("pixabay_api_keys"):
+        providers.append(("pixabay", search_videos_pixabay))
+    if config.app.get("coverr_api_keys"):
+        providers.append(("coverr", search_videos_coverr))
+    return providers
+
+
+def assert_search_provider_available() -> None:
+    """
+    segment-first 搜索前置检查：一个在线供应商都不可用时快速失败。
+
+    报错镜像 get_api_key 的提示风格，并一次性列出全部三个 key 配置，
+    避免用户配好一个后又撞到下一个缺失提示。
+    """
+    if _available_video_providers():
+        return
+    raise ValueError(
+        "\n\n##### no video provider API keys are set #####\n\n"
+        "Segment-first material search queries every keyed provider "
+        "(pexels_api_keys, pixabay_api_keys, coverr_api_keys) in "
+        "parallel; at least one must be set.\n"
+        f"Please set it in the config.toml file: {config.config_file}\n"
+    )
+
+
+def _candidate_cap() -> int:
+    """[material_rerank] max_candidates_per_provider；缺失、非法或小于 1 时回落 20。"""
+    try:
+        cap = int(config.material_rerank.get("max_candidates_per_provider", 20))
+    except (TypeError, ValueError):
+        logger.warning(
+            "invalid max_candidates_per_provider, fallback to 20: "
+            f"raw={config.material_rerank.get('max_candidates_per_provider')!r}"
+        )
+        return 20
+    if cap < 1:
+        logger.warning(f"max_candidates_per_provider below 1, fallback to 20: raw={cap}")
+        return 20
+    return cap
+
+
+def search_videos_multi_provider(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect,
+    page: int = 1,
+) -> List[MaterialInfo]:
+    """
+    segment-first 并行搜索：一次 (词条, 页) 取数同时查询所有已配置 key
+    的供应商，合并结果供候选池聚簇。
+
+    每个供应商的结果在 24h 搜索缓存层返回后做头部截断（磁盘缓存保留
+    完整列表，截断只影响本次进入候选池的数量），再按供应商声明序拼接；
+    单个供应商抛异常按空结果处理（fail-open），不阻断其余供应商。
+    """
+    providers = _available_video_providers()
+    if not providers:
+        # 防御分支：task.py 预检正常先拦，这里兜底直接调用等场景。
+        assert_search_provider_available()
+
+    cap = _candidate_cap()
+    logger.info(
+        f"segment search fan-out begin: term={search_term!r}, page={page}, "
+        f"providers=[{', '.join(name for name, _ in providers)}], "
+        f"per_provider_cap={cap}"
+    )
+    merged: List[MaterialInfo] = []
+    per_provider: dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=len(providers)) as executor:
+        # 提交顺序即声明序：dict 保持插入序，结果按同一序合并。
+        futures = {
+            executor.submit(
+                _search_videos_with_cache,
+                provider=provider,
+                search_videos=search_fn,
+                search_term=search_term,
+                minimum_duration=minimum_duration,
+                video_aspect=video_aspect,
+                page=page,
+            ): provider
+            for provider, search_fn in providers
+        }
+        for future, provider in futures.items():
+            try:
+                items = future.result()
+            except Exception as exc:
+                # 供应商函数内部已 fail-open，这里兜 get_api_key 轮换竞态
+                # 等意外抛出：单个供应商故障不阻断其余供应商。
+                logger.warning(
+                    "provider search failed, fail-open: "
+                    f"provider={provider}, error={type(exc).__name__}: {exc}"
+                )
+                continue
+            capped = items[:cap]
+            if len(items) > cap:
+                logger.info(
+                    "provider results head-capped: "
+                    f"provider={provider}, raw={len(items)}, kept={cap}"
+                )
+            per_provider[provider] = len(capped)
+            merged.extend(capped)
+
+    logger.info(
+        f"segment search fan-out: term={search_term!r}, page={page}, "
+        f"providers=[{', '.join(name for name, _ in providers)}], "
+        f"per_provider={{{', '.join(f'{name}: {per_provider.get(name, 0)}' for name, _ in providers)}}}, "
+        f"merged={len(merged)}"
+    )
+    return merged
+
+
+def download_videos(
+    task_id: str,
+    search_terms: List[str],
+    source: str = "pexels",
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    video_concat_mode: VideoConcatMode = VideoConcatMode.random,
+    audio_duration: float = 0.0,
+    max_clip_duration: int = 5,
+    match_script_order: bool = False,
+) -> List[str]:
+    search_videos = search_videos_with_cache_for_source(source)
 
     material_directory = config.app.get("material_directory", "").strip()
     if material_directory == "task":
@@ -808,6 +1089,7 @@ def download_videos(
     valid_video_items = []
     valid_video_urls = []
     found_duration = 0.0
+    search_records: list[dict[str, Any]] = []
     for search_term in search_terms:
         video_items = search_videos(
             search_term=search_term,
@@ -815,6 +1097,13 @@ def download_videos(
             video_aspect=video_aspect,
         )
         logger.info(f"found {len(video_items)} videos for '{search_term}'")
+        search_records.append(
+            _material_search_record(
+                provider=source,
+                search_term=search_term,
+                items=video_items,
+            )
+        )
 
         for item in video_items:
             if item.url not in valid_video_urls:
@@ -873,6 +1162,7 @@ def download_videos(
             )
     logger.success(f"downloaded {len(video_paths)} videos")
     _persist_material_sources(task_id, material_sources)
+    _persist_search_records(task_id, search_records)
     return video_paths
 
 
@@ -898,6 +1188,7 @@ def _download_videos_by_script_order(
     candidate_groups = []
     valid_video_urls = set()
     found_duration = 0.0
+    search_records: list[dict[str, Any]] = []
 
     for search_term in search_terms:
         video_items = search_videos(
@@ -906,6 +1197,13 @@ def _download_videos_by_script_order(
             video_aspect=video_aspect,
         )
         logger.info(f"found {len(video_items)} videos for '{search_term}'")
+        search_records.append(
+            _material_search_record(
+                provider=_search_provider_of(search_videos),
+                search_term=search_term,
+                items=video_items,
+            )
+        )
 
         term_items = []
         for item in video_items:
@@ -979,6 +1277,7 @@ def _download_videos_by_script_order(
 
     logger.success(f"downloaded {len(video_paths)} ordered videos")
     _persist_material_sources(task_id, material_sources)
+    _persist_search_records(task_id, search_records)
     return video_paths
 
 

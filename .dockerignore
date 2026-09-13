@@ -35,3 +35,6 @@ logs/
 
 storage/
 config.toml
+.scratch/
+.agents/
+.claude/
