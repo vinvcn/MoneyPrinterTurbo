@@ -15,6 +15,7 @@ from app.config import config
 from app.models.schema import MaterialInfo
 from app.services import image_embedding, image_gen, video_match
 from app.services.image_embedding import EmbeddingGate
+from app.services.video import segment_window_plan
 from app.services.video_match import SegmentQueries, generate_segment_queries
 
 
@@ -1557,6 +1558,39 @@ class TestMatchSegments(unittest.TestCase):
         self.assertEqual(
             result.search_attempts,
             [{"level": "self", "term": "panda", "found": False}],
+        )
+
+    def test_zero_duration_segment_skips_search_and_backfill(self):
+        """(l) D=0（异常旁白）：窗口计划为空；match_segments 跳过查询/搜索/
+        回填，零 generate_image、零 holes、空 SegmentMaterials——不得经
+        last_window 兜底为不存在的计划窗口生成素材。装配层对同时缺素材与
+        时长的段同样跳过时间线（video.py:919-924），两端语义对称。"""
+        self.assertEqual(segment_window_plan(0, 3), [])
+        run = self._run(
+            segments=[{"index": 0, "text": "panda", "duration": 0}],
+            llm_payloads=[self._queries_json(["panda one"])],
+            pages_by_term={},
+            judge=None,
+        )
+
+        self.assertEqual(len(run.results), 1)
+        result = run.results[0]
+        self.assertEqual(run.image_calls, [])
+        self.assertEqual(run.searched, [])
+        self.assertEqual(run.saved, [])
+        self.assertEqual(result.clips, [])
+        self.assertEqual(result.clip_sources, [])
+        self.assertEqual(result.image_gen, [])
+        self.assertEqual(result.holes, [])
+        self.assertEqual(result.search_term, "")
+        self.assertEqual(result.resolved_term, "")
+        self.assertEqual(result.fallback_level, "")
+        self.assertEqual(result.search_attempts, [])
+        self.assertTrue(
+            any(
+                "video match: non-positive duration" in m
+                for m in self._warning_messages(run)
+            )
         )
 
 

@@ -169,11 +169,30 @@ def test_holes_produce_black_placeholder_for_plan_slot(tmp_path):
     assert sum(durations) == pytest.approx(segment_duration, abs=0.05)
     with VideoFileClip(str(combined)) as clip:
         assert clip.duration == pytest.approx(segment_duration, abs=0.1)
+    # Pixel sensitivity (Metis B3): duration-only assertions pass even when the
+    # hole slot silently consumes a source clip. _write_source_clip renders
+    # (30, 90, 160), so the real hole frame (t=1.5 inside the 3.0s window) must
+    # stay near-black while the non-hole windows stay visibly colored.
+    hole_file = tmp_path / "temp-clip-2.mp4"
+    with VideoFileClip(str(hole_file)) as c:
+        hole_frame = c.get_frame(1.5)
+    assert hole_frame is not None
+    hole_frame_max = float(hole_frame.max())
+    assert hole_frame_max <= 8
+    # At least one non-hole window carries the colored source: the hole
+    # assertion above cannot pass vacuously on an all-black assembly.
+    non_hole_frame_max = 0.0
     # source_file_path="" for the hole → bypasses used_clip_paths dedupe.
     for idx in [0, 2]:
         clip_file = tmp_path / f"temp-clip-{idx + 1}.mp4"
         with VideoFileClip(str(clip_file)) as c:
             assert c.duration > 0
+            non_hole_frame = c.get_frame(1.5)
+        assert non_hole_frame is not None
+        non_hole_frame_max = max(
+            non_hole_frame_max, float(non_hole_frame.max())
+        )
+    assert non_hole_frame_max > 8
 
 
 def test_empty_holes_produces_no_black_clips(tmp_path):

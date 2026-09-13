@@ -541,6 +541,23 @@ def match_segments(
         windows = segment_window_plan(segment_duration, clip_duration)
         needed_clips = max(CLIPS_PER_SEGMENT, len(windows))
 
+        if segment_duration <= 0:
+            # 异常旁白段（无正时长）：装配层对「无素材且无时长」的段直接跳过
+            # 时间线（video.py:919-924）；素材层对称处理，跳过查询、搜索与
+            # 回填，否则 windows=[] 会经 last_window 兜底为不存在的计划窗口
+            # 生成素材。
+            logger.warning(
+                f"segment {segment_index}: video match: non-positive duration "
+                f"({segment_duration}), skipping material search and backfill"
+            )
+            results.append(
+                SegmentMaterials(
+                    index=int(segment.get("index", position)),
+                    search_term="",
+                )
+            )
+            continue
+
         # 1. 每段一次 LLM 查询包（terms + coarse_query + fine_query）；
         #    失败 fail-open 为空包，降级由下方各阶段自行处理。
         queries = generate_segment_queries(str(video_subject or ""), segment_text)
