@@ -1127,8 +1127,9 @@ def _run_segment_first_pipeline(
     3. 字幕直接按片段音频偏移量生成；
     4. 视频拼接严格按片段顺序，不打乱。
 
-    中间 stop_at 语义与旧流程一致；segment-first 模式没有全局关键词阶段，
-    "terms" 停止点直接返回空关键词列表。
+    中间 stop_at 语义与旧流程一致：audio / subtitle / materials 分别返回
+    对应中间产物，其余值继续走到完整成片。（本函数没有 terms 分支；生产
+    调用方 ``_run_pipeline`` 对 terms / subtitle 仍路由回旧流程。）
     """
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
 

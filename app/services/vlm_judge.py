@@ -7,11 +7,12 @@ VLM 下载前相关性过滤（segment-first 流水线专用）。
 用一张缩略图（或 mp4 首帧）让 VLM 判断候选是否与搜索词和旁白相关。
 
 设计决策（issue #9，grilling session 2026-09-03）：
-- 三值判定 relevant / irrelevant / uncertain；uncertain 放行，
-  过滤器是质量增强，不能让流水线饿死。
-- VLM 调用失败重试 3 次后 fail-open（放行），绝不阻塞任务。
+- 三值判定 relevant / irrelevant / uncertain；uncertain 表示无法判定，由
+  调用方处置（video_match 走查按 skip 处理并转 image-gen 回填），过滤器
+  是质量增强，不阻塞成片。
+- VLM 调用失败重试 3 次后返回 uncertain（fail-open），绝不阻塞任务。
 - 图像来源优先缩略图（分辨率 ≥ 阈值才可用），否则 ffmpeg 提取候选
-  mp4 首帧；同样重试 3 次后放行。
+  mp4 首帧；同样重试 3 次后返回 uncertain。
 - 每次判定都写 INFO 日志（含判定、理由、图像来源），不静默。
 - 端点/模型/密钥可配置（config.toml [vlm] 段），默认指向
   SiliconFlow + Qwen/Qwen3.5-4B，可切自建 vLLM 而不改代码。
@@ -322,13 +323,6 @@ def extract_first_frame_jpeg(video_path: str) -> bytes:
             pass
 
 
-def _candidate_local_path(item: Any) -> str:
-    """从 MaterialInfo.source_info 里找已下载的本地文件（无则返回空串）。"""
-    source = item.source_info if isinstance(item.source_info, dict) else {}
-    local_file = str(source.get("local_file") or "").strip()
-    return local_file
-
-
 def make_default_judge(embedding_gate: Any = None):
     """
     构造注入 segment_material 的默认判定回调（issue #9 D1/D2/D3/D5）。
@@ -343,7 +337,7 @@ def make_default_judge(embedding_gate: Any = None):
     1. 缩略图（存在且实际分辨率 ≥ [vlm] 阈值）；
     2. mp4 首帧（需要候选已下载——过滤发生在下载前，因此缩略图缺失时
        先下载到临时位置提取首帧，拒收后立即删除）；
-    3. 两条路径都失败 → 重试用尽 → uncertain 放行（fail-open）。
+    3. 两条路径都失败 → 重试用尽 → 返回 uncertain（fail-open，由调用方处置）。
 
     每次判定都写 INFO 日志；审计记录不含图像字节，只含来源与判定结果。
     """
@@ -411,8 +405,8 @@ def make_default_judge(embedding_gate: Any = None):
                     except OSError:
                         pass
 
-        # 路径 3：两种图像都不可得。判定必然失败 → 直接 uncertain 放行，
-        # 不空耗 VLM 重试。
+        # 路径 3：两种图像都不可得。判定必然失败 → 直接返回 uncertain
+        # （fail-open，由调用方处置），不空耗 VLM 重试。
         if not image_data_uri:
             logger.warning(
                 "vlm filter has no usable image input, fail-open: "
