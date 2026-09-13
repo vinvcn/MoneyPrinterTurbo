@@ -37,7 +37,11 @@ class TestTaskGateWiring(unittest.TestCase):
             patch.object(
                 task.segmenter,
                 "segment_script",
-                lambda script: [SimpleNamespace(index=0, text="hello world")],
+                lambda script: [
+                    SimpleNamespace(
+                        index=0, text="hello world", estimated_duration=3.0
+                    )
+                ],
             ),
             patch.object(task, "save_script_data", lambda *a, **k: None),
             patch.object(
@@ -53,6 +57,15 @@ class TestTaskGateWiring(unittest.TestCase):
                     audio_file="a.mp3",
                     total_duration_ms=1500,
                     error=None,
+                    segments=[
+                        {
+                            "index": 0,
+                            "text": "hello world",
+                            "audio_file": "a-segment-0.mp3",
+                            "start_ms": 0,
+                            "duration_ms": 1500,
+                        }
+                    ],
                 ),
             ),
             patch.object(
