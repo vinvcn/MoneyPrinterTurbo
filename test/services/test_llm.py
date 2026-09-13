@@ -553,7 +553,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "hellopollinations")
+        self.assertEqual(result, "hello\npollinations")
 
     def test_gemini_uses_google_genai_client(self):
         """Gemini 适配器应通过新版 SDK 的统一 Client 发起内容生成请求。"""
@@ -586,7 +586,7 @@ class TestLiteLLMProvider(unittest.TestCase):
         with patch("google.genai.Client", FakeClient):
             result = llm._generate_response("Say hello")
 
-        self.assertEqual(result, "hellogemini")
+        self.assertEqual(result, "hello\ngemini")
         self.assertEqual(
             captured["client_kwargs"],
             {"api_key": "gemini-test-key", "http_options": None},
@@ -663,7 +663,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "gatewayresponse")
+        self.assertEqual(result, "gateway\nresponse")
 
     def _use_litellm_provider(self, model_name="openai/gpt-4o-mini"):
         config.app["llm_provider"] = "litellm"
@@ -696,7 +696,7 @@ class TestLiteLLMProvider(unittest.TestCase):
         with patch.dict(sys.modules, {"litellm": fake_litellm}):
             result = llm._generate_response("Say hello")
 
-        self.assertEqual(result, "helloworld")
+        self.assertEqual(result, "hello\nworld")
 
     def test_litellm_provider_uses_registry_default_model(self):
         self._use_litellm_provider(model_name="")
@@ -873,7 +873,7 @@ class TestLiteLLMProvider(unittest.TestCase):
         with self._patch_dashscope_multimodal(response):
             result = llm._generate_response("Say hello")
 
-        self.assertEqual(result, "你好世界")
+        self.assertEqual(result, "你好\n世界")
 
     def test_qwen_provider_reports_empty_text(self):
         """Qwen 空响应应返回可诊断错误，而不是底层 AttributeError。"""
@@ -943,7 +943,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "helloaihubmix")
+        self.assertEqual(result, "hello\naihubmix")
 
     def test_aimlapi_provider_uses_openai_compatible_client(self):
         config.app["llm_provider"] = "aimlapi"
@@ -980,7 +980,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "helloaimlapi")
+        self.assertEqual(result, "hello\naimlapi")
 
     def test_evolink_provider_uses_openai_compatible_client(self):
         """
@@ -1022,7 +1022,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "helloevolink")
+        self.assertEqual(result, "hello\nevolink")
 
     def test_volcengine_provider_uses_openai_compatible_client(self):
         """
@@ -1064,7 +1064,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "hellovolcengine")
+        self.assertEqual(result, "hello\nvolcengine")
 
     def test_grok_provider_still_uses_existing_path(self):
         config.app["llm_provider"] = "grok"
@@ -1119,7 +1119,7 @@ class TestLiteLLMProvider(unittest.TestCase):
             api_key="groq-test-key",
             base_url="https://api.groq.com/openai/v1",
         )
-        self.assertEqual(result, "hellogroq")
+        self.assertEqual(result, "hello\ngroq")
 
     def _use_ollama_provider(self, base_url=""):
         config.app["llm_provider"] = "ollama"
@@ -1157,7 +1157,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "helloollama")
+        self.assertEqual(result, "hello\nollama")
 
     def test_ollama_default_base_url_uses_localhost_outside_container(self):
         """
@@ -1246,7 +1246,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "hellomimo")
+        self.assertEqual(result, "hello\nmimo")
 
     def test_azure_provider_uses_azure_client_directly(self):
         """
@@ -1292,7 +1292,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Say hello"}],
             },
         )
-        self.assertEqual(result, "helloazure")
+        self.assertEqual(result, "hello\nazure")
 
     def test_unsupported_provider_returns_clear_error(self):
         config.app["llm_provider"] = "g" + "4f"
