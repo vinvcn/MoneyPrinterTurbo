@@ -1207,6 +1207,23 @@ def _preflight_search_provider(params) -> None:
         material.assert_search_provider_available()
 
 
+def _make_premise_pool(params):
+    """两段式 pass A 素材池回调（plan todo 8）；非 premise/mixed 返回 None。
+
+    match_segments 对回调做任务级一次读取（memo）；stock 搜索回调
+    （_make_search_videos）继续服务 pass B / 单遍 stock。
+    """
+    source = str(getattr(params, "video_source", "") or "")
+    if source not in _PREMISE_SOURCES:
+        return None
+    owner_id = _require_owner_id(params)
+
+    def premise_pool() -> list[MaterialInfo]:
+        return premise_pool_materials(owner_id)
+
+    return premise_pool
+
+
 def _make_save_video(params, task_material_dir: str):
     """构建 save_video 回调：premise:// 从本地素材目录拷贝，其余走 material.save_video。"""
 
@@ -1383,6 +1400,9 @@ def _run_segment_first_pipeline(
     # match_segments 自持）。
     search_videos = _make_search_videos(params)
     save_video = _make_save_video(params, task_material_dir)
+    # todo 8 两段式：match_segments 拿 source + 独立 premise_pool 回调跑 pass A，
+    # stock 搜索回调继续服务 mixed 的 pass B / 单遍 stock。
+    premise_pool = _make_premise_pool(params)
 
     def generate_image(
         segment: dict, duration=None, refined_prompt=None, framing=""
@@ -1417,6 +1437,8 @@ def _run_segment_first_pipeline(
         embedding_gate=embedding_gate,
         generate_image=generate_image,
         vector_cache=vector_cache,
+        source=str(params.video_source or ""),
+        premise_pool=premise_pool,
     )
     segment_material.persist_segment_material_sources(task_id, materials)
 

@@ -437,6 +437,8 @@ def match_segments(
     embedding_gate: image_embedding.EmbeddingGate | None = None,
     generate_image: Callable[..., tuple[str, dict]] | None = None,
     vector_cache: MutableMapping[str, list[float]] | None = None,
+    source: str = "",
+    premise_pool: Callable[[], list[MaterialInfo]] | None = None,
 ) -> list[SegmentMaterials]:
     """
     三段漏斗素材匹配主编排：粗排（embedding 召回）→ 精排（VL 重排）→
@@ -481,6 +483,17 @@ def match_segments(
             各调用一次（≤ _BACKFILL_CONCURRENCY 并发，slot 序收集结果）；
             回调缺失或单窗口失败时该窗口记入 holes（尾部计划窗口，装配层
             黑场占位），绝不阻塞流水线。
+        source: video_source 源路由（plan todo 7/8）："premise" 仅用户素材池
+            （premise_pool 任务级一次读取；不打乱——shuffle 只消多供应商
+            拼接偏差，premise 池没有该偏差；段内用户优先级 = coarse/fine
+            排序后的候选序，_COARSE_TOP_K=30 截断同样生效）。"mixed" 两段式：
+            pass A premise 先过完整漏斗，仍有未满窗口才启动 pass B stock；
+            pass B 里 material 层零 key 的 provider-unavailable ValueError
+            记 warn 降级为空（Metis #5），剩余窗口交 image-gen 回填。
+            其余值（""/stock/legacy）单遍 stock 行为逐字节不变。
+        premise_pool: 用户素材池读取回调（registry 派生 MaterialInfo）；
+            每次 match_segments 调用只读一次（任务级 memo，单任务内 registry
+            静态），逐段仅按 used_urls 过滤重建候选；premise/mixed 未注入时按空池处理。
 
     Returns:
         与输入等长的 SegmentMaterials 列表（字段与旧实现一致）。
@@ -500,6 +513,9 @@ def match_segments(
             # 旧三参（无页码，TypeError 退回）、两参新契约（按位传词条
             # 与页码）。回退调用自身的 TypeError（如返回 None 不可迭代）
             # 按空结果处理，绝不阻塞流水线。
+            # Metis #5（todo 8）：mixed 的 pass B 里 material 内部
+            # assert_search_provider_available() 的 provider-unavailable
+            # ValueError 降级为空结果（warn 留痕）；其余 source 保持上抛。
             found: list[MaterialInfo]
             try:
                 found = list(
@@ -524,6 +540,14 @@ def match_segments(
                         found = list(search_videos(normalized, page))
                     except TypeError:
                         found = []
+            except ValueError as exc:
+                if source != "mixed":
+                    raise
+                logger.warning(
+                    "video match: mixed stock search degraded to empty: "
+                    f"term={normalized!r}, page={page}, error={exc}"
+                )
+                found = []
             # 逐条打印搜索返回的候选，供运行审计核对"搜到了什么"。
             logger.info(
                 f"segment search returned {len(found)} candidates for "
@@ -552,6 +576,19 @@ def match_segments(
             shared = getattr(embedding_gate, "_shared_cache", None)
             if isinstance(shared, dict):
                 vector_cache = shared
+
+    # 源路由（plan todo 8）：premise/mixed 的 pass A 用户素材池任务级只读
+    # 一次（单任务内 registry 静态）；逐段仅按 used_urls 过滤重建候选。
+    premise_mode = source == "premise"
+    mixed_mode = source == "mixed"
+    _premise_state: dict[str, list[MaterialInfo] | None] = {"items": None}
+
+    def premise_items() -> list[MaterialInfo]:
+        if not premise_mode and not mixed_mode:
+            return []
+        if _premise_state["items"] is None:
+            _premise_state["items"] = list(premise_pool()) if premise_pool is not None else []
+        return _premise_state["items"]
 
     # VLM 走查预算：与旧实现同一先例——直接读 material_rerank._walk_limit
     # （私有访问先例已在 segment_material.py 建立），每次运行只读一次。
@@ -608,228 +645,279 @@ def match_segments(
                 f"segment {segment_index}: video match: vlm disabled, image-gen only"
             )
         else:
-            # 2. 搜索聚池：页优先 interleave（page1-term1, page1-term2, ...,
-            #    page2-*），按 URL 去重保首个，跨段已用 URL 不入池。
-            pool: list[dict] = []
-            pool_urls: set[str] = set()
-            active_terms = list(terms)
-            raw_seen = 0
-            dedup_dropped = 0
-            used_dropped = 0
-            for page in range(1, search_pages + 1):
-                if not active_terms:
-                    break
-                still_active: list[str] = []
-                for term in active_terms:
-                    page_items = search_page_cached(term, page)
-                    if not page_items:
-                        # 第 1 页即空的词条不参与翻页（镜像旧分页语义）。
+            # 2. 候选池构建（两段式 pass 工厂，todo 8）：stock 池 = 页优先 interleave
+            #    + (词条,页) 备忘 + URL 去重 + 跨段 used_urls 排除；premise 池 =
+            #    任务级一次读取的 registry 行（同样按 used_urls 跨段排除）。
+            def build_stock_pool() -> list[dict]:
+                # 2. 搜索聚池：页优先 interleave（page1-term1, page1-term2, ...,
+                #    page2-*），按 URL 去重保首个，跨段已用 URL 不入池。
+                pool: list[dict] = []
+                pool_urls: set[str] = set()
+                active_terms = list(terms)
+                raw_seen = 0
+                dedup_dropped = 0
+                used_dropped = 0
+                for page in range(1, search_pages + 1):
+                    if not active_terms:
+                        break
+                    still_active: list[str] = []
+                    for term in active_terms:
+                        page_items = search_page_cached(term, page)
+                        if not page_items:
+                            # 第 1 页即空的词条不参与翻页（镜像旧分页语义）。
+                            continue
+                        still_active.append(term)
+                        for item in page_items:
+                            raw_seen += 1
+                            url = str(item.url or "")
+                            if not url:
+                                continue
+                            if url in used_urls:
+                                used_dropped += 1
+                                continue
+                            if url in pool_urls:
+                                dedup_dropped += 1
+                                continue
+                            pool_urls.add(url)
+                            if url.startswith("premise://"):
+                                pool.append(_premise_candidate_from_item(item, term))
+                            else:
+                                pool.append(_candidate_from_item(item, term))
+                    active_terms = still_active
+                logger.info(
+                    "candidate pool assembled: "
+                    f"segment={segment_index}, raw={raw_seen}, kept={len(pool)}, "
+                    f"dedup_dropped={dedup_dropped}, used_dropped={used_dropped}"
+                )
+
+                return pool
+
+            def build_premise_pool() -> list[dict]:
+                pool: list[dict] = []
+                pool_urls: set[str] = set()
+                used_dropped = 0
+                for item in premise_items():
+                    url = str(item.url or "")
+                    if not url or url in pool_urls:
                         continue
-                    still_active.append(term)
-                    for item in page_items:
-                        raw_seen += 1
-                        url = str(item.url or "")
-                        if not url:
-                            continue
-                        if url in used_urls:
-                            used_dropped += 1
-                            continue
-                        if url in pool_urls:
-                            dedup_dropped += 1
-                            continue
-                        pool_urls.add(url)
-                        if url.startswith("premise://"):
-                            pool.append(_premise_candidate_from_item(item, term))
-                        else:
-                            pool.append(_candidate_from_item(item, term))
-                active_terms = still_active
-            logger.info(
-                "candidate pool assembled: "
-                f"segment={segment_index}, raw={raw_seen}, kept={len(pool)}, "
-                f"dedup_dropped={dedup_dropped}, used_dropped={used_dropped}"
-            )
+                    if url in used_urls:
+                        used_dropped += 1
+                        continue
+                    pool_urls.add(url)
+                    pool.append(_premise_candidate_from_item(item, ""))
+                logger.info(
+                    "premise pool assembled: "
+                    f"segment={segment_index}, kept={len(pool)}, "
+                    f"used_dropped={used_dropped}"
+                )
+                return pool
 
-            # 多供应商合并后池序带固定拼接偏差（供应商声明序 × 词条序 × 页序），
-            # 粗排前打乱消除拼接偏差；测试用 random.seed 固定。
-            random.shuffle(pool)
+            def run_funnel(pool: list[dict], *, do_shuffle: bool) -> None:
+                # 段内单遍漏斗：shuffle（仅 stock）→ 粗排+flush → 精排 → 走查。
+                nonlocal resolved_term, fallback_level
+                if not pool:
+                    return
+                if do_shuffle:
+                    # 多供应商合并后池序带固定拼接偏差（供应商声明序 × 词条序 × 页序），
+                    # 粗排前打乱消除拼接偏差；测试用 random.seed 固定。
+                    # premise 池没有供应商拼接偏差：跳过打乱，registry 序进
+                    # 粗排、coarse/fine 排序 + 走查采纳序即段内用户优先级（todo 8）。
+                    random.shuffle(pool)
 
-            # 3. 粗排：coarse_query 余弦排序 + 查重门走查 → top-30 非重复。
-            #    重复计数由 coarse_rank 的既有汇总行落日志（grep 锚点
-            #    "video match: coarse rank ... duplicates=N"），不重复打点。
-            top30, _dup_skips = coarse_rank(
-                pool, queries.coarse_query, vector_cache, embedding_gate
-            )
-            # 段级粗排完成即持久化新学到的 premise:// 向量（flush 是缓存的
-            # fail-soft 契约，普通 dict 无此方法 = 跳过）。coarse_rank 本身
-            # 保持纯打分，不做 IO。
-            flush = getattr(vector_cache, "flush", None)
-            if callable(flush):
-                flush()
+                # 3. 粗排：coarse_query 余弦排序 + 查重门走查 → top-30 非重复。
+                #    重复计数由 coarse_rank 的既有汇总行落日志（grep 锚点
+                #    "video match: coarse rank ... duplicates=N"），不重复打点。
+                top30, _dup_skips = coarse_rank(
+                    pool, queries.coarse_query, vector_cache, embedding_gate
+                )
+                # 段级粗排完成即持久化新学到的 premise:// 向量（flush 是缓存的
+                # fail-soft 契约，普通 dict 无此方法 = 跳过）。coarse_rank 本身
+                # 保持纯打分，不做 IO。
+                flush = getattr(vector_cache, "flush", None)
+                if callable(flush):
+                    flush()
 
-            # 4. 精排：fine_query 全量降序重排；开关关闭 → 粗排序 + 独立
-            #    日志行；调用本身抛异常 → 粗排序兜底（重排模块内部已
-            #    fail-open，这里只兜"调用被替换/抛异常"的情况，镜像旧实现）。
-            #    rerank_candidates 消费 MaterialInfo 列表（读 source_info
-            #    缩略图），这里把 top-30 候选还原为素材对象送重排，再按
-            #    URL 映射回候选 dict（池内 URL 唯一，映射无损）。
-            if material_rerank.is_rerank_enabled():
-                try:
-                    reranked_items = material_rerank.rerank_candidates(
-                        queries.fine_query,
-                        [c["item"] for c in top30],
-                    )
-                    by_url = {c["url"]: c for c in top30}
-                    ranked = [by_url[str(item.url)] for item in reranked_items]
-                except Exception as exc:
-                    logger.warning(
-                        "video match: fine rerank failed, falling back to "
-                        f"coarse order: error={type(exc).__name__}, detail={exc}"
-                    )
-                    ranked = top30
-            else:
-                logger.info("video match: fine rerank disabled, using coarse order")
-                ranked = top30
-
-            # 5. VLM 走查：fine 序前 walk_limit 个，配额满即提前退出。
-            accepted_terms: set[str] = set()
-            for candidate in ranked[:walk_limit]:
-                if len(clips) >= needed_clips:
-                    break
-                url = str(candidate.get("url") or "")
-                asset_id = str(candidate.get("asset_id") or "")
-                term = str(candidate.get("term") or "")
-                # 查重门复判（cache-hit 安全）：粗排边界已判过一次，这里
-                # 兜"粗排之后才被采纳注册"的近重复；向量全部命中共享缓存，
-                # 零新增嵌入。门自身异常 fail-open 放行，交给 VLM 终审。
-                try:
-                    duplicate = (
-                        embedding_gate.judge_candidate_embedding(
-                            url,
-                            str(candidate.get("data_uri") or ""),
-                            term,
+                # 4. 精排：fine_query 全量降序重排；开关关闭 → 粗排序 + 独立
+                #    日志行；调用本身抛异常 → 粗排序兜底（重排模块内部已
+                #    fail-open，这里只兜"调用被替换/抛异常"的情况，镜像旧实现）。
+                #    rerank_candidates 消费 MaterialInfo 列表（读 source_info
+                #    缩略图），这里把 top-30 候选还原为素材对象送重排，再按
+                #    URL 映射回候选 dict（池内 URL 唯一，映射无损）。
+                if material_rerank.is_rerank_enabled():
+                    try:
+                        reranked_items = material_rerank.rerank_candidates(
+                            queries.fine_query,
+                            [c["item"] for c in top30],
                         )
-                        if embedding_gate is not None
-                        else None
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "embedding gate failed, fail-open: "
-                        f"asset_id={asset_id}, error={type(exc).__name__}"
-                    )
-                    duplicate = None
-                if duplicate is not None:
-                    # 重复是终审拒绝（plan T5）：不下载、不采纳、无兜底；
-                    # 审计记录保留，让审计链显示门在走查层再次生效。
+                        by_url = {c["url"]: c for c in top30}
+                        ranked = [by_url[str(item.url)] for item in reranked_items]
+                    except Exception as exc:
+                        logger.warning(
+                            "video match: fine rerank failed, falling back to "
+                            f"coarse order: error={type(exc).__name__}, detail={exc}"
+                        )
+                        ranked = top30
+                else:
+                    logger.info("video match: fine rerank disabled, using coarse order")
+                    ranked = top30
+
+                # 5. VLM 走查：fine 序前 walk_limit 个，配额满即提前退出。
+                accepted_terms: set[str] = set()
+                for candidate in ranked[:walk_limit]:
+                    if len(clips) >= needed_clips:
+                        break
+                    url = str(candidate.get("url") or "")
+                    asset_id = str(candidate.get("asset_id") or "")
+                    term = str(candidate.get("term") or "")
+                    # 查重门复判（cache-hit 安全）：粗排边界已判过一次，这里
+                    # 兜"粗排之后才被采纳注册"的近重复；向量全部命中共享缓存，
+                    # 零新增嵌入。门自身异常 fail-open 放行，交给 VLM 终审。
+                    try:
+                        duplicate = (
+                            embedding_gate.judge_candidate_embedding(
+                                url,
+                                str(candidate.get("data_uri") or ""),
+                                term,
+                            )
+                            if embedding_gate is not None
+                            else None
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "embedding gate failed, fail-open: "
+                            f"asset_id={asset_id}, error={type(exc).__name__}"
+                        )
+                        duplicate = None
+                    if duplicate is not None:
+                        # 重复是终审拒绝（plan T5）：不下载、不采纳、无兜底；
+                        # 审计记录保留，让审计链显示门在走查层再次生效。
+                        logger.info(
+                            "vlm filter rejected candidate: "
+                            f"asset_id={asset_id}, verdict=duplicate, "
+                            f"reason={duplicate.get('reason')!r}, "
+                            f"image_source=embedding, "
+                            f"duplicate_of={duplicate.get('duplicate_of')}, "
+                            f"cos={duplicate.get('cos')}"
+                        )
+                        vlm_filter_records.append(
+                            {
+                                "term": term,
+                                "asset_id": asset_id,
+                                "verdict": duplicate.get("verdict", "duplicate"),
+                                "reason": duplicate.get("reason", ""),
+                                "image_source": "embedding",
+                                "attempts": 0,
+                                "duplicate_of": duplicate.get("duplicate_of"),
+                                "cos": duplicate.get("cos"),
+                            }
+                        )
+                        continue
+                    try:
+                        verdict = judge_candidate(
+                            item=candidate.get("item"),
+                            segment_text=segment_text,
+                            search_term=term,
+                        )
+                    except Exception as exc:
+                        # 单候选判定异常 = 跳过该候选继续走查，绝不阻塞
+                        # （判定是质量增强，不是硬闸；生产判定回调自身
+                        # fail-open，这里兜第三方/测试替身实现抛异常）。
+                        logger.warning(
+                            "vlm judge failed, fail-open: "
+                            f"asset_id={asset_id}, error={type(exc).__name__}, "
+                            f"detail={exc}"
+                        )
+                        continue
+                    if not isinstance(verdict, dict):
+                        logger.warning(
+                            "vlm judge returned unusable verdict, skip candidate: "
+                            f"asset_id={asset_id}, verdict={verdict!r}"
+                        )
+                        continue
+                    v = str(verdict.get("verdict") or "")
+                    vlm_filter_records.append(verdict)
+                    if v in ("irrelevant", "duplicate"):
+                        logger.info(
+                            "vlm filter rejected candidate: "
+                            f"asset_id={verdict.get('asset_id')}, "
+                            f"verdict={v}, "
+                            f"reason={verdict.get('reason')!r}, "
+                            f"image_source={verdict.get('image_source')}"
+                        )
+                        continue
+                    if v == "uncertain":
+                        # uncertain 不再兜底采纳（旧 last-resort 已被 image-gen
+                        # 回填取代）：跳过并留独立日志行（plan video-match：
+                        # uncertain = skip + distinct log）。
+                        logger.info(
+                            "vlm filter uncertain candidate skipped: "
+                            f"asset_id={verdict.get('asset_id')}, "
+                            f"reason={verdict.get('reason')!r}, "
+                            f"image_source={verdict.get('image_source')}"
+                        )
+                        continue
                     logger.info(
-                        "vlm filter rejected candidate: "
-                        f"asset_id={asset_id}, verdict=duplicate, "
-                        f"reason={duplicate.get('reason')!r}, "
-                        f"image_source=embedding, "
-                        f"duplicate_of={duplicate.get('duplicate_of')}, "
-                        f"cos={duplicate.get('cos')}"
-                    )
-                    vlm_filter_records.append(
-                        {
-                            "term": term,
-                            "asset_id": asset_id,
-                            "verdict": duplicate.get("verdict", "duplicate"),
-                            "reason": duplicate.get("reason", ""),
-                            "image_source": "embedding",
-                            "attempts": 0,
-                            "duplicate_of": duplicate.get("duplicate_of"),
-                            "cos": duplicate.get("cos"),
-                        }
-                    )
-                    continue
-                try:
-                    verdict = judge_candidate(
-                        item=candidate.get("item"),
-                        segment_text=segment_text,
-                        search_term=term,
-                    )
-                except Exception as exc:
-                    # 单候选判定异常 = 跳过该候选继续走查，绝不阻塞
-                    # （判定是质量增强，不是硬闸；生产判定回调自身
-                    # fail-open，这里兜第三方/测试替身实现抛异常）。
-                    logger.warning(
-                        "vlm judge failed, fail-open: "
-                        f"asset_id={asset_id}, error={type(exc).__name__}, "
-                        f"detail={exc}"
-                    )
-                    continue
-                if not isinstance(verdict, dict):
-                    logger.warning(
-                        "vlm judge returned unusable verdict, skip candidate: "
-                        f"asset_id={asset_id}, verdict={verdict!r}"
-                    )
-                    continue
-                v = str(verdict.get("verdict") or "")
-                vlm_filter_records.append(verdict)
-                if v in ("irrelevant", "duplicate"):
-                    logger.info(
-                        "vlm filter rejected candidate: "
+                        "vlm filter accepted candidate: "
                         f"asset_id={verdict.get('asset_id')}, "
                         f"verdict={v}, "
-                        f"reason={verdict.get('reason')!r}, "
                         f"image_source={verdict.get('image_source')}"
                     )
-                    continue
-                if v == "uncertain":
-                    # uncertain 不再兜底采纳（旧 last-resort 已被 image-gen
-                    # 回填取代）：跳过并留独立日志行（plan video-match：
-                    # uncertain = skip + distinct log）。
-                    logger.info(
-                        "vlm filter uncertain candidate skipped: "
-                        f"asset_id={verdict.get('asset_id')}, "
-                        f"reason={verdict.get('reason')!r}, "
-                        f"image_source={verdict.get('image_source')}"
-                    )
-                    continue
-                logger.info(
-                    "vlm filter accepted candidate: "
-                    f"asset_id={verdict.get('asset_id')}, "
-                    f"verdict={v}, "
-                    f"image_source={verdict.get('image_source')}"
-                )
-                saved = ""
-                try:
-                    saved = save_video(video_url=url, save_dir=material_directory)
-                except Exception as exc:
-                    logger.warning(
-                        "failed to download segment clip: "
-                        f"provider={getattr(candidate.get('item'), 'provider', '')}, "
-                        f"error={type(exc).__name__}, detail={exc}"
-                    )
-                if saved and saved not in clips:
-                    logger.info(f"segment clip saved: {saved}")
-                    clips.append(saved)
-                    clip_sources.append(
-                        {"url": url, "local_file": Path(saved).name}
-                    )
-                    used_urls.add(url)
-                    accepted_terms.add(term)
-                    if not resolved_term:
-                        resolved_term = term
-                        fallback_level = "self"
-                    if embedding_gate is not None:
-                        try:
-                            embedding_gate.register_accepted(url)
-                        except Exception as exc:
-                            # 注册失败只降级为告警：查重注册绝不中断素材链路
-                            #（镜像旧 on_clip_accepted 的容错语义）。
-                            logger.warning(
-                                "embedding gate register failed: "
-                                f"url={url}, error={type(exc).__name__}, detail={exc}"
-                            )
-                    if len(clips) >= needed_clips:
-                        # 配额打满即提前退出走查（VLM 预算的核心约束）。
-                        break
-                # 下载失败继续看下一个候选（与旧实现一致）。
+                    saved = ""
+                    try:
+                        saved = save_video(video_url=url, save_dir=material_directory)
+                    except Exception as exc:
+                        logger.warning(
+                            "failed to download segment clip: "
+                            f"provider={getattr(candidate.get('item'), 'provider', '')}, "
+                            f"error={type(exc).__name__}, detail={exc}"
+                        )
+                    if saved and saved not in clips:
+                        logger.info(f"segment clip saved: {saved}")
+                        clips.append(saved)
+                        clip_sources.append(
+                            {"url": url, "local_file": Path(saved).name}
+                        )
+                        used_urls.add(url)
+                        accepted_terms.add(term)
+                        accepted_all.add(term)
+                        if not resolved_term:
+                            resolved_term = term
+                            fallback_level = "self"
+                        if embedding_gate is not None:
+                            try:
+                                embedding_gate.register_accepted(url)
+                            except Exception as exc:
+                                # 注册失败只降级为告警：查重注册绝不中断素材链路
+                                #（镜像旧 on_clip_accepted 的容错语义）。
+                                logger.warning(
+                                    "embedding gate register failed: "
+                                    f"url={url}, error={type(exc).__name__}, detail={exc}"
+                                )
+                        if len(clips) >= needed_clips:
+                            # 配额打满即提前退出走查（VLM 预算的核心约束）。
+                            break
+                    # 下载失败继续看下一个候选（与旧实现一致）。
+
+
+            # 两段序（plan todo 8）：premise 单遍（不打乱、零 stock 调用）；
+            # mixed = pass A premise 优先，配额未满才惰性建 stock 池跑 pass B；
+            # stock/legacy 单遍行为逐字节不变。采纳序即装配序：user 天然在前。
+            # 注意 accepted_terms 现按 pass 维护——search_attempts 审计仍按
+            # stock 词条归因（premise 候选 term 为空，不参与 found 判定）。
+            accepted_all: set[str] = set()
+            if premise_mode:
+                run_funnel(build_premise_pool(), do_shuffle=False)
+            elif mixed_mode:
+                run_funnel(build_premise_pool(), do_shuffle=False)
+                if len(clips) < needed_clips:
+                    run_funnel(build_stock_pool(), do_shuffle=True)
+            else:
+                run_funnel(build_stock_pool(), do_shuffle=True)
 
             # 走查审计：合并池之后逐词条的"贡献了候选"可从池归因，
             # "产出成片"按采纳候选的出处词条归因（镜像旧 found 语义）。
             search_attempts = [
-                {"level": "self", "term": term, "found": term in accepted_terms}
+                {"level": "self", "term": term, "found": term in accepted_all}
                 for term in terms
             ]
 

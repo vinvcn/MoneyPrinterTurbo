@@ -14,6 +14,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -330,3 +331,65 @@ def test_vlm_judge_premise_first_frame_local_fallback(registry):
     assert ji.call_args.kwargs["image_data_uri"] == expected, "VLM 输入必须是本地 jpeg 字节 data URI"
     assert record["image_source"] == "premise_local"
     assert record["verdict"] == "relevant"
+
+
+# ---------------------------------------------------------------------------
+# todo 8 接线：pipeline 把 source + premise_pool 交给 match_segments
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("source", ["premise", "mixed", "stock", "pexels"])
+def test_make_premise_pool_only_for_premise_sources(source, registry):
+    _seed_materials(count=2)
+    pool_cb = task._make_premise_pool(_params(source, OWNER))
+    if source in ("premise", "mixed"):
+        assert callable(pool_cb)
+        assert [i.url for i in pool_cb()] == [f"premise://{OWNER}/m1/0", f"premise://{OWNER}/m1/1"]
+    else:
+        assert pool_cb is None
+
+
+def test_pipeline_passes_source_and_premise_pool_to_match_segments(registry):
+    _seed_materials(count=2)
+    captured: dict = {}
+
+    def fake_match(**kwargs):
+        captured.update(kwargs)
+        return [SimpleNamespace(clips=["c.mp4"], holes=[])]
+
+    def fake_state(*_a, **_k):
+        return None
+
+    with (
+        patch.object(task.sm.state, "update_task", fake_state),
+        patch.object(task.sm.state, "get_task", fake_state),
+        patch.object(
+            task.segmenter,
+            "segment_script",
+            lambda script: [SimpleNamespace(index=0, text="hello world", estimated_duration=3.0)],
+        ),
+        patch.object(task, "save_script_data", lambda *a, **k: None),
+        patch.object(task.segment_material, "english_search_term", lambda text: "noodles"),
+        patch.object(
+            task.segment_audio,
+            "prepare_segment_audio",
+            lambda **kwargs: SimpleNamespace(
+                ok=True, audio_file="a.mp3", total_duration_ms=1500, error=None,
+                segments=[{"index": 0, "text": "hello", "audio_file": "a-0.mp3", "start_ms": 0, "duration_ms": 1500}],
+            ),
+        ),
+        patch.object(task.image_embedding, "is_duplicate_gate_enabled", return_value=False),
+        patch.object(task.vlm_judge, "is_enabled", return_value=False),
+        patch.object(task.video_match, "match_segments", side_effect=fake_match),
+        patch.object(task.segment_material, "persist_segment_material_sources", lambda *a, **k: None),
+        patch.object(task.segment_material, "segments_to_records", lambda materials: []),
+        patch.object(task.utils, "task_dir", lambda sub_dir="": "/tmp"),
+    ):
+        task._run_segment_first_pipeline(
+            "t-wire8", _params("premise", OWNER), "hello world", stop_at="materials"
+        )
+
+    assert captured.get("source") == "premise"
+    premise_pool = captured.get("premise_pool")
+    assert callable(premise_pool)
+    assert [i.url for i in premise_pool()] == [f"premise://{OWNER}/m1/0", f"premise://{OWNER}/m1/1"]
+    assert callable(captured.get("search_videos")), "stock 回调照常在场（pass B / stock 单遍共用）"
