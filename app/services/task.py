@@ -1,6 +1,7 @@
 import math
 import os
 import re
+import shutil
 import socket
 import threading
 import time
@@ -13,7 +14,7 @@ from loguru import logger
 
 from app.config import config
 from app.models import const
-from app.models.schema import VideoConcatMode, VideoParams
+from app.models.schema import MaterialInfo, VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
 from app.services import (
     elevenlabs_music,
@@ -28,6 +29,7 @@ from app.services import (
 )
 from app.services import upload_post
 from app.services import state as sm
+from app.services import user_materials
 from app.services import user_material_vectors
 from app.services import (
     image_embedding,
@@ -1111,6 +1113,118 @@ def _schedule_cross_post(
     return None
 
 
+# ---------------------------------------------------------------------------
+# video_source 源路由（plan todo 7）：stock 等价现行多供应商搜索；premise 仅
+# 用户素材池（关键词被忽略，检索=全量返回，Metis #4：匹配交给粗排嵌入）；
+# mixed 的 premise+stock 两遍序属 todo 8，在此之前等同 stock（仅 owner_id
+# 校验不同）。legacy 值 pexels|pixabay|coverr|local 行为逐字节不变。
+# ---------------------------------------------------------------------------
+
+_OWNER_ID_REQUIRED = "owner_id_required"
+_PREMISE_SOURCES = ("premise", "mixed")
+
+
+def _require_owner_id(params) -> str:
+    source = str(getattr(params, "video_source", "") or "")
+    owner_id = str(getattr(params, "owner_id", "") or "").strip()
+    if source in _PREMISE_SOURCES and not owner_id:
+        raise ValueError(_OWNER_ID_REQUIRED)
+    return owner_id
+
+
+def premise_pool_materials(owner_id: str) -> list[MaterialInfo]:
+    """ready 素材池 -> 漏斗候选 MaterialInfo 列表；cap 读 [user_materials].max_candidates。
+
+    stock 的每供应商 20-cap 与缓存层完全不参与（plan scope）；文件缺失不在
+    此判定——builder 的 data_uri 与 save 的拷贝各自降级。
+    """
+    section = getattr(config, "user_materials", None) or {}
+    try:
+        cap = max(1, int(section.get("max_candidates", 500)))
+    except (TypeError, ValueError):
+        cap = 500
+    items: list[MaterialInfo] = []
+    for row in user_materials.pool(owner_id, cap=cap):
+        asset = f"{row['material_id']}/{row['idx']}"
+        items.append(
+            MaterialInfo(
+                provider="user_material",
+                url=row["url"],
+                duration=int(round(row["t_end"] - row["t_start"])),
+                source_info={
+                    "provider": "user_material",
+                    "asset_id": asset,
+                    "search_term": "",
+                    "thumbnail_url": "",
+                    "rendition": {
+                        "id": asset,
+                        "material_id": row["material_id"],
+                        "idx": row["idx"],
+                        "rev": row["rev"],
+                        "t_start": row["t_start"],
+                        "t_end": row["t_end"],
+                    },
+                },
+            )
+        )
+    return items
+
+
+def _make_search_videos(params):
+    """构建 match_segments 的搜索回调（premise 直读本地 registry，其余走多供应商）。"""
+    source = str(getattr(params, "video_source", "") or "")
+    owner_id = _require_owner_id(params)
+
+    def search_videos(
+        search_term: str,
+        minimum_duration=None,
+        video_aspect=None,
+        page: int = 1,
+    ) -> list[MaterialInfo]:
+        if source == "premise":
+            # registry 一次给全（"return all"）；翻页语义返回空。
+            if max(1, int(page or 1)) > 1:
+                return []
+            return premise_pool_materials(owner_id)
+        return material.search_videos_multi_provider(
+            search_term=search_term,
+            minimum_duration=params.video_clip_duration
+            if minimum_duration is None
+            else minimum_duration,
+            video_aspect=params.video_aspect if video_aspect is None else video_aspect,
+            page=max(1, int(page or 1)),
+        )
+
+    return search_videos
+
+
+def _preflight_search_provider(params) -> None:
+    """VLM-on 的 no-provider 快速失败；premise/mixed 跳过（零 key 不得硬失败）。"""
+    source = str(getattr(params, "video_source", "") or "")
+    if source in _PREMISE_SOURCES:
+        return
+    if vlm_judge.is_enabled():
+        material.assert_search_provider_available()
+
+
+def _make_save_video(params, task_material_dir: str):
+    """构建 save_video 回调：premise:// 从本地素材目录拷贝，其余走 material.save_video。"""
+
+    def save_video(video_url: str, save_dir: str = "") -> str:
+        url = str(video_url or "")
+        if url.startswith("premise://"):
+            resolved = user_materials.resolve_premise_url(url)
+            if resolved is None:
+                raise FileNotFoundError(f"premise material unavailable: {url}")
+            identity = url[len("premise://") :].replace("/", "-")
+            target = os.path.join(task_material_dir, f"premise-{identity}.mp4")
+            shutil.copyfile(resolved[0], target)
+            return target
+        return material.save_video(video_url=url, save_dir=task_material_dir)
+
+    return save_video
+
+
 def _run_segment_first_pipeline(
     task_id,
     params: VideoParams,
@@ -1131,6 +1245,11 @@ def _run_segment_first_pipeline(
     对应中间产物，其余值继续走到完整成片。（本函数没有 terms 分支；生产
     调用方 ``_run_pipeline`` 对 terms / subtitle 仍路由回旧流程。）
     """
+    try:
+        _require_owner_id(params)
+    except ValueError as exc:
+        return _mark_task_failed(task_id, "materials", str(exc))
+
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
 
     segments = segmenter.segment_script(video_script)
@@ -1259,32 +1378,11 @@ def _run_segment_first_pipeline(
 
     task_material_dir = utils.task_dir(task_id)
 
-    def search_videos(
-        search_term: str,
-        minimum_duration=None,
-        video_aspect=None,
-        page: int = 1,
-    ):
-        # 页感知搜索回调：match_segments 按 (词条, 页) 逐页取候选，这里把
-        # 页码透传给多供应商并行搜索（segment-first 并行查询所有已配置
-        # key 的供应商），只服务单次 (词条, 页) 取数；(词条, 页) 级备忘由
-        # match_segments 自持。
-        return material.search_videos_multi_provider(
-            search_term=search_term,
-            minimum_duration=params.video_clip_duration
-            if minimum_duration is None
-            else minimum_duration,
-            video_aspect=params.video_aspect
-            if video_aspect is None
-            else video_aspect,
-            page=max(1, int(page or 1)),
-        )
-
-    def save_video(video_url: str, save_dir: str = "") -> str:
-        # 镜像旧接线：segment-first 素材固定下载进任务目录，忽略 match
-        # 层透传的 save_dir（其取值来自 [app] material_directory 的模块级
-        # 兜底解析，本流程覆盖为任务目录）。
-        return material.save_video(video_url=video_url, save_dir=task_material_dir)
+    # 页感知搜索/保存回调工厂：stock 透传多供应商，premise 直读本地 registry
+    # （见 _make_search_videos / _make_save_video；(词条, 页) 级备忘由
+    # match_segments 自持）。
+    search_videos = _make_search_videos(params)
+    save_video = _make_save_video(params, task_material_dir)
 
     def generate_image(
         segment: dict, duration=None, refined_prompt=None, framing=""
@@ -1304,8 +1402,9 @@ def _run_segment_first_pipeline(
 
     # VLM-on 才会搜索素材：零 key 在搜索开始前快速失败并给出可操作提示；
     # VLM-off 时整段走 image-gen 回填，不触在线供应商，预检跳过。
-    if vlm_judge.is_enabled():
-        material.assert_search_provider_available()
+    # premise/mixed 同样跳过（用户素材路径不依赖在线供应商，Metis #5 的
+    # 零 key mixed 降级由 todo 8 两遍序承接）。
+    _preflight_search_provider(params)
 
     materials = video_match.match_segments(
         segments=segment_records,

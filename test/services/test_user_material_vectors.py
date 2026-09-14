@@ -201,10 +201,22 @@ def test_evict_material_purges_only_matching_vectors(registry):
 
 def test_gate_off_funnel_persists_through_explicit_param(registry):
     """duplicate_gate=false（无 EmbeddingGate）：match_segments 拿显式 vector_cache
-    绕开 isinstance(dict) 私有取回链，coarse 段后 flush 真实落库。"""
+    绕开 isinstance(dict) 私有取回链，coarse 段后 flush 真实落库。
+
+    todo-7 起 premise:// 候选的 data_uri 来自本地 registry（read_thumb_b64），
+    测试同步播种素材并断言任何 HTTP 缩略图路径都不参与（boom 桩）。
+    """
+    um.begin_push("owner-1", "mat-2026", 0)
+    with open(um.put_file("owner-1", "mat-2026", 0, 0, "clip"), "wb") as f:
+        f.write(b"X")
+    with open(um.put_file("owner-1", "mat-2026", 0, 0, "thumb"), "wb") as f:
+        f.write(b"TT")
+    um.complete("owner-1", "mat-2026", 0, [{"idx": 0, "t_start": 0.0, "t_end": 5.0, "duration": 5.0}])
+    thumb_uri = um.read_thumb_b64("owner-1", "mat-2026", 0)
+
     item = MaterialInfo(
-        provider="p", url=PREMISE_URL, duration=10,
-        source_info={"asset_id": "a0", "thumbnail_url": "thumb-0"},
+        provider="user_material", url=PREMISE_URL, duration=10,
+        source_info={"asset_id": "mat-2026/0", "thumbnail_url": ""},
     )
 
     def fake_llm(prompt):
@@ -219,13 +231,16 @@ def test_gate_off_funnel_persists_through_explicit_param(registry):
     def fake_save(video_url, save_dir=""):
         return f"/saved/{video_url.rsplit('/', 1)[-1]}"
 
+    def _no_http(*_a, **_k):
+        raise AssertionError("premise bytes must never go over HTTP (Metis #10)")
+
     cache = PersistentVectorCache()
     with (
         patch.object(video_match.llm, "generate_response", side_effect=fake_llm),
-        patch.object(video_match, "download_thumbnail_bytes", lambda url: (url.encode(), (640, 320))),
-        patch.object(video_match, "to_data_uri", lambda payload: payload.decode()),
+        patch.object(video_match, "download_thumbnail_bytes", side_effect=_no_http),
+        patch.object(video_match, "to_data_uri", side_effect=_no_http),
         patch.object(image_embedding, "embed_text", return_value=[1.0, 0.0]),
-        patch.object(image_embedding, "embed_image", _StubEmbedImage({"thumb-0": [1.0, 0.0]})),
+        patch.object(image_embedding, "embed_image", _StubEmbedImage({thumb_uri: [1.0, 0.0]})),
         patch.object(video_match.material_rerank, "is_rerank_enabled", return_value=False),
         patch.object(video_match.material_rerank, "_walk_limit", return_value=5),
     ):

@@ -30,6 +30,7 @@ from app.services import image_embedding
 from app.services import image_gen
 from app.services import llm
 from app.services import material_rerank
+from app.services import user_materials
 from app.services.segment_material import (
     CLIPS_PER_SEGMENT,
     SegmentMaterials,
@@ -382,6 +383,31 @@ def _candidate_from_item(item: MaterialInfo, term: str) -> dict:
     }
 
 
+def _premise_candidate_from_item(item: MaterialInfo, term: str) -> dict:
+    """premise:// MaterialInfo → 粗排候选 dict（与 _candidate_from_item 同契约）。
+
+    唯一差异：data_uri 从本地素材目录的首帧 jpg 读出（Go 侧派生，Metis #10
+    绝不为 premise 字节走 HTTP）；缩略图缺失/素材未 ready 时按既有的空
+    data_uri 契约沉底。url 原样保留 = 向量缓存的键身份（todo 6 契约）。
+    """
+    source = item.source_info if isinstance(item.source_info, dict) else {}
+    data_uri = ""
+    resolved = user_materials.resolve_premise_url(str(item.url or ""))
+    if resolved is not None:
+        row = resolved[2]
+        try:
+            data_uri = user_materials.read_thumb_b64(row["owner"], row["material_id"], row["idx"])
+        except ValueError:
+            data_uri = ""
+    return {
+        "asset_id": str(source.get("asset_id") or ""),
+        "url": str(item.url or ""),
+        "data_uri": data_uri,
+        "term": term,
+        "item": item,
+    }
+
+
 def _search_terms_for_queries(queries: SegmentQueries, subject: str) -> list[str]:
     """
     漏斗入口词条：queries.terms 为主，空词条时回落英文主题词。
@@ -612,7 +638,10 @@ def match_segments(
                             dedup_dropped += 1
                             continue
                         pool_urls.add(url)
-                        pool.append(_candidate_from_item(item, term))
+                        if url.startswith("premise://"):
+                            pool.append(_premise_candidate_from_item(item, term))
+                        else:
+                            pool.append(_candidate_from_item(item, term))
                 active_terms = still_active
             logger.info(
                 "candidate pool assembled: "

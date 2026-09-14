@@ -87,6 +87,11 @@ class VideoParams(BaseModel):
     match_materials_to_script: bool = False
     video_count: int = Field(default=1, ge=1)
 
+    # 素材来源。segment-first 接受值：
+    #   stock（= 供应商池，等价 pexels|pixabay|coverr 的现行多供应商搜索）、
+    #   premise（仅用户素材库，需 owner_id）、mixed（premise+stock，todo 8
+    #   两遍序）；legacy 值 pexels|pixabay|coverr|local 行为不变。
+    # 有意保持自由字符串（不做枚举）：未知值走现行 stock 路径，向后兼容。
     video_source: Optional[str] = "pexels"
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
@@ -222,6 +227,13 @@ class TaskVideoRequest(VideoParams, BaseModel):
         description=(
             "Client-assigned UUID used verbatim as the MPT task id for "
             "idempotent submission. Omit to keep the default server-generated id."
+        ),
+    )
+    owner_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Tenancy key of the user-material (premise) registry. Required "
+            "when video_source is 'premise' or 'mixed'; ignored otherwise."
         ),
     )
 
