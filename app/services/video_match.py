@@ -16,6 +16,7 @@ llm.generate_response 调用同时产出三类查询；响应无法解析出 JSO
 import json
 import random
 import re
+from collections.abc import MutableMapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -227,7 +228,7 @@ _COARSE_TOP_K = 30
 def coarse_rank(
     pool: list[dict],
     coarse_query: str | None,
-    vector_cache: dict[str, list[float]] | None,
+    vector_cache: MutableMapping[str, list[float]] | None,
     embedding_gate: image_embedding.EmbeddingGate | None,
 ) -> tuple[list[dict], list[dict]]:
     """
@@ -409,6 +410,7 @@ def match_segments(
     judge_candidate: Callable[..., dict] | None = None,
     embedding_gate: image_embedding.EmbeddingGate | None = None,
     generate_image: Callable[..., tuple[str, dict]] | None = None,
+    vector_cache: MutableMapping[str, list[float]] | None = None,
 ) -> list[SegmentMaterials]:
     """
     三段漏斗素材匹配主编排：粗排（embedding 召回）→ 精排（VL 重排）→
@@ -514,14 +516,16 @@ def match_segments(
     # 下载采纳都入册，查重门注册同步进行。
     used_urls: set[str] = set()
 
-    # 任务级 url->向量缓存：粗排与查重门共享同一份 dict。task.py 构造
-    # gate 时注入 vector_cache，这里取回同一份（私有访问先例与
-    # material_rerank._walk_limit 相同）；gate 缺席时退化为局部缓存。
-    vector_cache: dict[str, list[float]] = {}
-    if embedding_gate is not None:
-        shared = getattr(embedding_gate, "_shared_cache", None)
-        if isinstance(shared, dict):
-            vector_cache = shared
+    # 任务级 url->向量缓存：优先用调用方显式注入的实例（PersistentVectorCache
+    # 经 task.py 传入——显式参数就是绕开 isinstance(shared, dict) 取回链的
+    # 通道）。未显式注入时保持旧行为：gate 在场则共享其 _shared_cache，否则
+    # 局部私有 dict。
+    if vector_cache is None:
+        vector_cache = {}
+        if embedding_gate is not None:
+            shared = getattr(embedding_gate, "_shared_cache", None)
+            if isinstance(shared, dict):
+                vector_cache = shared
 
     # VLM 走查预算：与旧实现同一先例——直接读 material_rerank._walk_limit
     # （私有访问先例已在 segment_material.py 建立），每次运行只读一次。
@@ -626,6 +630,12 @@ def match_segments(
             top30, _dup_skips = coarse_rank(
                 pool, queries.coarse_query, vector_cache, embedding_gate
             )
+            # 段级粗排完成即持久化新学到的 premise:// 向量（flush 是缓存的
+            # fail-soft 契约，普通 dict 无此方法 = 跳过）。coarse_rank 本身
+            # 保持纯打分，不做 IO。
+            flush = getattr(vector_cache, "flush", None)
+            if callable(flush):
+                flush()
 
             # 4. 精排：fine_query 全量降序重排；开关关闭 → 粗排序 + 独立
             #    日志行；调用本身抛异常 → 粗排序兜底（重排模块内部已

@@ -28,6 +28,7 @@ from app.services import (
 )
 from app.services import upload_post
 from app.services import state as sm
+from app.services import user_material_vectors
 from app.services import (
     image_embedding,
     image_gen,
@@ -1239,8 +1240,11 @@ def _run_segment_first_pipeline(
     # 注册表，跨段重复画面在 VLM 之前被拒收。
     embedding_gate = None
     duplicate_gate_on = image_embedding.is_duplicate_gate_enabled()
+    # 持久向量缓存提到查重门之上、无条件构造（gate-off 时粗排的 premise://
+    # 向量同样经 match_segments 段末 flush 落库跨任务复用）；gate-on 时注入
+    # 同一实例，粗排预热与门走查共享（同一 URL 全链路只嵌入一次）。
+    vector_cache = user_material_vectors.PersistentVectorCache()
     if duplicate_gate_on:
-        vector_cache: dict[str, list[float]] = {}
         embedding_gate = image_embedding.make_default_gate(vector_cache=vector_cache)
         logger.info(
             "image embedding gate enabled: "
@@ -1313,6 +1317,7 @@ def _run_segment_first_pipeline(
         judge_candidate=segment_judge,
         embedding_gate=embedding_gate,
         generate_image=generate_image,
+        vector_cache=vector_cache,
     )
     segment_material.persist_segment_material_sources(task_id, materials)
 
