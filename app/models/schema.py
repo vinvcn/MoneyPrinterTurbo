@@ -475,3 +475,42 @@ class VideoMaterialUploadResponse(BaseResponse):
                 },
             },
         }
+
+
+class UserMaterialFootageTiming(BaseModel):
+    idx: int = Field(..., ge=0, description="0-based footage index")
+    t_start: float = Field(..., ge=0, description="footage start seconds in the source")
+    t_end: float = Field(..., ge=0, description="footage end seconds in the source")
+    duration: float = Field(..., ge=0, description="clip duration seconds")
+
+
+class UserMaterialCompleteRequest(BaseModel):
+    rev: int = Field(..., ge=0, description="push revision being finalized")
+    footages: List[UserMaterialFootageTiming] = Field(
+        ..., min_length=1, description="manifest; every idx must have clip+thumb staged"
+    )
+
+
+class UserMaterialEntry(BaseModel):
+    material_id: str
+    rev: int
+    footage_count: int
+    total_bytes: int
+
+
+class UserMaterialListResponse(BaseModel):
+    materials: List[UserMaterialEntry]
+
+
+class UserMaterialFilePushResponse(BaseModel):
+    idx: int
+    kind: str
+    rev: int
+    bytes_written: int
+
+
+class UserMaterialCompleteResponse(BaseModel):
+    material_id: str
+    rev: int
+    footage_count: int
+    total_bytes: int
