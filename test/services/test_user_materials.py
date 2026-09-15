@@ -66,7 +66,9 @@ def _manifest(count: int = 2) -> list[dict[str, float]]:
 def registry(tmp_path, monkeypatch):
     monkeypatch.setattr(um, "_storage_root", lambda create=False: str(tmp_path))
     monkeypatch.setattr(um, "_conn", None)
-    monkeypatch.setattr(um, "_last_sweep_monotonic", 0.0)
+    # None = “从未清扫”：不能写 0.0，因为 time.monotonic() 在 Linux 上是开机计时，
+    # CI 冷启动 VM 的 uptime < 1h 会让 0.0 被当成“刚刚清扫过”而永久跳过 sweep。
+    monkeypatch.setattr(um, "_last_sweep_monotonic", None)
     yield tmp_path
     if um._conn is not None:
         um._conn.close()
