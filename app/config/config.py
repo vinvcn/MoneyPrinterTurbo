@@ -581,6 +581,17 @@ material_rerank = _SynchronizedConfig(
         },
     )
 )
+user_materials = _SynchronizedConfig(
+    _cfg.get(
+        "user_materials",
+        {
+            # [user_materials] 段缺失时用保守默认：本地素材镜像 TTL 15 天、
+            # 粗排候选池上限 500（plan Metis #9/#15），与 Go 侧清扫参数一致。
+            "max_age_days": 15,
+            "max_candidates": 500,
+        },
+    )
+)
 ui = _SynchronizedConfig(
     _cfg.get(
         "ui",

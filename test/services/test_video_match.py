@@ -1,6 +1,7 @@
 import json
 import math
 import random
+import statistics
 import sys
 import threading
 import time
@@ -1680,6 +1681,264 @@ class TestMatchSegments(unittest.TestCase):
                 "video match: non-positive duration" in m
                 for m in self._warning_messages(run)
             )
+        )
+
+
+# ---------------------------------------------------------------------------
+# todo 8：两段式 premise 优先（premise-only / mixed 两遍 / 装配顺序 / 零 key 降级）
+# ---------------------------------------------------------------------------
+
+def _premise_info(owner: str, mid: str, idx: int) -> MaterialInfo:
+    return MaterialInfo(
+        provider="user_material",
+        url=f"premise://{owner}/{mid}/{idx}",
+        duration=10,
+        source_info={"asset_id": f"{mid}/{idx}", "search_term": "", "thumbnail_url": ""},
+    )
+
+
+def _pass_builder():
+    """premise 候选 builder 的纯内存替身：todo-7 的 builder 单测已覆盖真实
+    磁盘读，本类只验证两段编排，不应触 DB。被调用即记数。"""
+    calls: list[str] = []
+
+    def build(item, term):
+        calls.append(str(item.url))
+        return {
+            "asset_id": str(item.source_info.get("asset_id") or ""),
+            "url": str(item.url),
+            "data_uri": f"premise-thumb::{item.url}",
+            "term": term,
+            "item": item,
+        }
+
+    return build, calls
+
+
+class TestTwoPassPremiseFirst(unittest.TestCase):
+    """plan todo 8：premise 只读 registry 且 stock 回调零调用；mixed 仅当
+    premise 未满配额才走 stock pass B；装配顺序 user 前 stock 后；pass B
+    的 provider-unavailable ValueError 降级为 [] 不硬失败。"""
+
+    @staticmethod
+    def _queries_json(terms: list[str]) -> str:
+        return json.dumps(
+            {"terms": terms, "coarse_query": "A broad scene.", "fine_query": "A precise moment."}
+        )
+
+    def _run(
+        self,
+        *,
+        source: str,
+        premise_items: list[MaterialInfo],
+        stock_pages: dict | None = None,
+        stock_raises: Exception | None = None,
+        judge=None,
+        save_raises: Exception | None = None,
+        walk_limit: int = 30,
+    ) -> SimpleNamespace:
+        searched: list[tuple[str, int]] = []
+        saved: list[str] = []
+        image_calls: list[tuple] = []
+
+        def fake_search(search_term, page=1, **_legacy):
+            searched.append((search_term, page))
+            if stock_raises is not None:
+                raise stock_raises
+            return list((stock_pages or {}).get((search_term, page), []))
+
+        def fake_save(video_url, save_dir=""):
+            if save_raises is not None:
+                raise save_raises
+            saved.append(video_url)
+            return f"/saved/{video_url.rsplit('/', 1)[-1]}"
+
+        def fake_judge(item, segment_text="", search_term=""):
+            if callable(judge):
+                return judge(item)
+            return _verdict_record("relevant")
+
+        def fake_image(segment, duration, refined_prompt, framing):
+            image_calls.append((duration, framing))
+            return (f"/saved/gen-{len(image_calls)}.mp4", {"source": "kolors"})
+
+        builder, built = _pass_builder()
+        premise_pool_calls: list[int] = []
+
+        def premise_pool():
+            premise_pool_calls.append(1)
+            return list(premise_items)
+
+        with (
+            patch.object(video_match.llm, "generate_response", return_value=self._queries_json(["kw"])),
+            patch.object(video_match, "_premise_candidate_from_item", side_effect=builder),
+            patch.object(video_match, "download_thumbnail_bytes", lambda url: (b"x", (640, 320))),
+            patch.object(video_match, "to_data_uri", lambda payload: "data"),
+            patch.object(image_embedding, "embed_text", return_value=[1.0, 0.0, 0.0]),
+            patch.object(image_embedding, "embed_image", return_value=[1.0, 0.0, 0.0]),
+            patch.object(video_match.material_rerank, "is_rerank_enabled", return_value=False),
+            patch.object(video_match.material_rerank, "_walk_limit", return_value=walk_limit),
+            patch.object(video_match.image_gen, "refine_scene_prompt", return_value="refined"),
+            patch.object(video_match, "logger"),
+        ):
+            results = video_match.match_segments(
+                segments=[{"index": 0, "text": "seg zero text", "duration": 9.0}],
+                video_subject="panda",
+                search_videos=fake_search,
+                save_video=fake_save,
+                video_aspect="9:16",
+                clip_duration=3,
+                judge_candidate=fake_judge,
+                generate_image=fake_image,
+                source=source,
+                premise_pool=premise_pool,
+            )
+        return SimpleNamespace(
+            results=results,
+            searched=searched,
+            saved=saved,
+            image_calls=image_calls,
+            built=built,
+            premise_pool_calls=premise_pool_calls,
+        )
+
+    def test_premise_mode_never_invokes_stock_search_and_skips_shuffle(self):
+        run = self._run(
+            source="premise",
+            premise_items=[_premise_info("o1", "m1", i) for i in range(5)],
+            stock_pages={("kw", 1): [_video_item(f"https://v.example/s{i}.mp4", "kw", f"img-{i}") for i in range(4)]},
+        )
+        self.assertEqual(run.searched, [], "premise 模式绝不触 stock 搜索回调")
+        self.assertEqual(len(run.premise_pool_calls), 1, "registry 一次读取（task 级 memo）")
+        self.assertEqual(run.saved, [f"premise://o1/m1/{i}" for i in range(3)][: len(run.saved)])
+        self.assertTrue(all(u.startswith("premise://") for u in run.saved))
+        # shuffle 跳过 => builder 按 registry 顺序进入（无供应商拼接偏差可打乱）
+        self.assertEqual(run.built, [f"premise://o1/m1/{i}" for i in range(len(run.built))])
+
+    def test_premise_mode_coarse_truncation_applies_equally(self):
+        items = [_premise_info("o1", "m1", i) for i in range(40)]
+        run = self._run(source="premise", premise_items=items, walk_limit=31)
+        self.assertLessEqual(len(run.results[0].clips), 31, "walk_limit 截断照常生效")
+        self.assertLessEqual(len(run.built), 40)
+
+    def test_mixed_skips_stock_when_premise_fills_quota(self):
+        run = self._run(
+            source="mixed",
+            premise_items=[_premise_info("o1", "m1", i) for i in range(3)],
+            stock_pages={("kw", 1): [_video_item("https://v.example/s0.mp4", "kw", "img-0")]},
+        )
+        # D=9/W=3 → 配额 = max(CLIPS_PER_SEGMENT=3, 3) = 3：premise 3 个已满 → 不触 stock。
+        self.assertEqual(run.searched, [], "premise 满配额时 pass B 不启动")
+        self.assertEqual(len(run.saved), 3)
+        self.assertTrue(all(u.startswith("premise://") for u in run.saved))
+
+    def test_mixed_fills_remainder_via_stock_user_clips_first(self):
+        run = self._run(
+            source="mixed",
+            premise_items=[_premise_info("o1", "m1", 0)],
+            stock_pages={("kw", 1): [_video_item(f"https://v.example/s{i}.mp4", "kw", f"img-{i}") for i in range(3)]},
+        )
+        self.assertGreater(len(run.searched), 0, "premise 未满配额 → pass B 触 stock")
+        clips = run.results[0].clips
+        self.assertEqual(len(clips), 3)
+        # 装配顺序：user clip 全部先于 stock clip
+        self.assertTrue(run.saved[0].startswith("premise://"))
+        self.assertTrue(all(u.startswith("https://") for u in run.saved[1:]))
+
+    def test_deleted_mid_walk_premise_file_sinks_and_backfills_without_crash(self):
+        run = self._run(
+            source="premise",
+            premise_items=[_premise_info("o1", "m1", 0)],
+            save_raises=FileNotFoundError("clip gone"),
+        )
+        result = run.results[0]
+        self.assertEqual(run.saved, [], "save 全部抛错 → 无下载成功记录")
+        self.assertEqual(len(result.clips), 3, "全部窗口走既有 image-gen 回填，不崩")
+        self.assertEqual(len(run.image_calls), 3)
+
+    def test_zero_key_mixed_degrades_via_pass_b_wrapper(self):
+        no_provider = ValueError("no video provider API keys are set")
+        run = self._run(
+            source="mixed",
+            premise_items=[_premise_info("o1", "m1", 0), _premise_info("o1", "m1", 1)],
+            stock_raises=no_provider,
+        )
+        result = run.results[0]
+        self.assertLessEqual(len(run.searched), 4, "ValueError 降级为 []：词条×页各一次，不重试炸穿")
+        self.assertEqual(run.saved, [f"premise://o1/m1/{i}" for i in range(2)])
+        self.assertGreaterEqual(len(result.clips), 2)
+        self.assertTrue(result.clips[0] == "/saved/0", "premise 片段在首位")
+        self.assertEqual(len(result.clips), 3, "剩余窗口由 stock([] 降级)→image-gen 回填补满")
+
+    def test_stock_mode_behavior_unchanged_with_new_params_absent(self):
+        # 不传 source/premise_pool（默认）→ 旧 stock 单 pass 回归。
+        searched = []
+
+        def fake_search(search_term, page=1, **kw):
+            searched.append((search_term, page))
+            return [_video_item(f"https://v.example/s{page}.mp4", search_term, "img")]
+
+        with (
+            patch.object(video_match.llm, "generate_response", return_value=self._queries_json(["kw"])),
+            patch.object(video_match, "download_thumbnail_bytes", lambda url: (b"x", (640, 320))),
+            patch.object(video_match, "to_data_uri", lambda payload: "data"),
+            patch.object(image_embedding, "embed_text", return_value=[1.0, 0.0, 0.0]),
+            patch.object(image_embedding, "embed_image", return_value=[1.0, 0.0, 0.0]),
+            patch.object(video_match.material_rerank, "is_rerank_enabled", return_value=False),
+            patch.object(video_match.material_rerank, "_walk_limit", return_value=30),
+            patch.object(video_match.image_gen, "refine_scene_prompt", return_value="refined"),
+            patch.object(video_match, "logger"),
+        ):
+            results = video_match.match_segments(
+                segments=[{"index": 0, "text": "seg", "duration": 9.0}],
+                video_subject="s",
+                search_videos=fake_search,
+                save_video=lambda video_url, save_dir="": f"/saved/{video_url.rsplit('/', 1)[-1]}",
+                video_aspect="9:16",
+                clip_duration=3,
+                judge_candidate=lambda item, segment_text="", search_term="": _verdict_record("relevant"),
+                generate_image=lambda seg, d, p, f: (f"/saved/gen-{f}.mp4", {}),
+            )
+        self.assertEqual(len(results[0].clips), 3)
+        self.assertGreater(len(searched), 0)
+
+
+class TestCoarsePerfBench(unittest.TestCase):
+    """Metis #15：500×dim1024 纯 Python 余弦的段级预算。
+
+    预算取 300ms 而非开发机手感值 50ms：GitHub 共享 runner 实测中位数
+    139ms (py3.11) / 174ms (py3.13)，50ms 会在 CI 上恒红。300ms 仍能在
+    算法性回归（如误引入 O(n²) 两两比较，秒级）时变红。
+    """
+
+    def test_bench_500_candidates_dim1024_median_under_budget(self):
+        random.seed(15)
+        dim = 1024
+        query = [float(i % 7) - 3.0 for i in range(dim)]
+        candidates = [
+            {"asset_id": str(i), "url": f"https://v.example/{i}.mp4", "data_uri": f"img-{i}"}
+            for i in range(500)
+        ]
+        vectors = {
+            f"img-{i}": [float((i + j) % 11) - 5.0 for j in range(dim)] for i in range(500)
+        }
+        stub = _StubEmbedImage(vectors)
+        per_segment_ms: list[float] = []
+        with (
+            patch.object(image_embedding, "embed_text", return_value=query),
+            patch.object(image_embedding, "embed_image", stub),
+            patch.object(video_match, "logger"),
+        ):
+            for _ in range(30):
+                cache: dict = {}
+                t0 = time.perf_counter()
+                video_match.coarse_rank(candidates, "bench query", cache, None)
+                per_segment_ms.append((time.perf_counter() - t0) * 1000.0)
+        median_ms = statistics.median(per_segment_ms)
+        self.assertLess(
+            median_ms,
+            300.0,
+            f"coarse median {median_ms:.1f}ms (max {max(per_segment_ms):.1f}ms) exceeds 300ms budget",
         )
 
 
