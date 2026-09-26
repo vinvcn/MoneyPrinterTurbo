@@ -259,6 +259,18 @@ redis_password = ""
 max_concurrent_tasks = 5
 max_queued_tasks = 100
 
+# How API video-generation tasks are executed.
+#   "thread"  - every task runs as a thread in the API process (default). CPU-
+#               bound work in the render phase is serialised by the GIL, so
+#               throughput stops scaling past a few concurrent tasks.
+#   "process" - every task runs in its own spawned process with its own GIL.
+#               Requires enable_redis = true: without Redis the task state is
+#               process-private and workers could never publish progress, so
+#               the value silently falls back to "thread".
+# Note: in process mode each worker is a separate interpreter, so process-local
+# caches (cross-post futures, a locally loaded Whisper model) are per worker.
+# task_execution_mode = "thread"
+
 # -----------------------------------------------------------------------------
 # Cross-platform Publishing / 跨平台发布
 # -----------------------------------------------------------------------------
