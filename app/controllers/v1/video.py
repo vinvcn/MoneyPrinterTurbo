@@ -43,6 +43,7 @@ from app.models.schema import (
 from app.services import bgm as bgm_service
 from app.services import state as sm
 from app.services import task as tm
+from app.services import video as video_service
 from app.utils import file_security, utils
 
 
@@ -95,9 +96,19 @@ else:
         execution_mode=task_execution_mode,
     )
 
+# 渲染器开关（ADR-0013）：显式且穷尽，未知取值在进程启动（模块导入）时
+# 直接抛错，绝不静默回退。最终成片和素材拼接各自独立。
+final_render_mode, combine_render_mode = video_service.validate_render_modes(
+    config.app
+)
+
 logger.info(
     f"task execution mode: {task_execution_mode} "
     f"(max_concurrent_tasks={_max_concurrent_tasks})"
+)
+logger.info(
+    f"render modes: final_render_mode={final_render_mode}, "
+    f"combine_render_mode={combine_render_mode}"
 )
 
 

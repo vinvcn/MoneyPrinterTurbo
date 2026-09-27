@@ -234,6 +234,20 @@ subtitle_provider = "edge"
 # "h264_mf", "h264_videotoolbox".
 # video_codec = "libx264"
 
+# Renderer switches (ADR-0013). Each stage selects exactly one implementation;
+# the selected path is the ONLY path. There is no runtime fallback and no
+# circuit breaker: an unknown value fails at startup, and a selected path that
+# errors fails the task loudly. Values are read at startup, so changing them
+# requires an API container restart (same as max_concurrent_tasks).
+#
+# Final-video renderer.
+#   "moviepy" - MoviePy composite (current behaviour, flexible) [default]
+final_render_mode = "moviepy"
+#
+# Combine-phase renderer.
+#   "moviepy" - MoviePy temp-clip + ffmpeg concat (current behaviour) [default]
+combine_render_mode = "moviepy"
+
 # -----------------------------------------------------------------------------
 # Storage and Task Runtime / 存储与任务运行
 # -----------------------------------------------------------------------------

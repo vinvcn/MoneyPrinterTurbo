@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unicodedata
 from contextlib import ExitStack, redirect_stdout
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import List
 from loguru import logger
@@ -20,9 +21,11 @@ from moviepy import (
     CompositeVideoClip,
     ImageClip,
     TextClip,
+    VideoClip,
     VideoFileClip,
     afx,
 )
+from moviepy.tools import compute_position
 from moviepy.video.tools.subtitles import SubtitlesClip
 from PIL import Image, ImageDraw, ImageFont
 
@@ -90,6 +93,110 @@ _SUPPORTED_VIDEO_CODECS = (
     "h264_videotoolbox",
 )
 _runtime_disabled_video_codecs = set()
+
+# ---------------------------------------------------------------------------
+# Renderer mode switches (ADR-0013)
+#
+# The final-video render and the combine phase each select exactly one
+# implementation through config.toml. The selected path is the only path: there
+# is no runtime fallback and no circuit breaker. Values are validated once at
+# startup (the API controller resolves both switches at import time) and again
+# per task, so an unknown value fails loudly instead of on the first frame.
+#
+# Defaults live here, version-controlled; ``config.toml`` (gitignored, per
+# deployment) overrides them. Follow-up tickets add "ffmpeg_overlay" /
+# "ffmpeg_filter" as new mode values together with their implementation.
+# ---------------------------------------------------------------------------
+FINAL_RENDER_MODE_MOVIEPY = "moviepy"
+DEFAULT_FINAL_RENDER_MODE = FINAL_RENDER_MODE_MOVIEPY
+_SUPPORTED_FINAL_RENDER_MODES = (FINAL_RENDER_MODE_MOVIEPY,)
+
+COMBINE_RENDER_MODE_MOVIEPY = "moviepy"
+DEFAULT_COMBINE_RENDER_MODE = COMBINE_RENDER_MODE_MOVIEPY
+_SUPPORTED_COMBINE_RENDER_MODES = (COMBINE_RENDER_MODE_MOVIEPY,)
+
+
+def resolve_render_mode(
+    configured_mode,
+    *,
+    switch_name: str,
+    supported_modes: tuple[str, ...],
+    default_mode: str,
+) -> str:
+    """
+    解析单个渲染器开关，未配置时使用代码内置默认值。
+
+    与 ``task_execution_mode`` 的“不安全组合静默降级”不同，渲染器开关必须
+    显式且穷尽：未知取值直接抛错（启动时即失败），绝不回退到其它实现，
+    否则会重现 F4 那种静默降级的问题（见 ADR-0013）。
+    """
+    mode = str(configured_mode or default_mode).strip().lower()
+    if mode not in supported_modes:
+        raise ValueError(
+            f"unsupported {switch_name}: {configured_mode!r}; "
+            f"supported values: {', '.join(supported_modes)}"
+        )
+    return mode
+
+
+def resolve_final_render_mode(configured_mode=None) -> str:
+    """解析最终成片渲染器开关（``final_render_mode``）。"""
+    return resolve_render_mode(
+        configured_mode,
+        switch_name="final_render_mode",
+        supported_modes=_SUPPORTED_FINAL_RENDER_MODES,
+        default_mode=DEFAULT_FINAL_RENDER_MODE,
+    )
+
+
+def resolve_combine_render_mode(configured_mode=None) -> str:
+    """解析素材拼接阶段渲染器开关（``combine_render_mode``）。"""
+    return resolve_render_mode(
+        configured_mode,
+        switch_name="combine_render_mode",
+        supported_modes=_SUPPORTED_COMBINE_RENDER_MODES,
+        default_mode=DEFAULT_COMBINE_RENDER_MODE,
+    )
+
+
+def validate_render_modes(config_app) -> tuple[str, str]:
+    """
+    在进程启动时一次性校验两个渲染器开关。
+
+    返回 ``(final_render_mode, combine_render_mode)``；任一取值非法时抛出
+    ``ValueError``，让服务启动失败而不是把错误推迟到第一个任务。
+    """
+    return (
+        resolve_final_render_mode(config_app.get("final_render_mode")),
+        resolve_combine_render_mode(config_app.get("combine_render_mode")),
+    )
+
+
+def _dispatch_renderer(
+    *,
+    switch_name: str,
+    configured_mode,
+    resolve,
+    implementations: dict,
+    label: str,
+    **kwargs,
+):
+    """
+    解析开关、查表并执行唯一实现，两个渲染阶段共用同一分派契约。
+
+    选择的结果就是唯一执行的路径，没有运行时回退。所选实现抛错时记录带
+    模式名的日志，并抛出命名了模式的新错误（原始异常作为 ``__cause__``
+    保留），让任务明确失败并归因到具体渲染器。
+    """
+    mode = resolve(configured_mode)
+    implementation = implementations[mode]
+    try:
+        return implementation(**kwargs)
+    except Exception as exc:
+        logger.exception(f"{label} failed ({switch_name}={mode!r})")
+        raise RuntimeError(
+            f"{label} failed with {switch_name}={mode!r}: {exc}"
+        ) from exc
 
 
 def _get_required_video_duration(audio_duration: float) -> float:
@@ -575,7 +682,7 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
     return ""
 
 
-def combine_videos(
+def _combine_videos_moviepy(
     combined_video_path: str,
     video_paths: List[str],
     audio_file: str,
@@ -777,6 +884,53 @@ def combine_videos(
 
     logger.info("video combining completed")
     return combined_video_path
+
+
+_COMBINE_RENDER_IMPLEMENTATIONS = {
+    COMBINE_RENDER_MODE_MOVIEPY: _combine_videos_moviepy,
+}
+
+
+def combine_videos(
+    combined_video_path: str,
+    video_paths: List[str],
+    audio_file: str,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    video_concat_mode: VideoConcatMode = VideoConcatMode.random,
+    video_transition_mode: VideoTransitionMode = None,
+    max_clip_duration: int = 5,
+    threads: int = 2,
+    clip_speed: float = 1.0,
+    segments: List[dict] | None = None,
+    advance_clip_window: bool = True,
+    dedupe_clips_across_segments: bool = True,
+) -> str:
+    """
+    素材拼接阶段入口：按 ``combine_render_mode`` 显式分派到唯一实现。
+
+    选择的结果就是唯一执行的路径，没有运行时回退。未知取值在启动校验时
+    已被拒绝；这里再做一次防御式解析，保证直接调用服务层（CLI/脚本）时
+    也遵循同一契约。
+    """
+    return _dispatch_renderer(
+        switch_name="combine_render_mode",
+        configured_mode=config.app.get("combine_render_mode"),
+        resolve=resolve_combine_render_mode,
+        implementations=_COMBINE_RENDER_IMPLEMENTATIONS,
+        label="combine phase",
+        combined_video_path=combined_video_path,
+        video_paths=video_paths,
+        audio_file=audio_file,
+        video_aspect=video_aspect,
+        video_concat_mode=video_concat_mode,
+        video_transition_mode=video_transition_mode,
+        max_clip_duration=max_clip_duration,
+        threads=threads,
+        clip_speed=clip_speed,
+        segments=segments,
+        advance_clip_window=advance_clip_window,
+        dedupe_clips_across_segments=dedupe_clips_across_segments,
+    )
 
 
 def _normalize_segment_clip(
@@ -1307,7 +1461,123 @@ def subtitle_font_supports_text(font_path: str, text: str) -> bool:
     return _subtitle_font_supports_sample(font_path, sample)
 
 
-def generate_video(
+@dataclass(frozen=True)
+class _SubtitleOverlay:
+    """
+    单个字幕短语的预渲染图层。
+
+    ``rgba`` 是字幕背景板 + 文字已经合成好的 RGBA 数组（uint8），尺寸只覆盖
+    字幕实际占用的小块区域；``x``/``y`` 是它相对成片画布左上角的落点。
+    """
+
+    start: float
+    end: float
+    x: int
+    y: int
+    rgba: np.ndarray
+
+
+def _build_subtitle_overlay(clip, canvas_size) -> _SubtitleOverlay:
+    """
+    把一个已定位的字幕 clip 预渲染成 RGBA 图层并缓存。
+
+    字幕 clip 是静态的（不随时间变化），所以这里只在构建阶段调用一次
+    ``get_frame``/``mask``；以后每帧都复用同一份 RGBA 数组，避免 MoviePy
+    在每帧里重复做整帧 RGBA ``astype`` + ``alpha_composite``（F2 热点）。
+    """
+    frame = np.asarray(clip.get_frame(0))
+    if frame.dtype != np.uint8:
+        frame = frame.astype(np.uint8)
+    if frame.ndim == 2:
+        frame = np.dstack([frame, frame, frame])
+    frame = np.ascontiguousarray(frame[:, :, :3])
+
+    if clip.mask is not None:
+        alpha = (clip.mask.get_frame(0) * 255).astype(np.uint8)
+    else:
+        alpha = np.full(frame.shape[:2], 255, dtype=np.uint8)
+
+    rgba = np.ascontiguousarray(np.dstack([frame, alpha]))
+
+    # 与 MoviePy `compose_on` 使用同一套位置解析，保证落点逐像素一致。
+    pos = compute_position(clip.size, canvas_size, clip.pos(0), clip.relative_pos)
+    end = clip.end if clip.end is not None else clip.duration
+    return _SubtitleOverlay(
+        start=float(clip.start or 0.0),
+        end=float(end),
+        x=int(pos[0]),
+        y=int(pos[1]),
+        rgba=rgba,
+    )
+
+
+def _blit_rgba_overlay(frame: np.ndarray, overlay: _SubtitleOverlay) -> None:
+    """
+    把预渲染字幕图层原地叠加到 ``frame``（uint8 RGB）上，只处理包围盒。
+
+    使用 PIL ``alpha_composite`` 而不是手写整数公式，是为了与 MoviePy
+    原来的合成结果保持逐像素一致：alpha 合成是逐像素操作，包围盒之外的
+    图层 alpha 为 0，因此裁到包围盒不会改变结果。
+    """
+    rgba = overlay.rgba
+    x, y = overlay.x, overlay.y
+    overlay_h, overlay_w = rgba.shape[:2]
+    frame_h, frame_w = frame.shape[:2]
+
+    x_start = max(x, 0)
+    y_start = max(y, 0)
+    x_end = min(x + overlay_w, frame_w)
+    y_end = min(y + overlay_h, frame_h)
+    if x_end <= x_start or y_end <= y_start:
+        return
+
+    source = rgba[y_start - y : y_end - y, x_start - x : x_end - x]
+    region = frame[y_start:y_end, x_start:x_end]
+    composited = Image.alpha_composite(
+        Image.fromarray(region).convert("RGBA"),
+        Image.fromarray(np.ascontiguousarray(source)),
+    )
+    frame[y_start:y_end, x_start:x_end] = np.asarray(composited)[:, :, :3]
+
+
+class _SubtitleOverlayClip(VideoClip):
+    """
+    把预渲染好的字幕图层按包围盒叠加到基础视频上的合成 clip。
+
+    与 ``CompositeVideoClip([video, *text_clips])`` 视觉结果一致，但每帧只
+    在字幕覆盖的像素区域内做 alpha 合成，并全程停留在 uint8，避免 MoviePy
+    每帧整帧 RGBA 合成带来的 CPU 开销（瓶颈 F2）。
+    """
+
+    def __init__(self, base_clip, overlays: List[_SubtitleOverlay]):
+        self.base_clip = base_clip
+        self.overlays = list(overlays)
+        # 与旧的 `CompositeVideoClip` 一致：时长取所有子剪辑 end 的最大值，
+        # 而不是只取基础视频时长，避免字幕尾部超出视频时被提前截断。
+        overlay_end = max((overlay.end for overlay in self.overlays), default=0.0)
+        duration = max(base_clip.duration or 0.0, overlay_end)
+        super().__init__(
+            frame_function=self._compose_frame,
+            duration=duration,
+        )
+        self.size = base_clip.size
+        self.fps = getattr(base_clip, "fps", None)
+
+    def _compose_frame(self, t: float) -> np.ndarray:
+        frame = np.array(self.base_clip.get_frame(t), dtype=np.uint8, copy=True)
+        for overlay in self.overlays:
+            if overlay.start <= t < overlay.end:
+                _blit_rgba_overlay(frame, overlay)
+        return frame
+
+    def close(self):
+        # base_clip 由调用方的 ExitStack 负责关闭；这里释放字幕图层引用，
+        # 并调用父类 close（Clip.close 目前为空实现，但保持覆盖链完整）。
+        self.overlays = []
+        super().close()
+
+
+def _generate_video_moviepy(
     video_path: str,
     audio_path: str,
     subtitle_path: str,
@@ -1532,11 +1802,15 @@ def generate_video(
                     make_textclip=make_textclip,
                 )
             )
-            text_clips = []
-            for item in sub.subtitles:
-                clip = create_text_clip(subtitle_item=item)
-                text_clips.append(clip)
-            video_clip = CompositeVideoClip([video_clip, *text_clips])
+            # F2（#311）：每个字幕短语只预渲染一次，合成时只按包围盒叠加，
+            # 避免 MoviePy 每帧对整帧做 RGBA astype/alpha_composite。
+            overlays = [
+                _build_subtitle_overlay(
+                    create_text_clip(subtitle_item=item), video_clip.size
+                )
+                for item in sub.subtitles
+            ]
+            video_clip = _SubtitleOverlayClip(video_clip, overlays)
             clip_stack.callback(video_clip.close)
 
         bgm_enabled = bgm_service.should_use_bgm(
@@ -1604,6 +1878,41 @@ def generate_video(
             fps=fps,
         )
         return bgm_mix_succeeded
+
+
+_FINAL_RENDER_IMPLEMENTATIONS = {
+    FINAL_RENDER_MODE_MOVIEPY: _generate_video_moviepy,
+}
+
+
+def generate_video(
+    video_path: str,
+    audio_path: str,
+    subtitle_path: str,
+    output_file: str,
+    params: VideoParams,
+    bgm_file_override: str | None = None,
+) -> bool:
+    """
+    最终成片入口：按 ``final_render_mode`` 显式分派到唯一实现。
+
+    选择的结果就是唯一执行的路径，没有运行时回退。未知取值在启动校验时
+    已被拒绝；这里再做一次防御式解析，保证直接调用服务层（CLI/脚本）时
+    也遵循同一契约。
+    """
+    return _dispatch_renderer(
+        switch_name="final_render_mode",
+        configured_mode=config.app.get("final_render_mode"),
+        resolve=resolve_final_render_mode,
+        implementations=_FINAL_RENDER_IMPLEMENTATIONS,
+        label="final render",
+        video_path=video_path,
+        audio_path=audio_path,
+        subtitle_path=subtitle_path,
+        output_file=output_file,
+        params=params,
+        bgm_file_override=bgm_file_override,
+    )
 
 
 def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
