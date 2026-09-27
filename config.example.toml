@@ -245,7 +245,9 @@ subtitle_provider = "edge"
 final_render_mode = "moviepy"
 #
 # Combine-phase renderer.
-#   "moviepy" - MoviePy temp-clip + ffmpeg concat (current behaviour) [default]
+#   "moviepy"       - MoviePy temp-clip + ffmpeg concat (flexible) [default]
+#   "ffmpeg_filter" - one native filter_complex pass (fast; reproduces clip
+#                     selection, fit/pad, speed and per-clip transitions)
 combine_render_mode = "moviepy"
 
 # -----------------------------------------------------------------------------

@@ -112,8 +112,12 @@ DEFAULT_FINAL_RENDER_MODE = FINAL_RENDER_MODE_MOVIEPY
 _SUPPORTED_FINAL_RENDER_MODES = (FINAL_RENDER_MODE_MOVIEPY,)
 
 COMBINE_RENDER_MODE_MOVIEPY = "moviepy"
+COMBINE_RENDER_MODE_FFMPEG_FILTER = "ffmpeg_filter"
 DEFAULT_COMBINE_RENDER_MODE = COMBINE_RENDER_MODE_MOVIEPY
-_SUPPORTED_COMBINE_RENDER_MODES = (COMBINE_RENDER_MODE_MOVIEPY,)
+_SUPPORTED_COMBINE_RENDER_MODES = (
+    COMBINE_RENDER_MODE_MOVIEPY,
+    COMBINE_RENDER_MODE_FFMPEG_FILTER,
+)
 
 
 def resolve_render_mode(
@@ -402,6 +406,42 @@ def _disable_runtime_video_codec(codec: str, reason: str):
     )
 
 
+def _run_ffmpeg_with_codec_fallback(build_command, *, label: str):
+    """
+    Run an FFmpeg command, retrying once with libx264 if the chosen hardware
+    encoder fails.
+
+    This is the command-level twin of `_write_videofile_with_codec_fallback`
+    for the paths that shell out to FFmpeg directly (concat, combine). It is a
+    *codec* fallback, not a renderer fallback: ADR-0013 forbids silently
+    switching `combine_render_mode` / `final_render_mode`, which this does not
+    do — the selected renderer still runs, only the encoder changes.
+    """
+    effective_codec = _get_effective_video_codec()
+
+    def run(codec: str):
+        command = build_command(codec)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            error_message = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(error_message or f"{label} failed")
+        return codec
+
+    try:
+        return run(effective_codec)
+    except Exception as exc:
+        if effective_codec == _DEFAULT_VIDEO_CODEC:
+            raise
+        result_codec = run(_DEFAULT_VIDEO_CODEC)
+        _disable_runtime_video_codec(effective_codec, str(exc))
+        return result_codec
+
+
 def _get_temp_audio_dir(output_dir: str) -> str:
     """
     Return the directory to use for MoviePy's temporary audio file.
@@ -512,31 +552,12 @@ def concat_video_clips_with_ffmpeg(
         command.append(output_file)
         return command
 
-    def run_concat(codec: str):
-        command = build_command(codec)
-        # 使用 ffmpeg 只做一次串联与编码，避免 MoviePy 逐段合并时反复重编码，
-        # 从而降低画质劣化与颜色偏移风险。
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            error_message = (result.stderr or result.stdout or "").strip()
-            raise RuntimeError(error_message or "ffmpeg concat failed")
-        return codec
-
     # concat 列表文件按成片命名保留，作为时间线拼装顺序的审计记录，不再清理。
-    effective_codec = _get_effective_video_codec()
-    try:
-        return run_concat(effective_codec)
-    except Exception as exc:
-        if effective_codec == _DEFAULT_VIDEO_CODEC:
-            raise
-        result_codec = run_concat(_DEFAULT_VIDEO_CODEC)
-        _disable_runtime_video_codec(effective_codec, str(exc))
-        return result_codec
+    # 使用 ffmpeg 只做一次串联与编码，避免 MoviePy 逐段合并时反复重编码，
+    # 从而降低画质劣化与颜色偏移风险。
+    return _run_ffmpeg_with_codec_fallback(
+        build_command, label="ffmpeg concat"
+    )
 
 
 def _sanitize_image_file(image_path: str) -> str:
@@ -682,6 +703,633 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Combine phase: ffmpeg_filter renderer (R4 / #313, ADR-0013)
+#
+# The MoviePy combine path writes one `temp-clip-*.mp4` per placement through
+# MoviePy (GIL-held frame compositing + one encode each) and then concatenates
+# them with a second encode. `ffmpeg_filter` builds the exact same timeline as
+# a single `filter_complex` graph: one decode seek per source, scale/pad to the
+# target aspect, optional per-clip transition, then one native `concat` and one
+# encode. Clip *selection* is reproduced draw-for-draw from the MoviePy path so
+# the two renderers choose the same material order; the graph reproduces
+# scale-to-fit + centre-on-black (never crop) and the one-second transitions.
+# ---------------------------------------------------------------------------
+
+# Every per-clip transition is applied for one second.
+_COMBINE_TRANSITION_SECONDS = 1.0
+_TRANSITION_SIDES = ("left", "right", "top", "bottom")
+_SLIDE_TRANSITIONS = ("SlideIn", "SlideOut")
+_ZOOM_TRANSITIONS = ("ZoomIn", "ZoomOut")
+_SHUFFLE_TRANSITIONS = (
+    "FadeIn",
+    "FadeOut",
+    "SlideIn",
+    "SlideOut",
+    "ZoomIn",
+    "ZoomOut",
+)
+
+
+@dataclass(frozen=True)
+class _CombineClipPlan:
+    """
+    One placement on the combine timeline, before any encoder runs.
+
+    ``source_path`` empty means a black placeholder (missing material or an
+    explicit segment hole). ``source_start``/``source_end`` bound the read
+    window in the source video, ``output_duration`` is the intended length on
+    the output timeline after ``speed`` is applied, and
+    ``transition``/``transition_side`` describe the per-clip effect to
+    reproduce (``None`` means no effect).
+    """
+
+    source_path: str
+    source_start: float
+    source_end: float
+    output_duration: float
+    speed: float
+    transition: str | None = None
+    transition_side: str | None = None
+    # Safety-net truncation bound applied by `_normalize_segment_clip_with_transition`; the
+    # legacy path caps at `max_clip_duration`, the segment path at
+    # `max(max_clip_duration, window_seconds)`.
+    truncate_to: float | None = None
+
+
+def _choose_transition(transition_value) -> tuple[str | None, str | None]:
+    """
+    Resolve a configured transition into one concrete effect identity.
+
+    This is the single source of truth for transition selection: the MoviePy
+    renderer (`_normalize_segment_clip_with_transition` / `_apply_transition`)
+    and the FFmpeg graph (`_combine_transition_filters`) both switch on the
+    returned identity instead of maintaining their own enum branches.
+
+    The random draw order matches the original MoviePy behaviour: a slide side
+    is drawn for *every* clip (even when no transition is configured), and for
+    ``shuffle`` a second draw picks the effect. Preserving the draw order keeps
+    the random concat order comparable between the two renderers.
+    """
+    side = random.choice(_TRANSITION_SIDES)
+    value = getattr(transition_value, "value", transition_value)
+    if value in (None, VideoTransitionMode.none.value):
+        return None, None
+    if value == VideoTransitionMode.fade_in.value:
+        return "FadeIn", None
+    if value == VideoTransitionMode.fade_out.value:
+        return "FadeOut", None
+    if value == VideoTransitionMode.slide_in.value:
+        return "SlideIn", side
+    if value == VideoTransitionMode.slide_out.value:
+        return "SlideOut", side
+    if value == VideoTransitionMode.zoom_in.value:
+        return "ZoomIn", None
+    if value == VideoTransitionMode.zoom_out.value:
+        return "ZoomOut", None
+    if value == VideoTransitionMode.shuffle.value:
+        chosen = random.choice(_SHUFFLE_TRANSITIONS)
+        return chosen, (side if chosen in _SLIDE_TRANSITIONS else None)
+    # Unknown values are silently ignored by MoviePy too; mirror that.
+    return None, None
+
+
+def _probe_video_duration(video_path: str) -> float:
+    """Read a source clip's duration without decoding any frames."""
+    clip = _open_video_clip_quietly(video_path)
+    try:
+        return float(clip.duration or 0.0)
+    finally:
+        close_clip(clip)
+
+
+def _iter_legacy_placements(
+    video_paths: List[str],
+    *,
+    required_video_duration: float,
+    max_clip_duration: float,
+    video_concat_mode,
+    clip_speed: float,
+    transition_value,
+):
+    """
+    Yield the timeline placements for the random/sequential combine path.
+
+    Single source of truth for both renderers: `_combine_videos_moviepy`
+    consumes it and renders each yielded clip, `_plan_combine_clips_legacy`
+    consumes it for the FFmpeg graph. It only *selects* — probing source
+    durations (one open per source, matching the historical first loop) and
+    choosing transitions; the renderer opens the source for the actual clip.
+    """
+    normalized_speed = utils.normalize_clip_speed(clip_speed)
+    # max_clip_duration 约束的是成片里的最终播放时长，而不是源视频读取时长。
+    # 以 0.5 倍速播放 1.5 秒源画面会得到 3 秒片段，以 2 倍速播放 6 秒源画面
+    # 同样得到 3 秒片段。因此切片前必须按速度反推源时长，保证不同速度下源
+    # 时间线连续且无重叠。
+    source_clip_duration = max_clip_duration * normalized_speed
+    concat_value = getattr(video_concat_mode, "value", video_concat_mode)
+
+    subclipped_items: List[SubClippedVideoClip] = []
+    for video_path in video_paths:
+        clip_duration = _probe_video_duration(video_path)
+        start_time = 0.0
+        while start_time < clip_duration:
+            end_time = min(start_time + source_clip_duration, clip_duration)
+            if end_time > start_time:
+                subclipped_items.append(
+                    SubClippedVideoClip(
+                        file_path=video_path,
+                        start_time=start_time,
+                        end_time=end_time,
+                        source_file_path=video_path,
+                    )
+                )
+            start_time = end_time
+            if concat_value == VideoConcatMode.sequential.value:
+                break
+
+    subclipped_items = _prioritize_unique_source_clips(
+        subclipped_items=subclipped_items,
+        concat_mode=video_concat_mode,
+    )
+    logger.debug(f"total subclipped items: {len(subclipped_items)}")
+
+    total = 0.0
+    base_plans: List[_CombineClipPlan] = []
+    for item in subclipped_items:
+        if total >= required_video_duration:
+            break
+        source_length = item.end_time - item.start_time
+        output_duration = min(
+            source_length / normalized_speed if normalized_speed else source_length,
+            max_clip_duration,
+        )
+        transition, side = _choose_transition(transition_value)
+        plan = _CombineClipPlan(
+            source_path=item.file_path,
+            source_start=item.start_time,
+            source_end=item.end_time,
+            output_duration=output_duration,
+            speed=normalized_speed,
+            transition=transition,
+            transition_side=side,
+            truncate_to=max_clip_duration,
+        )
+        base_plans.append(plan)
+        total += output_duration
+        yield plan
+
+    # Loop the already-selected clips until the narration is covered.
+    if total < required_video_duration and base_plans:
+        for plan in itertools.cycle(list(base_plans)):
+            if total >= required_video_duration:
+                break
+            total += plan.output_duration
+            yield plan
+
+
+def _plan_combine_clips_legacy(
+    video_paths: List[str],
+    *,
+    required_video_duration: float,
+    max_clip_duration: float,
+    video_concat_mode,
+    clip_speed: float,
+    transition_value,
+) -> tuple[List[_CombineClipPlan], float]:
+    """Collect `_iter_legacy_placements` into a plan list (FFmpeg path)."""
+    plans = list(
+        _iter_legacy_placements(
+            video_paths,
+            required_video_duration=required_video_duration,
+            max_clip_duration=max_clip_duration,
+            video_concat_mode=video_concat_mode,
+            clip_speed=clip_speed,
+            transition_value=transition_value,
+        )
+    )
+    return plans, sum(plan.output_duration for plan in plans)
+
+
+def _iter_segment_placements(
+    segments: List[dict],
+    *,
+    max_clip_duration: float,
+    clip_speed: float,
+    transition_value,
+    advance_clip_window: bool = True,
+    dedupe_clips_across_segments: bool = True,
+    retain_clip: bool = True,
+):
+    """
+    Yield `(plan, clip)` pairs for the segment-first combine path.
+
+    Single source of truth for both renderers. ``retain_clip=True`` yields the
+    opened, sub-clipped, speed-adjusted MoviePy clip for the renderer to write
+    (the open is shared with the duration read, so the historical one-open-per-
+    placement contract is preserved); ``retain_clip=False`` closes the clip and
+    yields ``None`` for the FFmpeg graph, which only needs the plan.
+    """
+    normalized_speed = utils.normalize_clip_speed(clip_speed)
+    used_clip_paths: set[str] = set()
+
+    for segment in segments:
+        clip_paths = list(segment.get("clips") or [])
+        if dedupe_clips_across_segments:
+            fresh = [p for p in clip_paths if p not in used_clip_paths]
+            reused = [p for p in clip_paths if p in used_clip_paths]
+            clip_paths = fresh + reused
+
+        if not clip_paths:
+            placeholder_duration = float(segment.get("duration") or 0)
+            if placeholder_duration <= 0:
+                continue
+            yield (
+                _CombineClipPlan(
+                    source_path="",
+                    source_start=0.0,
+                    source_end=0.0,
+                    output_duration=placeholder_duration,
+                    speed=1.0,
+                    truncate_to=placeholder_duration,
+                ),
+                None,
+            )
+            continue
+
+        segment_duration = float(segment.get("duration") or 0)
+        windows = segment_window_plan(segment_duration, max_clip_duration)
+        segment_remaining = (
+            segment_duration if segment_duration > 0 else max_clip_duration
+        )
+        if not windows:
+            windows = [max_clip_duration]
+
+        clip_cycle = itertools.cycle(clip_paths)
+        window_offset: dict[str, float] = {}
+        plan_index = 0
+        plan_intact = True
+        hole_slots = set(segment.get("holes") or [])
+
+        while segment_remaining > _SEGMENT_FILL_TOLERANCE:
+            if plan_index < len(windows) and plan_intact:
+                window_seconds = windows[plan_index]
+            else:
+                window_seconds = min(max_clip_duration, segment_remaining)
+            plan_index += 1
+
+            if (plan_index - 1) in hole_slots:
+                segment_remaining -= window_seconds
+                yield (
+                    _CombineClipPlan(
+                        source_path="",
+                        source_start=0.0,
+                        source_end=0.0,
+                        output_duration=window_seconds,
+                        speed=1.0,
+                        truncate_to=window_seconds,
+                    ),
+                    None,
+                )
+                continue
+
+            video_path = next(clip_cycle)
+            start_offset = (
+                window_offset.get(video_path, 0.0) if advance_clip_window else 0.0
+            )
+            try:
+                clip = _open_video_clip_quietly(video_path)
+                source_duration = float(clip.duration or 0)
+                if (
+                    advance_clip_window
+                    and source_duration > 0
+                    and start_offset >= source_duration
+                ):
+                    start_offset = 0.0
+                target_source = window_seconds * normalized_speed
+                if source_duration > 0:
+                    available_source = min(
+                        target_source, max(source_duration - start_offset, 0.0)
+                    )
+                    clip = clip.subclipped(
+                        start_offset, start_offset + available_source
+                    )
+                else:
+                    available_source = float(clip.duration or 0)
+                if normalized_speed != 1.0:
+                    clip = clip.with_speed_scaled(normalized_speed)
+            except Exception as exc:
+                logger.error(
+                    "failed to process segment clip: "
+                    f"segment={segment.get('index')}, file={video_path}, error: {exc}"
+                )
+                break
+
+            placed = float(clip.duration or 0)
+            if not retain_clip:
+                close_clip(clip)
+                clip_out = None
+            else:
+                clip_out = clip
+
+            if advance_clip_window and source_duration > 0:
+                next_offset = start_offset + available_source
+                window_offset[video_path] = (
+                    0.0 if next_offset >= source_duration else next_offset
+                )
+            if dedupe_clips_across_segments:
+                used_clip_paths.add(video_path)
+            transition, side = _choose_transition(transition_value)
+            segment_remaining -= placed
+            if placed < window_seconds - 0.01:
+                plan_intact = False
+
+            yield (
+                _CombineClipPlan(
+                    source_path=video_path,
+                    source_start=start_offset,
+                    source_end=start_offset + available_source,
+                    output_duration=placed,
+                    speed=normalized_speed,
+                    transition=transition,
+                    transition_side=side,
+                    truncate_to=max(max_clip_duration, window_seconds),
+                ),
+                clip_out,
+            )
+
+
+def _plan_combine_clips_segment_first(
+    segments: List[dict],
+    *,
+    max_clip_duration: float,
+    clip_speed: float,
+    transition_value,
+    advance_clip_window: bool = True,
+    dedupe_clips_across_segments: bool = True,
+) -> tuple[List[_CombineClipPlan], float]:
+    """Collect `_iter_segment_placements` into a plan list (FFmpeg path)."""
+    plans = [
+        plan
+        for plan, _clip in _iter_segment_placements(
+            segments,
+            max_clip_duration=max_clip_duration,
+            clip_speed=clip_speed,
+            transition_value=transition_value,
+            advance_clip_window=advance_clip_window,
+            dedupe_clips_across_segments=dedupe_clips_across_segments,
+            retain_clip=False,
+        )
+    ]
+    return plans, sum(plan.output_duration for plan in plans)
+
+
+def _combine_transition_filters(
+    plan: _CombineClipPlan,
+    index: int,
+    width: int,
+    height: int,
+    video_fps: int,
+) -> List[str]:
+    """Return the filter chain fragments for one clip's configured transition."""
+    transition = plan.transition
+    if transition in ("FadeIn", "FadeOut"):
+        fade_in = transition == "FadeIn"
+        start = 0.0 if fade_in else max(0.0, plan.output_duration - _COMBINE_TRANSITION_SECONDS)
+        kind = "in" if fade_in else "out"
+        return [
+            f"[s{index}]fade=t={kind}:st={start:.3f}:d={_COMBINE_TRANSITION_SECONDS:.3f}"
+            f"[v{index}]"
+        ]
+    if transition in _SLIDE_TRANSITIONS:
+        # Reproduce the explicit black-background + positional animation used by
+        # `video_effects.slidein_transition` / `slideout_transition`.
+        if transition == "SlideIn":
+            progress = "min(t/1,1)"
+        else:
+            progress = f"max(0,min((t-({plan.output_duration:.3f}-1))/1,1))"
+        side = plan.transition_side or "left"
+        slide_in = transition == "SlideIn"
+        if side == "left":
+            x = (
+                f"'-{width}+{width}*{progress}'"
+                if slide_in
+                else f"'-{width}*{progress}'"
+            )
+            y = "0"
+        elif side == "right":
+            x = (
+                f"'{width}-{width}*{progress}'"
+                if slide_in
+                else f"'{width}*{progress}'"
+            )
+            y = "0"
+        elif side == "top":
+            y = (
+                f"'-{height}+{height}*{progress}'"
+                if slide_in
+                else f"'-{height}*{progress}'"
+            )
+            x = "0"
+        else:  # bottom
+            y = (
+                f"'{height}-{height}*{progress}'"
+                if slide_in
+                else f"'{height}*{progress}'"
+            )
+            x = "0"
+        return [
+            f"color=c=black:s={width}x{height}:r={video_fps},"
+            f"trim=duration={plan.output_duration:.3f}[bg{index}]",
+            f"[bg{index}][s{index}]overlay=x={x}:y={y}:"
+            f"eof_action=pass:shortest=0[v{index}]",
+        ]
+    if transition in _ZOOM_TRANSITIONS:
+        frames = max(1, int(round(plan.output_duration * video_fps)))
+        if transition == "ZoomIn":
+            zoom_expr = f"1+0.2*on/{frames}"
+        else:
+            zoom_expr = f"1.2-0.2*on/{frames}"
+        return [
+            f"[s{index}]zoompan=z='{zoom_expr}':"
+            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+            f"d=1:s={width}x{height}:fps={video_fps}[v{index}]"
+        ]
+    return [f"[s{index}]null[v{index}]"]
+
+
+def _build_combine_ffmpeg_command(
+    plans: List[_CombineClipPlan],
+    output_file: str,
+    *,
+    width: int,
+    height: int,
+    video_fps: int,
+    threads: int,
+    codec: str,
+    max_duration: float | None = None,
+) -> List[str]:
+    """Build the single `filter_complex` command for a combine timeline plan."""
+    input_args: List[str] = []
+    chains: List[str] = []
+
+    for index, plan in enumerate(plans):
+        if plan.source_path:
+            span = max(0.0, plan.source_end - plan.source_start)
+            input_args += [
+                "-ss",
+                f"{max(0.0, plan.source_start):.3f}",
+                "-t",
+                f"{span:.3f}",
+                "-i",
+                plan.source_path,
+            ]
+            pre_filters: List[str] = []
+            if abs(plan.speed - 1.0) > 1e-9:
+                pre_filters.append(f"setpts=PTS/{plan.speed:.6f}")
+            pre_filters.append(
+                f"trim=duration={plan.output_duration:.3f},setpts=PTS-STARTPTS"
+            )
+            pre = ",".join(pre_filters) + ","
+        else:
+            input_args += [
+                "-f",
+                "lavfi",
+                "-t",
+                f"{plan.output_duration:.3f}",
+                "-i",
+                f"color=c=black:s={width}x{height}:r={video_fps}",
+            ]
+            pre = ""
+
+        chains.append(
+            f"[{index}:v]{pre}fps={video_fps},"
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,setsar=1,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black[s{index}]"
+        )
+        chains.extend(
+            _combine_transition_filters(plan, index, width, height, video_fps)
+        )
+
+    # concat does not auto-convert inside filter_complex: normalise every arm
+    # (transition outputs included) to yuv420p before joining them.
+    normalise = [
+        f"[v{index}]format=yuv420p[c{index}]" for index in range(len(plans))
+    ]
+    concat_inputs = "".join(f"[c{index}]" for index in range(len(plans)))
+    graph = ";".join(
+        chains
+        + normalise
+        + [f"{concat_inputs}concat=n={len(plans)}:v=1:a=0[vout]"]
+    )
+
+    command = [
+        utils.get_ffmpeg_binary(),
+        "-y",
+        *input_args,
+        "-filter_complex",
+        graph,
+        "-map",
+        "[vout]",
+        "-c:v",
+        codec,
+        "-threads",
+        str(threads or 2),
+        "-pix_fmt",
+        "yuv420p",
+        "-r",
+        str(video_fps),
+    ]
+    if max_duration is not None and max_duration > 0:
+        command += ["-t", f"{max_duration:.3f}"]
+    # The combine stage is video-only; narration is mixed in by generate_video.
+    command += ["-an", output_file]
+    return command
+
+
+def _combine_videos_ffmpeg_filter(
+    combined_video_path: str,
+    video_paths: List[str],
+    audio_file: str,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    video_concat_mode: VideoConcatMode = VideoConcatMode.random,
+    video_transition_mode: VideoTransitionMode = None,
+    max_clip_duration: int = 5,
+    threads: int = 2,
+    clip_speed: float = 1.0,
+    segments: List[dict] | None = None,
+    advance_clip_window: bool = True,
+    dedupe_clips_across_segments: bool = True,
+) -> str:
+    """
+    Combine phase renderer that emits one `filter_complex` pass (R4 / #313).
+
+    Selected explicitly through ``combine_render_mode = "ffmpeg_filter"``;
+    there is no runtime fallback. Clip selection, fit/pad, speed and per-clip
+    transitions are reproduced from the MoviePy path, but the whole timeline is
+    decoded/composited/encoded once by FFmpeg instead of via per-clip MoviePy
+    temp files.
+    """
+    audio_clip = AudioFileClip(audio_file)
+    try:
+        audio_duration = float(audio_clip.duration or 0.0)
+    finally:
+        close_clip(audio_clip)
+    logger.info(f"ffmpeg_filter combine: audio duration: {audio_duration} seconds")
+
+    aspect = VideoAspect(video_aspect)
+    video_width, video_height = aspect.to_resolution()
+    transition_value = getattr(video_transition_mode, "value", video_transition_mode)
+
+    if segments:
+        plans, planned_duration = _plan_combine_clips_segment_first(
+            segments,
+            max_clip_duration=max_clip_duration,
+            clip_speed=clip_speed,
+            transition_value=transition_value,
+            advance_clip_window=advance_clip_window,
+            dedupe_clips_across_segments=dedupe_clips_across_segments,
+        )
+    else:
+        required_video_duration = _get_required_video_duration(audio_duration)
+        plans, planned_duration = _plan_combine_clips_legacy(
+            video_paths,
+            required_video_duration=required_video_duration,
+            max_clip_duration=max_clip_duration,
+            video_concat_mode=video_concat_mode,
+            clip_speed=clip_speed,
+            transition_value=transition_value,
+        )
+
+    if not plans:
+        logger.warning("no clips available for merging (ffmpeg_filter)")
+        return combined_video_path
+
+    logger.info(
+        f"ffmpeg_filter combine: {len(plans)} placements, "
+        f"{planned_duration:.2f}s planned, one filter_complex pass"
+    )
+
+    def build_command(codec: str):
+        return _build_combine_ffmpeg_command(
+            plans,
+            combined_video_path,
+            width=video_width,
+            height=video_height,
+            video_fps=fps,
+            threads=threads,
+            codec=codec,
+            max_duration=audio_duration,
+        )
+
+    _run_ffmpeg_with_codec_fallback(
+        build_command, label="ffmpeg combined render (ffmpeg_filter)"
+    )
+    # Same contract as `_combine_videos_moviepy`: return the combined path, not
+    # the codec (the codec fallback helper returns the codec it used).
+    return combined_video_path
+
+
 def _combine_videos_moviepy(
     combined_video_path: str,
     video_paths: List[str],
@@ -732,92 +1380,73 @@ def _combine_videos_moviepy(
         # 只记录一次最终生效值，既方便定位 API 越界参数被归一化的问题，
         # 也避免在逐片段热路径中重复输出相同日志。
         logger.info(f"clip playback speed: {normalized_clip_speed:.2f}x")
-    # max_clip_duration 约束的是成片里的最终播放时长，而不是源视频读取时长。
-    # MoviePy 以 0.5 倍速播放 1.5 秒源画面会得到 3 秒片段，以 2 倍速播放
-    # 6 秒源画面同样会得到 3 秒片段。因此切片前必须按速度反推源时长；如果
-    # 仍固定读取 3 秒再慢放、裁剪，下一段却从源视频第 3 秒开始，会跳过中间
-    # 1.5 秒画面。该计算同时保证不同速度下的源时间线连续且无重叠。
-    source_clip_duration = max_clip_duration * normalized_clip_speed
     output_dir = os.path.dirname(combined_video_path)
 
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
 
     processed_clips = []
-    subclipped_items = []
-    video_duration = 0
-    for video_path in video_paths:
-        clip = _open_video_clip_quietly(video_path)
-        clip_duration = clip.duration
-        clip_w, clip_h = clip.size
-        close_clip(clip)
-        
-        start_time = 0
+    rendered_clips = {}
+    video_duration = 0.0
 
-        while start_time < clip_duration:
-            end_time = min(start_time + source_clip_duration, clip_duration)
-
-            # 保留所有有效分段。
-            # 这样既不会丢掉“整段视频本身就短于 max_clip_duration”的素材，
-            # 也不会吞掉长视频最后剩下的一小段尾部内容。
-            if end_time > start_time:
-                subclipped_items.append(
-                    SubClippedVideoClip(
-                        file_path=video_path,
-                        start_time=start_time,
-                        end_time=end_time,
-                        width=clip_w,
-                        height=clip_h,
-                        source_file_path=video_path,
-                    )
-                )
-
-            start_time = end_time
-            if video_concat_mode.value == VideoConcatMode.sequential.value:
-                break
-
-    subclipped_items = _prioritize_unique_source_clips(
-        subclipped_items=subclipped_items,
-        concat_mode=video_concat_mode,
-    )
-        
-    logger.debug(f"total subclipped items: {len(subclipped_items)}")
-    
-    # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
-    for i, subclipped_item in enumerate(subclipped_items):
-        if video_duration >= required_video_duration:
-            break
-        
+    for i, plan in enumerate(
+        _iter_legacy_placements(
+            video_paths,
+            required_video_duration=required_video_duration,
+            max_clip_duration=max_clip_duration,
+            video_concat_mode=video_concat_mode,
+            clip_speed=clip_speed,
+            transition_value=transition_value,
+        )
+    ):
         logger.debug(
-            f"processing clip {i+1}: {subclipped_item.width}x{subclipped_item.height}, "
-            f"source: {os.path.basename(subclipped_item.source_file_path)}, "
+            f"processing clip {i + 1}: source: "
+            f"{os.path.basename(plan.source_path)}, "
             f"current duration: {video_duration:.2f}s, "
             f"remaining: {required_video_duration - video_duration:.2f}s"
         )
-        
+
+        # The generator replays placements to cover the narration; the MoviePy
+        # path keeps reusing the already-rendered temp file for a replay rather
+        # than re-encoding it (same behaviour as the old `processed_clips`
+        # cycle).
+        cache_key = (
+            plan.source_path,
+            round(plan.source_start, 4),
+            round(plan.source_end, 4),
+            round(plan.speed, 4),
+            plan.transition,
+            plan.transition_side,
+        )
+        replayed = rendered_clips.get(cache_key)
+        if replayed is not None:
+            processed_clips.append(replayed)
+            video_duration += replayed.duration
+            continue
+
         try:
-            clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
-                subclipped_item.start_time, subclipped_item.end_time
+            clip = _open_video_clip_quietly(plan.source_path).subclipped(
+                plan.source_start, plan.source_end
             )
             # 播放速度属于素材本身属性，应在转场前应用。这样 Fade/Slide 等一秒转场
             # 不会跟随素材速度变成 0.5 秒或 2 秒；后续最大时长裁剪继续作为
             # 浮点误差或异常素材时长的安全兜底，保证最终片段不突破配置上限。
-            if normalized_clip_speed != 1.0:
-                clip = clip.with_speed_scaled(normalized_clip_speed)
+            if plan.speed != 1.0:
+                clip = clip.with_speed_scaled(plan.speed)
             # 缩放/转场/时长兜底与 segment-first 路径共用同一实现，
-            # 避免两条流水线的画面行为出现差异。
-            clip = _normalize_segment_clip(
+            # 避免两条流水线的画面行为出现差异。转场身份已由共享生成器解析。
+            clip = _normalize_segment_clip_with_transition(
                 clip,
                 video_width,
                 video_height,
-                max_clip_duration,
-                transition_value,
+                plan.truncate_to if plan.truncate_to is not None else max_clip_duration,
+                plan.transition,
+                plan.transition_side,
             )
-            clip_duration = clip.duration
             clip_w, clip_h = clip.size
 
             # wirte clip to temp file
-            clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
+            clip_file = f"{output_dir}/temp-clip-{i + 1}.mp4"
             _write_videofile_with_codec_fallback(
                 clip,
                 clip_file,
@@ -830,38 +1459,26 @@ def _combine_videos_moviepy(
             clip_duration_saved = clip.duration
             close_clip(clip)
 
-            processed_clips.append(
-                SubClippedVideoClip(
-                    file_path=clip_file,
-                    duration=clip_duration_saved,
-                    width=clip_w,
-                    height=clip_h,
-                    source_file_path=subclipped_item.source_file_path,
-                )
+            entry = SubClippedVideoClip(
+                file_path=clip_file,
+                duration=clip_duration_saved,
+                width=clip_w,
+                height=clip_h,
+                source_file_path=plan.source_path,
             )
+            rendered_clips[cache_key] = entry
+            processed_clips.append(entry)
             video_duration += clip_duration_saved
-            
+
         except Exception as e:
             logger.error(f"failed to process clip: {str(e)}")
-    
-    # loop processed clips until the video duration covers the audio duration and the small safety margin.
+
     if video_duration < required_video_duration:
         logger.warning(
             f"video duration ({video_duration:.2f}s) is shorter than required duration "
-            f"({required_video_duration:.2f}s), looping clips to match audio length."
+            f"({required_video_duration:.2f}s) after rendering."
         )
-        base_clips = processed_clips.copy()
-        for clip in itertools.cycle(base_clips):
-            if video_duration >= required_video_duration:
-                break
-            processed_clips.append(clip)
-            video_duration += clip.duration
-        logger.info(
-            f"video duration: {video_duration:.2f}s, audio duration: {audio_duration:.2f}s, "
-            f"required duration: {required_video_duration:.2f}s, "
-            f"looped {len(processed_clips)-len(base_clips)} clips"
-        )
-     
+
     # merge video clips progressively, avoid loading all videos at once to avoid memory overflow
     logger.info("starting clip merging process")
     if not processed_clips:
@@ -888,6 +1505,7 @@ def _combine_videos_moviepy(
 
 _COMBINE_RENDER_IMPLEMENTATIONS = {
     COMBINE_RENDER_MODE_MOVIEPY: _combine_videos_moviepy,
+    COMBINE_RENDER_MODE_FFMPEG_FILTER: _combine_videos_ffmpeg_filter,
 }
 
 
@@ -933,71 +1551,90 @@ def combine_videos(
     )
 
 
-def _normalize_segment_clip(
-    clip,
-    video_width: int,
-    video_height: int,
-    max_clip_duration: float,
-    transition_value,
-):
+def _fit_clip_to_canvas(clip, video_width: int, video_height: int):
     """
-    将单个素材片段调整为最终时间线需要的形态。
+    把素材等比缩放到目标画幅，不足处用黑边补齐（只 fit，不 crop）。
 
-    从 combine_videos 的旧流程中提取：缩放到目标画幅（不足处留黑边）、
-    应用用户选择的转场、并兜底裁剪到最大片段时长。segment-first 与
-    随机拼接两条路径共用，避免转场/缩放行为出现第二套实现。
+    `combine_videos` 的旧流程和 segment-first 路径共用；`ffmpeg_filter`
+    渲染器的 scale/pad 图节点是这段逻辑的等价实现，两者必须保持一致。
     """
     clip_duration = clip.duration
     clip_w, clip_h = clip.size
-    if clip_w != video_width or clip_h != video_height:
-        clip_ratio = clip.w / clip.h
-        video_ratio = video_width / video_height
-        logger.debug(f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, target: {video_width}x{video_height}, ratio: {video_ratio:.2f}")
+    if clip_w == video_width and clip_h == video_height:
+        return clip
 
-        if clip_ratio == video_ratio:
-            clip = clip.resized(new_size=(video_width, video_height))
-        else:
-            if clip_ratio > video_ratio:
-                scale_factor = video_width / clip_w
-            else:
-                scale_factor = video_height / clip_h
+    clip_ratio = clip.w / clip.h
+    video_ratio = video_width / video_height
+    logger.debug(
+        f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, "
+        f"target: {video_width}x{video_height}, ratio: {video_ratio:.2f}"
+    )
 
-            new_width = int(clip_w * scale_factor)
-            new_height = int(clip_h * scale_factor)
+    if clip_ratio == video_ratio:
+        return clip.resized(new_size=(video_width, video_height))
 
-            background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
-            clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
-            clip = CompositeVideoClip([background, clip_resized])
+    if clip_ratio > video_ratio:
+        scale_factor = video_width / clip_w
+    else:
+        scale_factor = video_height / clip_h
 
-    shuffle_side = random.choice(["left", "right", "top", "bottom"])
-    if transition_value in (None, VideoTransitionMode.none.value):
-        clip = clip
-    elif transition_value == VideoTransitionMode.fade_in.value:
-        clip = video_effects.fadein_transition(clip, 1)
-    elif transition_value == VideoTransitionMode.fade_out.value:
-        clip = video_effects.fadeout_transition(clip, 1)
-    elif transition_value == VideoTransitionMode.slide_in.value:
-        clip = video_effects.slidein_transition(clip, 1, shuffle_side)
-    elif transition_value == VideoTransitionMode.slide_out.value:
-        clip = video_effects.slideout_transition(clip, 1, shuffle_side)
-    elif transition_value == VideoTransitionMode.zoom_in.value:
-        clip = video_effects.zoomin_transition(clip, 1)
-    elif transition_value == VideoTransitionMode.zoom_out.value:
-        clip = video_effects.zoomout_transition(clip, 1)
-    elif transition_value == VideoTransitionMode.shuffle.value:
-        transition_funcs = [
-            lambda c: video_effects.fadein_transition(c, 1),
-            lambda c: video_effects.fadeout_transition(c, 1),
-            lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
-            lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
-            lambda c: video_effects.zoomin_transition(c, 1),
-            lambda c: video_effects.zoomout_transition(c, 1),
-        ]
-        shuffle_transition = random.choice(transition_funcs)
-        clip = shuffle_transition(clip)
+    new_width = int(clip_w * scale_factor)
+    new_height = int(clip_h * scale_factor)
 
-    if clip.duration > max_clip_duration:
-        clip = clip.subclipped(0, max_clip_duration)
+    background = ColorClip(
+        size=(video_width, video_height), color=(0, 0, 0)
+    ).with_duration(clip_duration)
+    clip_resized = clip.resized(new_size=(new_width, new_height)).with_position(
+        "center"
+    )
+    return CompositeVideoClip([background, clip_resized])
+
+
+def _apply_transition(clip, transition: str | None, side: str | None):
+    """
+    把 `_choose_transition` 解析出的转场应用到 MoviePy clip。
+
+    转场身份的单一事实来源是 `_choose_transition`；本函数只负责把身份映射
+    到 `video_effects` 的具体实现，`_combine_transition_filters` 则把同一
+    身份映射到等价的 FFmpeg filter，两者不会再各自维护一套枚举分支。
+    """
+    if transition == "FadeIn":
+        return video_effects.fadein_transition(clip, _COMBINE_TRANSITION_SECONDS)
+    if transition == "FadeOut":
+        return video_effects.fadeout_transition(clip, _COMBINE_TRANSITION_SECONDS)
+    if transition == "SlideIn":
+        return video_effects.slidein_transition(
+            clip, _COMBINE_TRANSITION_SECONDS, side or "left"
+        )
+    if transition == "SlideOut":
+        return video_effects.slideout_transition(
+            clip, _COMBINE_TRANSITION_SECONDS, side or "left"
+        )
+    if transition == "ZoomIn":
+        return video_effects.zoomin_transition(clip, _COMBINE_TRANSITION_SECONDS)
+    if transition == "ZoomOut":
+        return video_effects.zoomout_transition(clip, _COMBINE_TRANSITION_SECONDS)
+    return clip
+
+
+def _normalize_segment_clip_with_transition(
+    clip,
+    video_width: int,
+    video_height: int,
+    truncate_to: float,
+    transition: str | None,
+    side: str | None,
+):
+    """
+    Fit/transition/truncate a clip using an already-resolved transition.
+
+    Used by the placement consumers: the transition identity comes from the
+    shared generator's `_choose_transition`, so this must not draw again.
+    """
+    clip = _fit_clip_to_canvas(clip, video_width, video_height)
+    clip = _apply_transition(clip, transition, side)
+    if clip.duration > truncate_to:
+        clip = clip.subclipped(0, truncate_to)
     return clip
 
 
@@ -1050,188 +1687,76 @@ def _combine_videos_segment_first(
 
     processed_clips: List[SubClippedVideoClip] = []
     clip_sequence = 0
-    # 跨 segment 去重：记录本任务已上过时间线的源视频路径。每个 segment
-    # 优先从"未用过"的候选中轮播；候选全部用过时才回退到复用。热门素材
-    # 常被相邻 segment 的搜索同时返回，不去重会让同一段画面反复出现。
-    used_clip_paths: set[str] = set()
-    for segment in segments:
-        segment_index = segment.get("index")
-        clip_paths = list(segment.get("clips") or [])
-        if dedupe_clips_across_segments:
-            fresh = [p for p in clip_paths if p not in used_clip_paths]
-            reused = [p for p in clip_paths if p in used_clip_paths]
-            if fresh and reused:
-                logger.info(
-                    f"segment {segment_index}: deferring {len(reused)} already-used "
-                    f"clip(s) behind {len(fresh)} unused one(s)"
-                )
-            clip_paths = fresh + reused
-        if not clip_paths:
-            # 时间线对齐要求每段的画面时长覆盖该段旁白时长。没有素材时用
-            # 黑屏占位而不是跳过，否则后续片段整体前移，旁白与画面对不上。
-            placeholder_duration = float(segment.get("duration") or 0)
-            if placeholder_duration <= 0:
-                logger.warning(
-                    f"segment {segment_index} has no clips and no duration, "
-                    "skipping in timeline"
-                )
-                continue
-            logger.warning(
-                f"segment {segment_index} has no clips, using a black "
-                f"placeholder ({placeholder_duration:.2f}s) to keep alignment"
-            )
+
+    for plan, clip in _iter_segment_placements(
+        segments,
+        max_clip_duration=max_clip_duration,
+        clip_speed=clip_speed,
+        transition_value=transition_value,
+        advance_clip_window=advance_clip_window,
+        dedupe_clips_across_segments=dedupe_clips_across_segments,
+        retain_clip=True,
+    ):
+        clip_file = f"{output_dir}/temp-clip-{clip_sequence + 1}.mp4"
+        clip_sequence += 1
+
+        if plan.source_path == "":
+            # 时间线对齐要求每段的画面时长覆盖该段旁白时长。没有素材或显式
+            # backfill hole 时用黑屏占位而不是跳过；占位片段不做转场，与旧
+            # 行为一致。
             placeholder = ColorClip(
                 size=(video_width, video_height), color=(0, 0, 0)
-            ).with_duration(placeholder_duration)
-            clip_file = f"{output_dir}/temp-clip-{clip_sequence + 1}.mp4"
+            ).with_duration(plan.output_duration)
             placeholder.write_videofile(clip_file, fps=fps, logger=None)
+            close_clip(placeholder)
             processed_clips.append(
                 SubClippedVideoClip(
                     file_path=clip_file,
-                    duration=placeholder_duration,
+                    duration=plan.output_duration,
                     width=video_width,
                     height=video_height,
                     source_file_path="",
                 )
             )
-            clip_sequence += 1
             continue
 
-        # A3（F-H1）窗口计划：按 segment_window_plan 切窗（输出秒），精确
-        # 覆盖该段旁白时长。不变量：每段实际放置输出时长 == segment_duration
-        # （±0.05s）。素材源提前耗尽被截断时按实际放置扣减、继续轮播兜底，
-        # 宁可短放也不超配（超配会推移后续段边界，造成字幕-画面漂移）。
-        segment_duration = float(segment.get("duration") or 0)
-        windows = segment_window_plan(segment_duration, max_clip_duration)
-        segment_remaining = (
-            segment_duration
-            if segment_duration > 0
-            else max_clip_duration
+        if clip is None:
+            raise RuntimeError(
+                f"segment-first placement missing clip: segment="
+                f"{plan.source_path}@{plan.source_start:.3f}"
+            )
+
+        try:
+            clip = _normalize_segment_clip_with_transition(
+                clip,
+                video_width,
+                video_height,
+                plan.truncate_to
+                if plan.truncate_to is not None
+                else max(max_clip_duration, plan.output_duration),
+                plan.transition,
+                plan.transition_side,
+            )
+            _write_videofile_with_codec_fallback(
+                clip,
+                clip_file,
+                codec=_get_configured_video_codec(),
+                logger=None,
+                fps=fps,
+            )
+            clip_duration_saved = clip.duration
+        finally:
+            close_clip(clip)
+
+        processed_clips.append(
+            SubClippedVideoClip(
+                file_path=clip_file,
+                duration=clip_duration_saved,
+                width=video_width,
+                height=video_height,
+                source_file_path=plan.source_path,
+            )
         )
-        if not windows:
-            # segment 没有时长信息（异常旁白）：保持旧行为，只放一个满窗。
-            windows = [max_clip_duration]
-        clip_cycle = itertools.cycle(clip_paths)
-        # 每个源视频已消耗的窗口偏移（秒），用于窗口后移。
-        window_offset: dict[str, float] = {}
-        plan_index = 0
-        # 计划有效性：某个窗口因素材源提前耗尽而短放时，计划窗口与实际
-        # 剩余时长不再对齐，此后退回旧的"按剩余时长切满窗"自适应循环。
-        plan_intact = True
-        hole_slots = set(segment.get("holes") or [])
-        while segment_remaining > _SEGMENT_FILL_TOLERANCE:
-            if plan_index < len(windows) and plan_intact:
-                window_seconds = windows[plan_index]
-            else:
-                # 自适应兜底：素材干涸（或无计划的异常旁白段），窗口目标
-                # 取剩余输出时长，兜底但不再超配。
-                window_seconds = min(max_clip_duration, segment_remaining)
-            plan_index += 1
-            # Metis B3: explicit backfill holes → black placeholder of the
-            # full planned window_seconds.  The hole does NOT consume a source
-            # clip, does NOT touch window_offset / plan_intact, and the
-            # source_file_path="" bypasses used_clip_paths dedupe.
-            if (plan_index - 1) in hole_slots:
-                hole_file = (
-                    f"{output_dir}/temp-clip-{clip_sequence + 1}.mp4"
-                )
-                hole_clip = ColorClip(
-                    size=(video_width, video_height), color=(0, 0, 0)
-                ).with_duration(window_seconds)
-                hole_clip.write_videofile(hole_file, fps=fps, logger=None)
-                close_clip(hole_clip)
-                processed_clips.append(
-                    SubClippedVideoClip(
-                        file_path=hole_file,
-                        duration=window_seconds,
-                        width=video_width,
-                        height=video_height,
-                        source_file_path="",
-                    )
-                )
-                clip_sequence += 1
-                segment_remaining -= window_seconds
-                continue
-            video_path = next(clip_cycle)
-            start_offset = (
-                window_offset.get(video_path, 0.0) if advance_clip_window else 0.0
-            )
-            try:
-                clip = _open_video_clip_quietly(video_path)
-                source_duration = clip.duration
-                if advance_clip_window and source_duration > 0:
-                    # 窗口后移：跳过已用前缀；超出源时长时回绕到 0，保证
-                    # 短素材也能持续产出完整窗口。
-                    if start_offset >= source_duration:
-                        start_offset = 0.0
-                # 窗口的源秒数 = 输出窗口秒 × 播放速度（output = src/speed）。
-                target_source = window_seconds * normalized_clip_speed
-                if source_duration > 0:
-                    available_source = min(
-                        target_source, max(source_duration - start_offset, 0.0)
-                    )
-                    clip = clip.subclipped(
-                        start_offset, start_offset + available_source
-                    )
-                else:
-                    # 源时长不可读（损坏素材）：与旧路径一致整段使用。
-                    available_source = clip.duration
-                if normalized_clip_speed != 1.0:
-                    clip = clip.with_speed_scaled(normalized_clip_speed)
-                # 兜底裁剪上限取窗口目标（合并窗可超过 max_clip_duration），
-                # 归一化截断只作为异常安全网，正常路径放置时长 ≤ 窗口目标。
-                clip = _normalize_segment_clip(
-                    clip,
-                    video_width,
-                    video_height,
-                    max(max_clip_duration, window_seconds),
-                    transition_value,
-                )
-                if advance_clip_window and source_duration > 0:
-                    # 记录下一窗口起点：按实际消耗的源秒数推进（含速度语义），
-                    # 消耗到结尾则回绕到 0（由下次读取时的 >= source_duration
-                    # 分支处理），保证同源时间线连续且无重叠。
-                    next_offset = start_offset + available_source
-                    window_offset[video_path] = (
-                        0.0 if next_offset >= source_duration else next_offset
-                    )
-            except Exception as exc:
-                logger.error(
-                    "failed to process segment clip: "
-                    f"segment={segment_index}, file={video_path}, error: {exc}"
-                )
-                break
-
-            clip_file = f"{output_dir}/temp-clip-{clip_sequence + 1}.mp4"
-            try:
-                _write_videofile_with_codec_fallback(
-                    clip,
-                    clip_file,
-                    codec=_get_configured_video_codec(),
-                    logger=None,
-                    fps=fps,
-                )
-                clip_duration_saved = clip.duration
-            finally:
-                close_clip(clip)
-
-            processed_clips.append(
-                SubClippedVideoClip(
-                    file_path=clip_file,
-                    duration=clip_duration_saved,
-                    width=video_width,
-                    height=video_height,
-                    source_file_path=video_path,
-                )
-            )
-            if dedupe_clips_across_segments:
-                used_clip_paths.add(video_path)
-            clip_sequence += 1
-            # 按实际放置输出时长扣减（不按计划值），源跑短时自然续到下一窗。
-            segment_remaining -= clip_duration_saved
-            if clip_duration_saved < window_seconds - 0.01:
-                # 素材源在窗口中途耗尽：计划与剩余时长脱钩，转自适应兜底。
-                plan_intact = False
 
     logger.info("starting segment clip merging process")
     if not processed_clips:
