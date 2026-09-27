@@ -1,8 +1,13 @@
 import json
+import threading
 import unittest
+from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
-from app.controllers.manager.base_manager import TaskQueueFullError
+from app.controllers.manager.base_manager import (
+    EXECUTION_MODE_PROCESS,
+    TaskQueueFullError,
+)
 from app.controllers.manager.memory_manager import InMemoryTaskManager
 from app.controllers.manager.redis_manager import RedisTaskManager
 from app.models import const
@@ -137,6 +142,168 @@ class TestInMemoryTaskManager(unittest.TestCase):
             kwargs={},
         )
         fake_thread.start.assert_called_once_with()
+
+
+class TestProcessModeExecution(unittest.TestCase):
+    """进程模式的调度与名额释放：与线程模式共享同一套并发记账。"""
+
+    @staticmethod
+    def _manager(max_concurrent_tasks=1, max_queued_tasks=1):
+        manager = InMemoryTaskManager(
+            max_concurrent_tasks=max_concurrent_tasks,
+            max_queued_tasks=max_queued_tasks,
+            execution_mode=EXECUTION_MODE_PROCESS,
+        )
+        manager._process_executor = MagicMock()
+        return manager
+
+    def test_execute_task_submits_payload_to_process_executor(self):
+        """任务必须以 (func, args, kwargs) 的形式提交，并挂上完成回调。"""
+        manager = self._manager()
+        future = MagicMock()
+        manager._process_executor.submit.return_value = future
+
+        manager.execute_task(len, [1, 2], extra=None)
+
+        manager._process_executor.submit.assert_called_once_with(
+            len, ([1, 2],), {"extra": None}
+        )
+        future.add_done_callback.assert_called_once_with(
+            manager._on_process_task_finished
+        )
+
+    def test_callback_releases_slot_after_success(self):
+        """worker 正常返回后必须释放并发名额，否则队列会在一次任务后卡死。"""
+        manager = self._manager()
+        manager.current_tasks = 1
+        future = Future()
+        future.set_result(None)
+
+        with patch.object(manager, "task_done") as task_done:
+            manager._on_process_task_finished(future)
+
+        task_done.assert_called_once_with()
+
+    def test_callback_releases_slot_after_worker_failure(self):
+        """
+        worker 抛异常时同样要释放名额，并且必须留下日志：
+        回调在父进程的线程池管理线程里执行，异常不会传给任何调用方。
+        """
+        manager = self._manager()
+        manager.current_tasks = 1
+        future = Future()
+        future.set_exception(RuntimeError("worker blew up"))
+
+        with patch.object(manager, "task_done") as task_done, patch(
+            "app.controllers.manager.base_manager.logger"
+        ) as logger:
+            manager._on_process_task_finished(future)
+
+        task_done.assert_called_once_with()
+        self.assertTrue(logger.error.called)
+
+    def test_callback_releases_slot_after_cancellation(self):
+        """被取消的 Future 没有结果，回调不能在 future.exception() 上崩溃。"""
+        manager = self._manager()
+        manager.current_tasks = 1
+        future = Future()
+
+        self.assertTrue(future.cancel())
+
+        with patch.object(manager, "task_done") as task_done:
+            manager._on_process_task_finished(future)
+
+        task_done.assert_called_once_with()
+
+    def test_callback_releases_slot_even_if_logging_fails(self):
+        """日志失败也不能吞掉名额释放，否则并发额度会永久泄漏。"""
+        manager = self._manager()
+        manager.current_tasks = 1
+        future = Future()
+        future.set_exception(RuntimeError("worker blew up"))
+
+        with patch.object(manager, "task_done") as task_done, patch(
+            "app.controllers.manager.base_manager.logger"
+        ) as logger:
+            logger.error.side_effect = RuntimeError("logger down")
+            manager._on_process_task_finished(future)
+
+        task_done.assert_called_once_with()
+
+    def test_inline_completion_does_not_deadlock_slot_accounting(self):
+        """
+        Future 在注册回调时若已完成，回调会在当前线程内联执行，而该线程正
+        持有 self.lock。锁不可重入时 add_task 会自死锁并永久挂起。用带超时
+        的线程断言，避免回归时把整个测试套件挂死。
+        """
+        manager = self._manager()
+        completed = Future()
+        completed.set_result(None)
+        manager._process_executor.submit.return_value = completed
+        outcome = {}
+
+        def run():
+            try:
+                manager.add_task(len, [1])
+            except Exception as exc:  # pragma: no cover - 只为保留意外异常信息
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive(), "add_task deadlocked on the manager lock")
+        self.assertNotIn("error", outcome)
+        # 内联回调必须已经释放名额，否则一次瞬时完成会凭空占用一个槽位。
+        self.assertEqual(manager.current_tasks, 0)
+
+    def test_inline_completion_drains_queue_without_deadlock(self):
+        """
+        内联完成会走 task_done -> check_queue -> execute_task 的重入链：名额一释放，
+        队列里的任务会在这条链上被继续派发。用已完成的 Future 连续触发，断言整条
+        链能跑完、队列排空、名额全部释放。
+        """
+        manager = InMemoryTaskManager(
+            max_concurrent_tasks=1,
+            max_queued_tasks=3,
+            execution_mode=EXECUTION_MODE_PROCESS,
+        )
+        manager._process_executor = MagicMock()
+        completed = Future()
+        completed.set_result(None)
+        manager._process_executor.submit.return_value = completed
+        manager.enqueue({"func": len, "args": ([1],), "kwargs": {}})
+        manager.enqueue({"func": len, "args": ([1, 2],), "kwargs": {}})
+        outcome = {}
+
+        def run():
+            try:
+                manager.add_task(len, [1, 2, 3])
+            except Exception as exc:  # pragma: no cover - 只为保留意外异常信息
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+
+        self.assertFalse(
+            worker.is_alive(), "re-entrant dispatch chain deadlocked"
+        )
+        self.assertNotIn("error", outcome)
+        self.assertEqual(manager.current_tasks, 0)
+        self.assertTrue(manager.is_queue_empty())
+        # 新提交的任务 + 队列里排队的两条，都必须真的派发出去。
+        self.assertEqual(manager._process_executor.submit.call_count, 3)
+
+    def test_shutdown_closes_process_executor(self):
+        """shutdown 必须把关闭动作转发给进程执行器，线程模式下则是空操作。"""
+        manager = self._manager()
+        thread_manager = InMemoryTaskManager(max_concurrent_tasks=1)
+
+        manager.shutdown()
+        thread_manager.shutdown()
+
+        manager._process_executor.shutdown.assert_called_once_with()
 
 
 class TestRedisTaskManager(unittest.TestCase):

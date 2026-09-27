@@ -16,7 +16,11 @@ from loguru import logger
 
 from app.config import config
 from app.controllers import base
-from app.controllers.manager.base_manager import TaskQueueFullError
+from app.controllers.manager.base_manager import (
+    EXECUTION_MODE_THREAD,
+    TaskQueueFullError,
+    resolve_execution_mode,
+)
 from app.controllers.manager.memory_manager import InMemoryTaskManager
 from app.controllers.manager.redis_manager import RedisTaskManager
 from app.controllers.v1.base import new_router
@@ -56,6 +60,7 @@ def _sanitize_for_log(task: dict) -> dict:
             params.sample_audio_base64 = val[:60] + f"...[{len(val)} chars]"
     return sanitized
 
+
 # 认证依赖项
 # router = new_router(dependencies=[Depends(base.verify_token)])
 router = new_router()
@@ -67,6 +72,12 @@ _redis_db = config.app.get("redis_db", 0)
 _redis_password = config.app.get("redis_password", None)
 _max_concurrent_tasks = config.app.get("max_concurrent_tasks", 5)
 _max_queued_tasks = config.app.get("max_queued_tasks", 100)
+# 任务执行模式：thread（默认，单解释器内的线程）或 process（每个任务独立进程，
+# 绕开 GIL）。不安全的组合会被 resolve_execution_mode 强制降级为 thread。
+task_execution_mode = resolve_execution_mode(
+    config.app.get("task_execution_mode", EXECUTION_MODE_THREAD),
+    redis_enabled=_enable_redis,
+)
 
 redis_url = f"redis://:{_redis_password}@{_redis_host}:{_redis_port}/{_redis_db}"
 # 根据配置选择合适的任务管理器
@@ -75,12 +86,19 @@ if _enable_redis:
         max_concurrent_tasks=_max_concurrent_tasks,
         redis_url=redis_url,
         max_queued_tasks=_max_queued_tasks,
+        execution_mode=task_execution_mode,
     )
 else:
     task_manager = InMemoryTaskManager(
         max_concurrent_tasks=_max_concurrent_tasks,
         max_queued_tasks=_max_queued_tasks,
+        execution_mode=task_execution_mode,
     )
+
+logger.info(
+    f"task execution mode: {task_execution_mode} "
+    f"(max_concurrent_tasks={_max_concurrent_tasks})"
+)
 
 
 def _sanitize_upload_filename(filename: str, request_id: str) -> str:

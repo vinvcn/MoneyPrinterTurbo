@@ -5,7 +5,10 @@ import redis
 from loguru import logger
 from pydantic import ValidationError
 
-from app.controllers.manager.base_manager import TaskManager
+from app.controllers.manager.base_manager import (
+    EXECUTION_MODE_THREAD,
+    TaskManager,
+)
 from app.models import const
 from app.models.schema import TaskVideoRequest, VideoParams
 from app.services import state as sm
@@ -23,9 +26,14 @@ class RedisTaskManager(TaskManager):
         max_concurrent_tasks: int,
         redis_url: str,
         max_queued_tasks: int = 100,
+        execution_mode: str = EXECUTION_MODE_THREAD,
     ):
         self.redis_client = redis.Redis.from_url(redis_url)
-        super().__init__(max_concurrent_tasks, max_queued_tasks=max_queued_tasks)
+        super().__init__(
+            max_concurrent_tasks,
+            max_queued_tasks=max_queued_tasks,
+            execution_mode=execution_mode,
+        )
 
     def create_queue(self):
         return "task_queue"
