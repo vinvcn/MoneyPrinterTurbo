@@ -38,7 +38,7 @@ class TestRenderModeResolution(unittest.TestCase):
 
     def test_unknown_modes_raise_naming_the_switch(self):
         cases = [
-            (vd.resolve_final_render_mode, "ffmpeg_overlay", "final_render_mode"),
+            (vd.resolve_final_render_mode, "libass", "final_render_mode"),
             (vd.resolve_combine_render_mode, "libass", "combine_render_mode"),
         ]
         for resolve, bad_value, switch_name in cases:
@@ -60,8 +60,12 @@ class TestRenderModeResolution(unittest.TestCase):
                 {"combine_render_mode": "ffmpeg_filter"},
                 ("moviepy", "ffmpeg_filter"),
             ),
-            ({"final_render_mode": "ffmpeg_overlay"}, None),
+            (
+                {"final_render_mode": "ffmpeg_overlay"},
+                ("ffmpeg_overlay", "moviepy"),
+            ),
             ({"combine_render_mode": "libass"}, None),
+            ({"final_render_mode": "libass"}, None),
         ]
         for config_values, expected in cases:
             with self.subTest(config_values=config_values):

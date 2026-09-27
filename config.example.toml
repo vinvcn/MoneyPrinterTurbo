@@ -241,7 +241,9 @@ subtitle_provider = "edge"
 # requires an API container restart (same as max_concurrent_tasks).
 #
 # Final-video renderer.
-#   "moviepy" - MoviePy composite (current behaviour, flexible) [default]
+#   "moviepy"        - MoviePy composite (flexible) [default]
+#   "ffmpeg_overlay" - PIL subtitle overlay + one native FFmpeg overlay/encode
+#                      pass (fast; preserves full PIL subtitle flexibility)
 final_render_mode = "moviepy"
 #
 # Combine-phase renderer.

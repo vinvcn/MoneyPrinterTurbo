@@ -77,6 +77,8 @@ fps = 30
 # 这里给视频素材多留一个很小的安全余量，避免音频末尾因为帧舍入出现黑屏、
 # 卡顿或最后一小段旁白没有画面的情况。
 _VIDEO_DURATION_SAFETY_MARGIN = 0.1
+# BGM 淡出时长，MoviePy 路径用 afx.AudioFadeOut(3)，ffmpeg_overlay 需与其一致。
+_BGM_FADE_OUT_SECONDS = 3.0
 _MIN_MATERIAL_DIMENSION = 480
 # 消息类应用和部分编码器会把画面尺寸向下取整，例如 WhatsApp 会把 9:16 的
 # 素材压成 478x850，比 480 少两个像素。直接按 480 硬卡会让这类素材全部被
@@ -108,8 +110,12 @@ _runtime_disabled_video_codecs = set()
 # "ffmpeg_filter" as new mode values together with their implementation.
 # ---------------------------------------------------------------------------
 FINAL_RENDER_MODE_MOVIEPY = "moviepy"
+FINAL_RENDER_MODE_FFMPEG_OVERLAY = "ffmpeg_overlay"
 DEFAULT_FINAL_RENDER_MODE = FINAL_RENDER_MODE_MOVIEPY
-_SUPPORTED_FINAL_RENDER_MODES = (FINAL_RENDER_MODE_MOVIEPY,)
+_SUPPORTED_FINAL_RENDER_MODES = (
+    FINAL_RENDER_MODE_MOVIEPY,
+    FINAL_RENDER_MODE_FFMPEG_OVERLAY,
+)
 
 COMBINE_RENDER_MODE_MOVIEPY = "moviepy"
 COMBINE_RENDER_MODE_FFMPEG_FILTER = "ffmpeg_filter"
@@ -2102,6 +2108,211 @@ class _SubtitleOverlayClip(VideoClip):
         super().close()
 
 
+def _resolve_subtitle_background_color(params):
+    """兼容历史参数：text_background_color 可能是布尔值或颜色字符串。"""
+    # 兼容历史参数：API 里 `text_background_color` 既可能是布尔值，
+    # 也可能是实际颜色字符串。统一在这里归一化，避免把 True/False
+    # 直接传给 TextClip 后出现不可预期的渲染结果。
+    if isinstance(params.text_background_color, bool):
+        return "#000000" if params.text_background_color else None
+    return params.text_background_color
+
+
+
+def _create_subtitle_text_clip(
+    subtitle_item, params, video_width, video_height, font_path
+):
+    """
+    为单个字幕短语构建已定位到画布的 MoviePy 图层。
+
+    final-video 的两条渲染路径共用：moviepy 把它合成进最终 clip，
+    ffmpeg_overlay 把它预渲染成透明 RGBA 覆盖层。
+    """
+    params.font_size = int(params.font_size)
+    params.stroke_width = int(params.stroke_width)
+    phrase = subtitle_item[1]
+    max_width = video_width * 0.9
+    bg_color = _resolve_subtitle_background_color(params)
+    rounded_bg_enabled = bool(
+        getattr(params, "rounded_subtitle_background", False) and bg_color
+    )
+    has_subtitle_background = bool(bg_color)
+    # 圆角背景按文字真实宽度生成，左右留白应更克制；旧矩形背景仍保留
+    # 较大的安全边距，避免历史配置中的长字幕贴边或被裁切。
+    padding_ratio = 0.4 if rounded_bg_enabled else 0.6
+    pad_x = int(params.font_size * padding_ratio) if has_subtitle_background else 0
+    # 字幕背景需要给文字左右留出明确内边距。先从可用宽度中扣除
+    # padding 再换行，避免长英文或大字号刚好撑满 90% 视频宽度后，
+    # 文字贴到背景框边缘，看起来像被裁切。普通矩形背景和圆角背景
+    # 都走这条逻辑；无背景字幕则保持原有最大宽度。
+    text_max_width = max(1, int(max_width) - 2 * pad_x)
+    wrapped_txt, txt_height = wrap_text(
+        phrase,
+        max_width=text_max_width,
+        font=font_path,
+        fontsize=params.font_size,
+    )
+    interline = int(params.font_size * 0.25)
+    line_count = wrapped_txt.count("\n") + 1
+    vertical_padding = int(params.font_size * 0.35)
+    text_clip_margin_y = max(
+        int(params.font_size * 0.3), int(params.stroke_width * 2)
+    )
+    # MoviePy 在 `method=label` 下会自动收缩文本框高度，遇到多行字幕、
+    # 描边或背景色时，容易把最后一行的下半部分裁掉。这里显式传入
+    # 一个更保守的高度，把行间距和额外上下留白一并算进去，保证字幕
+    # 背景框与文字本身都能完整渲染出来。
+    clip_h = int(txt_height + vertical_padding + (interline * line_count))
+
+    if rounded_bg_enabled:
+        # 圆角背景需要贴合文字宽度，而不是沿用 90% 视频宽度。这里先用
+        # PIL 测量最长一行文字，再加水平内边距，避免短字幕出现过宽底板。
+        try:
+            font = ImageFont.truetype(font_path, params.font_size)
+            text_w = max(
+                int(font.getbbox(line)[2] - font.getbbox(line)[0])
+                for line in wrapped_txt.split("\n")
+            )
+        except Exception as exc:
+            logger.warning(
+                f"failed to measure subtitle text width, fallback to max width: {str(exc)}"
+            )
+            text_w = int(max_width)
+
+        box_w = max(1, min(int(max_width), text_w + 2 * pad_x))
+        radius = max(8, int(params.font_size * 0.4))
+        text_clip = TextClip(
+            text=wrapped_txt,
+            font=font_path,
+            font_size=params.font_size,
+            color=params.text_fore_color,
+            bg_color=None,
+            stroke_color=params.stroke_color,
+            stroke_width=params.stroke_width,
+            interline=interline,
+            size=(box_w, None),
+            text_align="center",
+            margin=(0, text_clip_margin_y),
+        )
+        clip_h = max(clip_h, text_clip.h)
+        bg_clip = _rounded_subtitle_background_clip(
+            width=box_w,
+            height=clip_h,
+            color=bg_color,
+            alpha=140,
+            radius=radius,
+        )
+        text_position = _get_visible_center_position(text_clip, box_w, clip_h)
+        _clip = CompositeVideoClip(
+            [bg_clip, text_clip.with_position(text_position)],
+            size=(box_w, clip_h),
+        )
+    elif bg_color:
+        size = (
+            int(max_width),
+            clip_h,
+        )
+        text_clip = TextClip(
+            text=wrapped_txt,
+            font=font_path,
+            font_size=params.font_size,
+            color=params.text_fore_color,
+            bg_color=None,
+            stroke_color=params.stroke_color,
+            stroke_width=params.stroke_width,
+            interline=interline,
+            size=(int(max_width), None),
+            text_align="center",
+            margin=(0, text_clip_margin_y),
+        )
+        size = (size[0], max(size[1], text_clip.h))
+        bg_clip = _rounded_subtitle_background_clip(
+            width=size[0],
+            height=size[1],
+            color=bg_color,
+            alpha=255,
+            radius=0,
+        )
+        text_position = _get_visible_center_position(text_clip, size[0], size[1])
+        _clip = CompositeVideoClip(
+            [bg_clip, text_clip.with_position(text_position)],
+            size=size,
+        )
+    else:
+        size = (
+            int(max_width),
+            clip_h,
+        )
+        _clip = TextClip(
+            text=wrapped_txt,
+            font=font_path,
+            font_size=params.font_size,
+            color=params.text_fore_color,
+            bg_color=None,
+            stroke_color=params.stroke_color,
+            stroke_width=params.stroke_width,
+            interline=interline,
+            size=size,
+            text_align="center",
+        )
+    duration = subtitle_item[0][1] - subtitle_item[0][0]
+    _clip = _clip.with_start(subtitle_item[0][0])
+    _clip = _clip.with_end(subtitle_item[0][1])
+    _clip = _clip.with_duration(duration)
+    if params.subtitle_position == "bottom":
+        _clip = _clip.with_position(("center", video_height * 0.95 - _clip.h))
+    elif params.subtitle_position == "top":
+        _clip = _clip.with_position(("center", video_height * 0.05))
+    elif params.subtitle_position == "custom":
+        # Ensure the subtitle is fully within the screen bounds
+        margin = 10  # Additional margin, in pixels
+        max_y = video_height - _clip.h - margin
+        min_y = margin
+        custom_y = (video_height - _clip.h) * (params.custom_position / 100)
+        custom_y = max(
+            min_y, min(custom_y, max_y)
+        )  # Constrain the y value within the valid range
+        _clip = _clip.with_position(("center", custom_y))
+    else:  # center
+        _clip = _clip.with_position(("center", "center"))
+    return _clip
+
+
+
+def _build_subtitle_overlays(
+    subtitle_path, params, video_width, video_height, font_path
+):
+    """
+    把字幕文件里的每个短语预渲染成 `_SubtitleOverlay`（RGBA + 落点 + 时间窗）。
+
+    只渲染一次/短语，供两条最终渲染路径共用。
+    """
+    overlays = []
+    if not (subtitle_path and os.path.exists(subtitle_path)):
+        return overlays
+
+    def make_textclip(text):
+        return TextClip(
+            text=text,
+            font=font_path,
+            font_size=params.font_size,
+        )
+
+    with SubtitlesClip(
+        subtitles=subtitle_path,
+        encoding="utf-8",
+        make_textclip=make_textclip,
+    ) as sub:
+        for item in sub.subtitles:
+            clip = _create_subtitle_text_clip(
+                item, params, video_width, video_height, font_path
+            )
+            overlays.append(
+                _build_subtitle_overlay(clip, (video_width, video_height))
+            )
+    return overlays
+
+
 def _generate_video_moviepy(
     video_path: str,
     audio_path: str,
@@ -2141,164 +2352,6 @@ def _generate_video_moviepy(
 
         logger.info(f"  ⑤ font: {font_path}")
 
-    def resolve_subtitle_background_color():
-        # 兼容历史参数：API 里 `text_background_color` 既可能是布尔值，
-        # 也可能是实际颜色字符串。统一在这里归一化，避免把 True/False
-        # 直接传给 TextClip 后出现不可预期的渲染结果。
-        if isinstance(params.text_background_color, bool):
-            return "#000000" if params.text_background_color else None
-        return params.text_background_color
-
-    def create_text_clip(subtitle_item):
-        params.font_size = int(params.font_size)
-        params.stroke_width = int(params.stroke_width)
-        phrase = subtitle_item[1]
-        max_width = video_width * 0.9
-        bg_color = resolve_subtitle_background_color()
-        rounded_bg_enabled = bool(
-            getattr(params, "rounded_subtitle_background", False) and bg_color
-        )
-        has_subtitle_background = bool(bg_color)
-        # 圆角背景按文字真实宽度生成，左右留白应更克制；旧矩形背景仍保留
-        # 较大的安全边距，避免历史配置中的长字幕贴边或被裁切。
-        padding_ratio = 0.4 if rounded_bg_enabled else 0.6
-        pad_x = int(params.font_size * padding_ratio) if has_subtitle_background else 0
-        # 字幕背景需要给文字左右留出明确内边距。先从可用宽度中扣除
-        # padding 再换行，避免长英文或大字号刚好撑满 90% 视频宽度后，
-        # 文字贴到背景框边缘，看起来像被裁切。普通矩形背景和圆角背景
-        # 都走这条逻辑；无背景字幕则保持原有最大宽度。
-        text_max_width = max(1, int(max_width) - 2 * pad_x)
-        wrapped_txt, txt_height = wrap_text(
-            phrase,
-            max_width=text_max_width,
-            font=font_path,
-            fontsize=params.font_size,
-        )
-        interline = int(params.font_size * 0.25)
-        line_count = wrapped_txt.count("\n") + 1
-        vertical_padding = int(params.font_size * 0.35)
-        text_clip_margin_y = max(
-            int(params.font_size * 0.3), int(params.stroke_width * 2)
-        )
-        # MoviePy 在 `method=label` 下会自动收缩文本框高度，遇到多行字幕、
-        # 描边或背景色时，容易把最后一行的下半部分裁掉。这里显式传入
-        # 一个更保守的高度，把行间距和额外上下留白一并算进去，保证字幕
-        # 背景框与文字本身都能完整渲染出来。
-        clip_h = int(txt_height + vertical_padding + (interline * line_count))
-
-        if rounded_bg_enabled:
-            # 圆角背景需要贴合文字宽度，而不是沿用 90% 视频宽度。这里先用
-            # PIL 测量最长一行文字，再加水平内边距，避免短字幕出现过宽底板。
-            try:
-                font = ImageFont.truetype(font_path, params.font_size)
-                text_w = max(
-                    int(font.getbbox(line)[2] - font.getbbox(line)[0])
-                    for line in wrapped_txt.split("\n")
-                )
-            except Exception as exc:
-                logger.warning(
-                    f"failed to measure subtitle text width, fallback to max width: {str(exc)}"
-                )
-                text_w = int(max_width)
-
-            box_w = max(1, min(int(max_width), text_w + 2 * pad_x))
-            radius = max(8, int(params.font_size * 0.4))
-            text_clip = TextClip(
-                text=wrapped_txt,
-                font=font_path,
-                font_size=params.font_size,
-                color=params.text_fore_color,
-                bg_color=None,
-                stroke_color=params.stroke_color,
-                stroke_width=params.stroke_width,
-                interline=interline,
-                size=(box_w, None),
-                text_align="center",
-                margin=(0, text_clip_margin_y),
-            )
-            clip_h = max(clip_h, text_clip.h)
-            bg_clip = _rounded_subtitle_background_clip(
-                width=box_w,
-                height=clip_h,
-                color=bg_color,
-                alpha=140,
-                radius=radius,
-            )
-            text_position = _get_visible_center_position(text_clip, box_w, clip_h)
-            _clip = CompositeVideoClip(
-                [bg_clip, text_clip.with_position(text_position)],
-                size=(box_w, clip_h),
-            )
-        elif bg_color:
-            size = (
-                int(max_width),
-                clip_h,
-            )
-            text_clip = TextClip(
-                text=wrapped_txt,
-                font=font_path,
-                font_size=params.font_size,
-                color=params.text_fore_color,
-                bg_color=None,
-                stroke_color=params.stroke_color,
-                stroke_width=params.stroke_width,
-                interline=interline,
-                size=(int(max_width), None),
-                text_align="center",
-                margin=(0, text_clip_margin_y),
-            )
-            size = (size[0], max(size[1], text_clip.h))
-            bg_clip = _rounded_subtitle_background_clip(
-                width=size[0],
-                height=size[1],
-                color=bg_color,
-                alpha=255,
-                radius=0,
-            )
-            text_position = _get_visible_center_position(text_clip, size[0], size[1])
-            _clip = CompositeVideoClip(
-                [bg_clip, text_clip.with_position(text_position)],
-                size=size,
-            )
-        else:
-            size = (
-                int(max_width),
-                clip_h,
-            )
-            _clip = TextClip(
-                text=wrapped_txt,
-                font=font_path,
-                font_size=params.font_size,
-                color=params.text_fore_color,
-                bg_color=None,
-                stroke_color=params.stroke_color,
-                stroke_width=params.stroke_width,
-                interline=interline,
-                size=size,
-                text_align="center",
-            )
-        duration = subtitle_item[0][1] - subtitle_item[0][0]
-        _clip = _clip.with_start(subtitle_item[0][0])
-        _clip = _clip.with_end(subtitle_item[0][1])
-        _clip = _clip.with_duration(duration)
-        if params.subtitle_position == "bottom":
-            _clip = _clip.with_position(("center", video_height * 0.95 - _clip.h))
-        elif params.subtitle_position == "top":
-            _clip = _clip.with_position(("center", video_height * 0.05))
-        elif params.subtitle_position == "custom":
-            # Ensure the subtitle is fully within the screen bounds
-            margin = 10  # Additional margin, in pixels
-            max_y = video_height - _clip.h - margin
-            min_y = margin
-            custom_y = (video_height - _clip.h) * (params.custom_position / 100)
-            custom_y = max(
-                min_y, min(custom_y, max_y)
-            )  # Constrain the y value within the valid range
-            _clip = _clip.with_position(("center", custom_y))
-        else:  # center
-            _clip = _clip.with_position(("center", "center"))
-        return _clip
-
     # MoviePy 的 CompositeAudioClip.close() 不会关闭子 AudioFileClip。这里用
     # ExitStack 显式持有所有原始文件 reader，确保成功、字幕异常、混音失败和
     # 视频写入失败等路径都能释放 FFmpeg 子进程，尤其避免 Windows 文件被占用。
@@ -2312,29 +2365,12 @@ def _generate_video_moviepy(
             [afx.MultiplyVolume(params.voice_volume)]
         )
 
-        def make_textclip(text):
-            return TextClip(
-                text=text,
-                font=font_path,
-                font_size=params.font_size,
-            )
-
-        if subtitle_path and os.path.exists(subtitle_path):
-            sub = clip_stack.enter_context(
-                SubtitlesClip(
-                    subtitles=subtitle_path,
-                    encoding="utf-8",
-                    make_textclip=make_textclip,
-                )
-            )
-            # F2（#311）：每个字幕短语只预渲染一次，合成时只按包围盒叠加，
-            # 避免 MoviePy 每帧对整帧做 RGBA astype/alpha_composite。
-            overlays = [
-                _build_subtitle_overlay(
-                    create_text_clip(subtitle_item=item), video_clip.size
-                )
-                for item in sub.subtitles
-            ]
+        # F2（#311）：每个字幕短语只预渲染一次，合成时只按包围盒叠加，
+        # 避免 MoviePy 每帧对整帧做 RGBA astype/alpha_composite。
+        overlays = _build_subtitle_overlays(
+            subtitle_path, params, video_width, video_height, font_path
+        )
+        if overlays:
             video_clip = _SubtitleOverlayClip(video_clip, overlays)
             clip_stack.callback(video_clip.close)
 
@@ -2405,8 +2441,244 @@ def _generate_video_moviepy(
         return bgm_mix_succeeded
 
 
+# ---------------------------------------------------------------------------
+# Final-video renderer: ffmpeg_overlay (option C / #312, ADR-0013)
+#
+# Stage 1 (Python/PIL) reuses the same subtitle construction as the MoviePy
+# path (`_build_subtitle_overlays`) and writes each phrase once as a transparent
+# RGBA PNG at its resolved position. Stage 2 is one native FFmpeg pass that
+# overlays those PNGs onto the combined video inside their time windows, mixes
+# narration (+ optional BGM) and encodes. This removes the per-frame Python
+# full-frame composite (F2) while keeping full PIL subtitle flexibility.
+# ---------------------------------------------------------------------------
+
+
+def _write_subtitle_overlay_pngs(overlays, output_dir: str, output_stem: str):
+    """Write each pre-rendered RGBA overlay to a PNG kept for audit/debugging."""
+    paths = []
+    for index, overlay in enumerate(overlays, start=1):
+        path = os.path.join(output_dir, f"{output_stem}-overlay-{index}.png")
+        Image.fromarray(overlay.rgba).save(path)
+        paths.append(path)
+    return paths
+
+
+def _build_final_overlay_command(
+    *,
+    overlay_paths,
+    overlays,
+    video_path: str,
+    audio_path: str,
+    bgm_file: str,
+    output_file: str,
+    video_fps: int,
+    threads: int,
+    codec: str,
+    voice_volume: float,
+    bgm_volume: float,
+    composed_duration: float,
+    bgm_loop: bool,
+):
+    """Build the single overlay+mix+encode command for `ffmpeg_overlay`."""
+    inputs = ["-i", video_path]
+    for path in overlay_paths:
+        # `-loop 1` keeps each static overlay frame available for its window.
+        inputs += ["-loop", "1", "-framerate", str(video_fps), "-i", path]
+    audio_index = 1 + len(overlay_paths)
+    inputs += ["-i", audio_path]
+    bgm_index = None
+    if bgm_file:
+        if bgm_loop:
+            inputs += ["-stream_loop", "-1"]
+        inputs += ["-i", bgm_file]
+        bgm_index = audio_index + 1
+
+    graph = []
+    current = "[0:v]"
+    for index, overlay in enumerate(overlays):
+        label_in = f"[{index + 1}:v]"
+        label_out = f"[v{index}]"
+        enable = f"between(t,{overlay.start:.3f},{overlay.end:.3f})"
+        graph.append(
+            f"{current}{label_in}overlay=x={overlay.x}:y={overlay.y}:"
+            f"enable='{enable}':eof_action=pass{label_out}"
+        )
+        current = label_out
+    graph.append(f"{current}format=yuv420p[vout]")
+
+    if bgm_index is not None:
+        fade_start = max(0.0, composed_duration - _BGM_FADE_OUT_SECONDS)
+        graph.append(f"[{audio_index}:a]volume={voice_volume}[voice]")
+        graph.append(
+            f"[{bgm_index}:a]volume={bgm_volume},"
+            f"afade=t=out:st={fade_start:.3f}:d={_BGM_FADE_OUT_SECONDS:.3f}[bgm]"
+        )
+        # `normalize=0` sums the two streams like MoviePy's CompositeAudioClip
+        # instead of averaging them down.
+        graph.append(
+            "[voice][bgm]amix=inputs=2:duration=first:"
+            "dropout_transition=0:normalize=0[aout]"
+        )
+    else:
+        graph.append(f"[{audio_index}:a]volume={voice_volume}[aout]")
+
+    return [
+        utils.get_ffmpeg_binary(),
+        "-y",
+        *inputs,
+        "-filter_complex",
+        ";".join(graph),
+        "-map",
+        "[vout]",
+        "-map",
+        "[aout]",
+        "-c:v",
+        codec,
+        "-threads",
+        str(threads or 2),
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        audio_codec,
+        "-b:a",
+        audio_bitrate,
+        "-t",
+        f"{composed_duration:.3f}",
+        "-r",
+        str(video_fps),
+        output_file,
+    ]
+
+
+def _generate_video_ffmpeg_overlay(
+    video_path: str,
+    audio_path: str,
+    subtitle_path: str,
+    output_file: str,
+    params: VideoParams,
+    bgm_file_override: str | None = None,
+) -> bool:
+    """
+    最终成片渲染器：PIL 预渲染字幕覆盖层 + 单次 FFmpeg overlay 编码（#312）。
+
+    返回值和 moviepy 路径一致，只描述 BGM 处理是否成功。写到一个临时文件并
+    在成功后原子替换，失败时任务明确报错且不留下半成品。
+    """
+    aspect = VideoAspect(params.video_aspect)
+    video_width, video_height = aspect.to_resolution()
+    output_dir = os.path.dirname(output_file)
+    output_stem = os.path.splitext(os.path.basename(output_file))[0]
+
+    logger.info(f"generating video (ffmpeg_overlay): {video_width} x {video_height}")
+    logger.info(f"  ① video: {video_path}")
+    logger.info(f"  ② audio: {audio_path}")
+    logger.info(f"  ③ subtitle: {subtitle_path}")
+    logger.info(f"  ④ output: {output_file}")
+
+    font_path = ""
+    if params.subtitle_enabled:
+        if not params.font_name:
+            params.font_name = "STHeitiMedium.ttc"
+        font_path = os.path.join(utils.font_dir(), params.font_name)
+        if os.name == "nt":
+            font_path = font_path.replace("\\", "/")
+        logger.info(f"  ⑤ font: {font_path}")
+
+    # Stage 1: render the subtitle layer once per phrase (full PIL freedom).
+    overlays = _build_subtitle_overlays(
+        subtitle_path, params, video_width, video_height, font_path
+    )
+    overlay_paths = _write_subtitle_overlay_pngs(
+        overlays, output_dir, output_stem
+    )
+    logger.info(
+        f"ffmpeg_overlay: {len(overlays)} subtitle overlay(s) pre-rendered"
+    )
+
+    video_duration = _probe_video_duration(video_path)
+    overlay_end = max((overlay.end for overlay in overlays), default=0.0)
+    composed_duration = max(video_duration, overlay_end)
+
+    bgm_enabled = bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
+    if not bgm_enabled and params.bgm_type:
+        logger.info(
+            f"skipping background music because volume is not positive: "
+            f"type={params.bgm_type}, volume={params.bgm_volume}"
+        )
+    bgm_file = ""
+    if bgm_enabled:
+        bgm_file = (
+            bgm_file_override
+            if bgm_file_override is not None
+            else get_bgm_file(
+                bgm_type=params.bgm_type,
+                bgm_file=params.bgm_file,
+            )
+        )
+    # Provider-supplied BGM is already length-matched; random/custom BGM is
+    # looped to cover the clip, matching the MoviePy path.
+    bgm_loop = bgm_file_override is None
+
+    partial_file = f"{output_file}.partial.mp4"
+
+    def make_builder(include_bgm: bool):
+        def build(codec: str):
+            return _build_final_overlay_command(
+                overlay_paths=overlay_paths,
+                overlays=overlays,
+                video_path=video_path,
+                audio_path=audio_path,
+                bgm_file=bgm_file if include_bgm else "",
+                output_file=partial_file,
+                video_fps=fps,
+                threads=params.n_threads or 2,
+                codec=codec,
+                voice_volume=params.voice_volume,
+                bgm_volume=params.bgm_volume,
+                composed_duration=composed_duration,
+                bgm_loop=bgm_loop,
+            )
+
+        return build
+
+    # BGM failure degrades to narration-only (same contract as the MoviePy
+    # path); a failure of the selected renderer itself still fails the task.
+    bgm_mix_succeeded = True
+    try:
+        if bgm_file:
+            try:
+                _run_ffmpeg_with_codec_fallback(
+                    make_builder(True), label="final render (ffmpeg_overlay)"
+                )
+            except Exception:
+                bgm_mix_succeeded = False
+                logger.exception(
+                    f"failed to mix background music: type={params.bgm_type}, "
+                    f"file={bgm_file}"
+                )
+                _run_ffmpeg_with_codec_fallback(
+                    make_builder(False), label="final render (ffmpeg_overlay)"
+                )
+        else:
+            _run_ffmpeg_with_codec_fallback(
+                make_builder(False), label="final render (ffmpeg_overlay)"
+            )
+        # Promote only after a successful render, so a failed attempt leaves no
+        # output that could be mistaken for a finished video.
+        os.replace(partial_file, output_file)
+    except Exception:
+        if os.path.exists(partial_file):
+            try:
+                os.remove(partial_file)
+            except OSError:
+                pass
+        raise
+    return bgm_mix_succeeded
+
+
 _FINAL_RENDER_IMPLEMENTATIONS = {
     FINAL_RENDER_MODE_MOVIEPY: _generate_video_moviepy,
+    FINAL_RENDER_MODE_FFMPEG_OVERLAY: _generate_video_ffmpeg_overlay,
 }
 
 
