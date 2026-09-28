@@ -4,6 +4,7 @@ import math
 import os
 import random
 import gc
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -2118,6 +2119,40 @@ def _resolve_subtitle_background_color(params):
     return params.text_background_color
 
 
+def _resolve_font_path(params) -> str:
+    """解析字幕字体路径，两条最终渲染路径共用。"""
+    if not params.subtitle_enabled:
+        return ""
+    if not params.font_name:
+        params.font_name = "STHeitiMedium.ttc"
+    font_path = os.path.join(utils.font_dir(), params.font_name)
+    if os.name == "nt":
+        font_path = font_path.replace("\\", "/")
+    return font_path
+
+
+def _resolve_bgm_file(params, bgm_file_override):
+    """
+    解析本次最终渲染要混入的背景音乐，返回文件路径（无 BGM 时为空串）。
+
+    两条渲染路径共用同一套规则：音量不大于 0 时短路；提供商传入的 override
+    优先于随机/自定义解析。调用方据此决定是否循环铺满。
+    """
+    bgm_enabled = bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
+    if not bgm_enabled and params.bgm_type:
+        logger.info(
+            f"skipping background music because volume is not positive: "
+            f"type={params.bgm_type}, volume={params.bgm_volume}"
+        )
+    if not bgm_enabled:
+        return ""
+    if bgm_file_override is not None:
+        return bgm_file_override
+    return get_bgm_file(
+        bgm_type=params.bgm_type,
+        bgm_file=params.bgm_file,
+    )
+
 
 def _create_subtitle_text_clip(
     subtitle_item, params, video_width, video_height, font_path
@@ -2278,7 +2313,6 @@ def _create_subtitle_text_clip(
     return _clip
 
 
-
 def _build_subtitle_overlays(
     subtitle_path, params, video_width, video_height, font_path
 ):
@@ -2342,14 +2376,8 @@ def _generate_video_moviepy(
     # write into the same directory as the output file
     output_dir = os.path.dirname(output_file)
 
-    font_path = ""
-    if params.subtitle_enabled:
-        if not params.font_name:
-            params.font_name = "STHeitiMedium.ttc"
-        font_path = os.path.join(utils.font_dir(), params.font_name)
-        if os.name == "nt":
-            font_path = font_path.replace("\\", "/")
-
+    font_path = _resolve_font_path(params)
+    if font_path:
         logger.info(f"  ⑤ font: {font_path}")
 
     # MoviePy 的 CompositeAudioClip.close() 不会关闭子 AudioFileClip。这里用
@@ -2374,29 +2402,9 @@ def _generate_video_moviepy(
             video_clip = _SubtitleOverlayClip(video_clip, overlays)
             clip_stack.callback(video_clip.close)
 
-        bgm_enabled = bgm_service.should_use_bgm(
-            params.bgm_type, params.bgm_volume
-        )
-        if not bgm_enabled and params.bgm_type:
-            # 所有 BGM 来源共用这一条短路规则。音量不大于 0 时不能解析随机或
-            # 自定义文件，也不能加载提供商返回的文件，避免无意义的 IO 和混音。
-            logger.info(
-                f"skipping background music because volume is not positive: "
-                f"type={params.bgm_type}, volume={params.bgm_volume}"
-            )
-
         # 提供商配乐可由任务编排层直接传入对应文件。None 表示沿用随机/自定义
         # BGM 解析，空字符串明确禁用本条 BGM；但任何来源都必须先通过通用音量规则。
-        bgm_file = ""
-        if bgm_enabled:
-            bgm_file = (
-                bgm_file_override
-                if bgm_file_override is not None
-                else get_bgm_file(
-                    bgm_type=params.bgm_type,
-                    bgm_file=params.bgm_file,
-                )
-            )
+        bgm_file = _resolve_bgm_file(params, bgm_file_override)
         bgm_mix_succeeded = True
         if bgm_file:
             try:
@@ -2453,11 +2461,17 @@ def _generate_video_moviepy(
 # ---------------------------------------------------------------------------
 
 
-def _write_subtitle_overlay_pngs(overlays, output_dir: str, output_stem: str):
-    """Write each pre-rendered RGBA overlay to a PNG kept for audit/debugging."""
+def _write_subtitle_overlay_pngs(overlays, overlay_dir: str):
+    """
+    Write each pre-rendered RGBA overlay to a PNG in ``overlay_dir``.
+
+    These files are an intermediate artifact for the FFmpeg pass (they can embed
+    subtitle text), so the caller writes them to a temp directory and removes it
+    afterwards — they are never left in the served task output directory.
+    """
     paths = []
     for index, overlay in enumerate(overlays, start=1):
-        path = os.path.join(output_dir, f"{output_stem}-overlay-{index}.png")
+        path = os.path.join(overlay_dir, f"overlay-{index}.png")
         Image.fromarray(overlay.rgba).save(path)
         paths.append(path)
     return paths
@@ -2482,8 +2496,10 @@ def _build_final_overlay_command(
     """Build the single overlay+mix+encode command for `ffmpeg_overlay`."""
     inputs = ["-i", video_path]
     for path in overlay_paths:
-        # `-loop 1` keeps each static overlay frame available for its window.
-        inputs += ["-loop", "1", "-framerate", str(video_fps), "-i", path]
+        # A single-frame PNG input; `overlay` repeats its last frame for the
+        # whole enable window (`eof_action=repeat`), which is markedly cheaper
+        # than 20+ `-loop 1` decoders running for the full clip.
+        inputs += ["-framerate", str(video_fps), "-i", path]
     audio_index = 1 + len(overlay_paths)
     inputs += ["-i", audio_path]
     bgm_index = None
@@ -2501,7 +2517,7 @@ def _build_final_overlay_command(
         enable = f"between(t,{overlay.start:.3f},{overlay.end:.3f})"
         graph.append(
             f"{current}{label_in}overlay=x={overlay.x}:y={overlay.y}:"
-            f"enable='{enable}':eof_action=pass{label_out}"
+            f"enable='{enable}':eof_action=repeat:shortest=0{label_out}"
         )
         current = label_out
     graph.append(f"{current}format=yuv420p[vout]")
@@ -2538,6 +2554,10 @@ def _build_final_overlay_command(
         str(threads or 2),
         "-pix_fmt",
         "yuv420p",
+        # Keep the output limited-range/tv like the MoviePy writer, so the
+        # overlay composite does not drift in color range.
+        "-color_range",
+        "tv",
         "-c:a",
         audio_codec,
         "-b:a",
@@ -2575,22 +2595,20 @@ def _generate_video_ffmpeg_overlay(
     logger.info(f"  ③ subtitle: {subtitle_path}")
     logger.info(f"  ④ output: {output_file}")
 
-    font_path = ""
-    if params.subtitle_enabled:
-        if not params.font_name:
-            params.font_name = "STHeitiMedium.ttc"
-        font_path = os.path.join(utils.font_dir(), params.font_name)
-        if os.name == "nt":
-            font_path = font_path.replace("\\", "/")
+    font_path = _resolve_font_path(params)
+    if font_path:
         logger.info(f"  ⑤ font: {font_path}")
 
     # Stage 1: render the subtitle layer once per phrase (full PIL freedom).
     overlays = _build_subtitle_overlays(
         subtitle_path, params, video_width, video_height, font_path
     )
-    overlay_paths = _write_subtitle_overlay_pngs(
-        overlays, output_dir, output_stem
+    # Intermediate RGBA overlays live in a temp dir (they embed subtitle text);
+    # removed in the finally below on both success and failure.
+    overlay_dir = tempfile.mkdtemp(
+        prefix=f"{output_stem}-overlay-", dir=output_dir or None
     )
+    overlay_paths = _write_subtitle_overlay_pngs(overlays, overlay_dir)
     logger.info(
         f"ffmpeg_overlay: {len(overlays)} subtitle overlay(s) pre-rendered"
     )
@@ -2599,22 +2617,7 @@ def _generate_video_ffmpeg_overlay(
     overlay_end = max((overlay.end for overlay in overlays), default=0.0)
     composed_duration = max(video_duration, overlay_end)
 
-    bgm_enabled = bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
-    if not bgm_enabled and params.bgm_type:
-        logger.info(
-            f"skipping background music because volume is not positive: "
-            f"type={params.bgm_type}, volume={params.bgm_volume}"
-        )
-    bgm_file = ""
-    if bgm_enabled:
-        bgm_file = (
-            bgm_file_override
-            if bgm_file_override is not None
-            else get_bgm_file(
-                bgm_type=params.bgm_type,
-                bgm_file=params.bgm_file,
-            )
-        )
+    bgm_file = _resolve_bgm_file(params, bgm_file_override)
     # Provider-supplied BGM is already length-matched; random/custom BGM is
     # looped to cover the clip, matching the MoviePy path.
     bgm_loop = bgm_file_override is None
@@ -2673,6 +2676,8 @@ def _generate_video_ffmpeg_overlay(
             except OSError:
                 pass
         raise
+    finally:
+        shutil.rmtree(overlay_dir, ignore_errors=True)
     return bgm_mix_succeeded
 
 
