@@ -107,8 +107,8 @@ class TestOverlayCommandBuilder(unittest.TestCase):
             command[command.index("-framerate") + 1], "30"
         )
 
-    def test_bgm_is_mixed_and_looped(self):
-        command = vd._build_final_overlay_command(
+    def _bgm_command(self):
+        return vd._build_final_overlay_command(
             overlay_paths=[],
             overlays=[],
             video_path="base.mp4",
@@ -123,11 +123,63 @@ class TestOverlayCommandBuilder(unittest.TestCase):
             composed_duration=10.0,
             bgm_loop=True,
         )
+
+    def test_bgm_is_mixed_and_looped(self):
+        # FFmpeg >= 5.1: `normalize=0` sums the streams like MoviePy.
+        with patch.object(vd, "_amix_normalize_supported", True):
+            command = self._bgm_command()
         self.assertIn("-stream_loop", command)
         graph = command[command.index("-filter_complex") + 1]
         self.assertIn("volume=0.2,afade=t=out:st=7.000:d=3.000", graph)
         self.assertIn("amix=inputs=2:duration=first", graph)
         self.assertIn("normalize=0", graph)
+        self.assertNotIn("volume=2[aout]", graph)
+
+    def test_bgm_mix_compensates_when_amix_lacks_normalize(self):
+        # FFmpeg < 5.1 (bullseye image's 4.3) rejects the option outright; the
+        # graph must compensate with volume=2 instead of failing the whole mix.
+        with patch.object(vd, "_amix_normalize_supported", False):
+            command = self._bgm_command()
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertIn(
+            "amix=inputs=2:duration=first:dropout_transition=0,volume=2[aout]", graph
+        )
+        self.assertNotIn("normalize=0", graph)
+
+
+class TestAmixNormalizeProbe(unittest.TestCase):
+    """`_amix_supports_normalize` decides the mix graph; it must never crash."""
+
+    def setUp(self):
+        self._original = vd._amix_normalize_supported
+
+    def tearDown(self):
+        vd._amix_normalize_supported = self._original
+
+    def _probe_with_help(self, help_text):
+        from types import SimpleNamespace
+
+        vd._amix_normalize_supported = None
+        with patch.object(vd.subprocess, "run") as run_mock:
+            run_mock.return_value = SimpleNamespace(
+                returncode=0, stdout=help_text, stderr=""
+            )
+            return vd._amix_supports_normalize("ffmpeg")
+
+    def test_detects_normalize_support(self):
+        self.assertTrue(
+            self._probe_with_help("amix AVOptions:\n  normalize <boolean> ...")
+        )
+
+    def test_detects_missing_normalize(self):
+        self.assertFalse(
+            self._probe_with_help("amix AVOptions:\n  inputs <int> ...")
+        )
+
+    def test_probe_failure_falls_back_to_compensation(self):
+        vd._amix_normalize_supported = None
+        with patch.object(vd.subprocess, "run", side_effect=OSError("no ffmpeg")):
+            self.assertFalse(vd._amix_supports_normalize("ffmpeg"))
 
 
 class TestOverlayArtifacts(unittest.TestCase):
