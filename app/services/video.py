@@ -374,6 +374,41 @@ def _ffmpeg_encoder_exists(ffmpeg_binary: str, codec: str) -> bool:
     return codec in result.stdout
 
 
+_amix_normalize_supported: bool | None = None
+
+
+def _amix_supports_normalize(ffmpeg_binary: str) -> bool:
+    """
+    检查当前 FFmpeg 的 `amix` 滤镜是否支持 `normalize` 选项。
+
+    `normalize` 于 FFmpeg 5.1 引入；bullseye 基础镜像自带的 4.3 会直接报
+    "Option 'normalize' not found" 并让整条混音命令初始化失败。探测结果进程内
+    缓存一次，因为同一个 FFmpeg 在不同任务间不会改变能力。
+    """
+    global _amix_normalize_supported
+    if _amix_normalize_supported is None:
+        try:
+            result = subprocess.run(
+                [ffmpeg_binary, "-hide_banner", "-h", "filter=amix"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            help_text = result.stdout or result.stderr or ""
+            _amix_normalize_supported = (
+                result.returncode == 0 and "normalize" in help_text
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            _amix_normalize_supported = False
+        if not _amix_normalize_supported:
+            logger.warning(
+                "ffmpeg amix lacks the 'normalize' option (needs FFmpeg >= 5.1); "
+                "compensating with volume=2 to sum voice and background music"
+            )
+    return _amix_normalize_supported
+
+
 def _get_effective_video_codec(preferred_codec: str | None = None) -> str:
     """
     返回本次实际使用的视频编码器。
@@ -2530,11 +2565,15 @@ def _build_final_overlay_command(
             f"afade=t=out:st={fade_start:.3f}:d={_BGM_FADE_OUT_SECONDS:.3f}[bgm]"
         )
         # `normalize=0` sums the two streams like MoviePy's CompositeAudioClip
-        # instead of averaging them down.
-        graph.append(
-            "[voice][bgm]amix=inputs=2:duration=first:"
-            "dropout_transition=0:normalize=0[aout]"
-        )
+        # instead of averaging them down. It needs FFmpeg >= 5.1; older builds
+        # (e.g. the bullseye image's 4.3) reject the option and would fail the
+        # whole mix, so fall back to amix's default 1/N averaging compensated
+        # by volume=2 — identical for this fixed 2-input graph.
+        if _amix_supports_normalize(utils.get_ffmpeg_binary()):
+            mix_options = "dropout_transition=0:normalize=0"
+        else:
+            mix_options = "dropout_transition=0,volume=2"
+        graph.append(f"[voice][bgm]amix=inputs=2:duration=first:{mix_options}[aout]")
     else:
         graph.append(f"[{audio_index}:a]volume={voice_volume}[aout]")
 
