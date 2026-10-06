@@ -1,5 +1,8 @@
-# Use an official Python runtime as a parent image
-FROM python:3.11-slim-bullseye
+# Use an official Python runtime as a parent image.
+# Debian 11 (bullseye) reached end-of-LTS on 2026-08-31; its mirrors are
+# pruning the security pool while indexes still advertise removed files
+# (apt 404s). Bookworm is the supported oldstable (LTS until 2028-06).
+FROM python:3.11-slim-bookworm
 
 # Set the working directory in the container
 WORKDIR /MoneyPrinterTurbo
@@ -16,8 +19,9 @@ ARG PIP_USE_OFFICIAL=0
 
 # Install system dependencies with retry logic
 RUN if [ "$DOCKER_BUILD_MIRROR" = "china" ]; then \
-        echo "deb http://mirrors.aliyun.com/debian bullseye main" > /etc/apt/sources.list && \
-        echo "deb http://mirrors.aliyun.com/debian-security bullseye-security main" >> /etc/apt/sources.list; \
+        rm -f /etc/apt/sources.list.d/debian.sources && \
+        echo "deb http://mirrors.aliyun.com/debian bookworm main" > /etc/apt/sources.list && \
+        echo "deb http://mirrors.aliyun.com/debian-security bookworm-security main" >> /etc/apt/sources.list; \
     else \
         echo "Using default Debian mirrors"; \
     fi && \
