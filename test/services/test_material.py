@@ -1588,6 +1588,29 @@ class TestLibraryProvider(unittest.TestCase):
         search = material.search_videos_with_cache_for_source("library")
         self.assertEqual(material._search_provider_of(search), "library")
 
+    def test_library_proxies_bypass_for_local_names(self):
+        """容器内网名 / loopback / no 列表一律直连；远端部署才走代理。
+
+        宿主代理无法解析 Docker 内网名（vpc-retrieval），不绕过会把请求
+        变成 502（e2e 实测踩坑）。
+        """
+        config.proxy["http"] = "http://host.docker.internal:7897"
+        config.proxy["https"] = "http://host.docker.internal:7897"
+        config.proxy["no"] = "localhost,127.0.0.1,.internal"
+
+        self.assertIsNone(material._library_proxies("http://vpc-retrieval:8787"))
+        self.assertIsNone(material._library_proxies("http://localhost:8787"))
+        self.assertIsNone(material._library_proxies("http://127.0.0.1:8787"))
+        self.assertIsNone(material._library_proxies("http://host.internal:8787"))
+
+        remote = material._library_proxies("https://library.example.com")
+        self.assertEqual(remote.get("http"), "http://host.docker.internal:7897")
+
+    def test_library_proxies_none_without_proxy_config(self):
+        """没有代理配置时返回 None（不改变直连行为）。"""
+        config.proxy.clear()
+        self.assertIsNone(material._library_proxies("https://library.example.com"))
+
     def test_assert_library_requires_base_url(self):
         """library 预检看 [library] base_url，与官方 key 无关。"""
         config.library["base_url"] = ""

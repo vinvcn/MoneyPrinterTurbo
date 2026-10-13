@@ -795,6 +795,32 @@ def _library_settings() -> tuple[str, float]:
     return base_url, timeout
 
 
+def _library_proxies(base_url: str) -> dict | None:
+    """
+    本地检索服务的代理策略。
+
+    命中 [proxy] 的 no 列表、loopback 或 Docker 单标签主机名（如
+    vpc-retrieval）时直连：宿主代理解析不了容器内网名字，会把请求变成
+    502。其余情况（远端部署的素材库）沿用与在线 provider 相同的代理。
+    """
+    from urllib.parse import urlparse
+
+    host = (urlparse(base_url).hostname or "").lower()
+    if not host:
+        return None
+    proxy_conf = config.proxy if isinstance(config.proxy, dict) else {}
+    no_list = [
+        item.strip().lower() for item in str(proxy_conf.get("no", "")).split(",") if item.strip()
+    ]
+    if host in {"localhost", "127.0.0.1", "::1"} or "." not in host:
+        return None
+    for item in no_list:
+        # 标准 no_proxy 语义：以点开头的条目按域名后缀匹配。
+        if (item.startswith(".") and host.endswith(item)) or host == item:
+            return None
+    return dict(proxy_conf) or None
+
+
 def _pick_library_rendition(
     video_files: list[dict[str, Any]],
     video_aspect: VideoAspect,
@@ -866,7 +892,7 @@ def search_videos_library(
         response = requests.post(
             f"{base_url}/search",
             json=payload,
-            proxies=config.proxy,
+            proxies=_library_proxies(base_url),
             verify=_get_tls_verify(),
             timeout=(10, timeout),
         )
