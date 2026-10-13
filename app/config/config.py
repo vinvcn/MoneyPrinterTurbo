@@ -469,6 +469,7 @@ def save_config():
         config_to_save["image_gen"] = dict(image_gen)
         config_to_save["image_embedding"] = dict(image_embedding)
         config_to_save["material_rerank"] = dict(material_rerank)
+        config_to_save["library"] = dict(library)
         config_to_save["ui"] = dict(ui)
         serialized_config = toml.dumps(config_to_save)
 
@@ -578,6 +579,17 @@ material_rerank = _SynchronizedConfig(
             "timeout": 120,
             "api_key": "",
             "base_url": "",
+        },
+    )
+)
+library = _SynchronizedConfig(
+    _cfg.get(
+        "library",
+        {
+            # [library] 段缺失时按默认端点处理：video_source = "library"
+            # 时素材检索走本地 vpc-retrieval 服务（容器网络内按容器名访问）。
+            "base_url": "http://vpc-retrieval:8787",
+            "timeout": 30,
         },
     )
 )

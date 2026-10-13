@@ -1440,5 +1440,164 @@ class TestMultiProviderFanOut(unittest.TestCase):
         )
 
 
+class TestLibraryProvider(unittest.TestCase):
+    """
+    video_source = "library"：本地素材库检索（vpc-retrieval 服务）。
+
+    映射、档位选择、模拟翻页、fail-open 与来源审计。全部 patch
+    requests.post，测试不触网、不落缓存。
+    """
+
+    def setUp(self):
+        self.original_app_config = dict(config.app)
+        self.original_proxy_config = dict(config.proxy)
+        self.original_library_config = dict(config.library)
+        config.library["base_url"] = "http://vpc-retrieval:8787"
+        config.library["timeout"] = 30
+        config.proxy.clear()
+
+    def tearDown(self):
+        config.app.clear()
+        config.app.update(self.original_app_config)
+        config.proxy.clear()
+        config.proxy.update(self.original_proxy_config)
+        config.library.clear()
+        config.library.update(self.original_library_config)
+
+    @staticmethod
+    def _fake_response(hits: list[dict]) -> SimpleNamespace:
+        return SimpleNamespace(status_code=200, json=lambda: {"hits": hits})
+
+    @staticmethod
+    def _hit(pexels_id: int, duration: int, files: list[dict]) -> dict:
+        return {
+            "pexels_id": pexels_id,
+            "url": f"https://www.pexels.com/video/example-{pexels_id}/",
+            "duration": duration,
+            "thumbnail_url": f"https://images.pexels.com/t/{pexels_id}.jpeg",
+            "video_files": files,
+        }
+
+    def test_search_library_maps_hits_and_prefers_target_resolution(self):
+        """hit → MaterialInfo 映射：精确目标分辨率优先、横屏档位被过滤、
+        时长下限生效、source_info 完整；请求形状（orientation/k）正确。"""
+        hits = [
+            self._hit(
+                123,
+                8,
+                [
+                    {"link": "https://videos.example/123-720.mp4", "width": 720, "height": 1280},
+                    {"link": "https://videos.example/123-1080.mp4", "width": 1080, "height": 1920},
+                    {"link": "https://videos.example/123-land.mp4", "width": 1920, "height": 1080},
+                ],
+            ),
+            self._hit(
+                456,
+                2,
+                [{"link": "https://videos.example/456.mp4", "width": 1080, "height": 1920}],
+            ),
+        ]
+        with patch(
+            "app.services.material.requests.post",
+            return_value=self._fake_response(hits),
+        ) as post:
+            results = material.search_videos_library(
+                "ocean waves",
+                minimum_duration=5,
+                video_aspect=material.VideoAspect.portrait,
+            )
+
+        self.assertEqual(len(results), 1)
+        item = results[0]
+        self.assertEqual(item.provider, "library")
+        self.assertEqual(item.duration, 8)
+        self.assertEqual(item.url, "https://videos.example/123-1080.mp4")
+        self.assertEqual(item.source_info["asset_id"], "123")
+        self.assertEqual(item.source_info["search_term"], "ocean waves")
+        self.assertEqual(
+            item.source_info["source_page"],
+            "https://www.pexels.com/video/example-123/",
+        )
+        self.assertEqual(
+            item.source_info["thumbnail_url"],
+            "https://images.pexels.com/t/123.jpeg",
+        )
+        self.assertEqual(item.source_info["rendition"]["width"], 1080)
+        self.assertEqual(item.source_info["rendition"]["height"], 1920)
+
+        post_args = post.call_args
+        self.assertEqual(post_args.args[0], "http://vpc-retrieval:8787/search")
+        payload = post_args.kwargs["json"]
+        self.assertEqual(payload["terms"], ["ocean waves"])
+        self.assertEqual(payload["orientation"], "portrait")
+        self.assertEqual(payload["min_duration"], 5)
+        self.assertEqual(payload["k"], 30)
+
+    def test_search_library_page_slicing(self):
+        """page=2 用 k=60 拉取后滑窗口返回第 30~59 名（这里是 30..44）。"""
+        hits = [
+            self._hit(
+                1000 + i,
+                10,
+                [{"link": f"https://videos.example/{1000 + i}.mp4", "width": 1920, "height": 1080}],
+            )
+            for i in range(45)
+        ]
+        with patch(
+            "app.services.material.requests.post",
+            return_value=self._fake_response(hits),
+        ) as post:
+            results = material.search_videos_library(
+                "city",
+                minimum_duration=5,
+                video_aspect=material.VideoAspect.landscape,
+                page=2,
+            )
+
+        self.assertEqual(post.call_args.kwargs["json"]["k"], 60)
+        self.assertEqual(len(results), 15)
+        self.assertEqual(results[0].source_info["asset_id"], "1030")
+
+    def test_search_library_fail_open_on_request_error(self):
+        """服务不可达：记 warning、返回空列表，绝不抛异常（fail-open）。"""
+        with patch(
+            "app.services.material.requests.post",
+            side_effect=requests.ConnectionError("boom"),
+        ):
+            results = material.search_videos_library(
+                "ocean",
+                minimum_duration=5,
+                video_aspect=material.VideoAspect.portrait,
+            )
+        self.assertEqual(results, [])
+
+    def test_search_library_non_200_returns_empty(self):
+        with patch(
+            "app.services.material.requests.post",
+            return_value=SimpleNamespace(status_code=503, json=lambda: {}),
+        ):
+            results = material.search_videos_library(
+                "ocean",
+                minimum_duration=5,
+                video_aspect=material.VideoAspect.portrait,
+            )
+        self.assertEqual(results, [])
+
+    def test_library_dispatch_and_provider_audit(self):
+        """dispatch：source="library" 的缓存闭包能还原审计 provider。"""
+        search = material.search_videos_with_cache_for_source("library")
+        self.assertEqual(material._search_provider_of(search), "library")
+
+    def test_assert_library_requires_base_url(self):
+        """library 预检看 [library] base_url，与官方 key 无关。"""
+        config.library["base_url"] = ""
+        with self.assertRaises(ValueError) as ctx:
+            material.assert_search_provider_available("library")
+        self.assertIn("[library] base_url", str(ctx.exception))
+
+        config.library["base_url"] = "http://vpc-retrieval:8787"
+        material.assert_search_provider_available("library")
+
+
 if __name__ == "__main__":
     unittest.main()
