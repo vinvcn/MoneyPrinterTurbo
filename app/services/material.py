@@ -865,22 +865,63 @@ def _pick_library_rendition(
     return best
 
 
-#: 已向调用方返回过的素材库 URL（key：(base_url, search_term)）。翻页时作为
-#: exclude_urls 传回服务端，让服务剔除旧候选并用候补补位，页数不受 depth 上限
-#: 影响；进程级缓存，容量有界。
-_LIBRARY_SEEN: dict[tuple[str, str], list[str]] = {}
+#: 已向调用方返回过的素材库 URL，key：(base_url, search_term, min_duration, aspect)。
+#: 翻页时并入 exclude_urls 传回服务端，让服务剔除旧候选并用候补补位；每键容量
+#: 与键总数都有界（FIFO 淘汰最早插入的键），跨任务使用只会多排除、不会重发。
+_LIBRARY_SEEN: dict[tuple[str, str, int, str], list[str]] = {}
 _LIBRARY_SEEN_CAP = 200
+_LIBRARY_SEEN_KEYS_CAP = 64
+_LIBRARY_PAGE_SIZE = 30
 
 
-def _remember_library_urls(base_url: str, search_term: str, items: List[MaterialInfo]) -> None:
+def _library_seen_key(
+    base_url: str, search_term: str, minimum_duration: int, aspect: VideoAspect
+) -> tuple[str, str, int, str]:
+    """排除集的键：词条 + 时长下限 + 画幅（任一不同即不同候选集合）。"""
+    return (base_url, search_term, int(minimum_duration or 0), aspect.name)
+
+
+def _remember_library_urls(key: tuple[str, str, int, str], items: List[MaterialInfo]) -> None:
     """记录本次返回的素材 URL，供后续翻页做服务端剔除。"""
-    key = (base_url, search_term)
     seen = _LIBRARY_SEEN.setdefault(key, [])
     for item in items:
         if item.url and item.url not in seen:
             seen.append(item.url)
     if len(seen) > _LIBRARY_SEEN_CAP:
         del seen[: len(seen) - _LIBRARY_SEEN_CAP]
+    while len(_LIBRARY_SEEN) > _LIBRARY_SEEN_KEYS_CAP:
+        _LIBRARY_SEEN.pop(next(iter(_LIBRARY_SEEN)))
+
+
+def _cached_library_urls(
+    base_url: str,
+    search_term: str,
+    minimum_duration: int,
+    aspect: VideoAspect,
+    page: int,
+) -> list[str]:
+    """
+    把低页码的历史缓存结果并入排除集。
+
+    缓存命中不经过 provider（本函数调用方），进程内的 seen 列表可能滞后；
+    用 24h 缓存补齐后，翻页在任意冷/热组合下都不会重发已返回过的候选。
+    """
+    urls: list[str] = []
+    for previous in range(1, max(1, int(page))):
+        try:
+            items = material_cache.load_material_search_cache(
+                provider="library",
+                search_term=search_term,
+                minimum_duration=minimum_duration,
+                video_aspect=aspect,
+                page=previous,
+            )
+        except Exception:
+            items = None
+        for item in items or []:
+            if item.url and item.url not in urls:
+                urls.append(item.url)
+    return urls
 
 
 def search_videos_library(
@@ -905,12 +946,18 @@ def search_videos_library(
         return []
 
     page_number = max(1, int(page or 1))
-    seen_urls = list(_LIBRARY_SEEN.get((base_url, search_term), ()))
+    seen_key = _library_seen_key(base_url, search_term, minimum_duration, aspect)
+    seen_urls = list(_LIBRARY_SEEN.get(seen_key, ()))
+    for url in _cached_library_urls(
+        base_url, search_term, minimum_duration, aspect, page_number
+    ):
+        if url not in seen_urls:
+            seen_urls.append(url)
     payload = {
         "terms": [search_term],
         "orientation": aspect.name,
         "min_duration": int(minimum_duration or 0),
-        "k": 30,
+        "k": _LIBRARY_PAGE_SIZE,
     }
     if seen_urls:
         payload["exclude_urls"] = seen_urls
@@ -963,7 +1010,8 @@ def search_videos_library(
             rendition_height = int(rendition.get("height") or 0)
         except (TypeError, ValueError):
             rendition_width, rendition_height = 0, 0
-        creator_name = hit.get("creator")
+        creator_name = str(hit.get("creator")).strip() if hit.get("creator") else None
+
         item = MaterialInfo()
         item.provider = "library"
         item.url = str(rendition.get("link") or "")
@@ -987,8 +1035,8 @@ def search_videos_library(
 
     # 本页取新鲜候选的前 30 条；已返回过的 URL 记入 seen，作为下一页的
     # exclude_urls 传回服务端剔除并补位。
-    items = items[:30]
-    _remember_library_urls(base_url, search_term, items)
+    items = items[:_LIBRARY_PAGE_SIZE]
+    _remember_library_urls(seen_key, items)
     return items
 
 

@@ -1586,6 +1586,42 @@ class TestLibraryProvider(unittest.TestCase):
         self.assertEqual(len(second), 12)
         self.assertEqual(second[0].source_info["asset_id"], "2000")
 
+    def test_search_library_paging_seeds_excludes_from_history_cache(self):
+        """缓存命中不经过 provider：低页码的历史缓存结果要并入 exclude_urls，
+        否则 page-2 会重发 page-1 的候选（dedup 后 0 新候选）。"""
+        cached_item = material.MaterialInfo()
+        cached_item.provider = "library"
+        cached_item.url = "https://videos.example/from-cache.mp4"
+        cached_item.duration = 10
+
+        def fake_load(provider, search_term, minimum_duration, video_aspect, page):
+            return [cached_item] if page == 1 else None
+
+        with (
+            patch.object(material.material_cache, "load_material_search_cache", side_effect=fake_load),
+            patch(
+                "app.services.material.requests.post",
+                return_value=self._fake_response(
+                    [
+                        self._hit(
+                            3000,
+                            10,
+                            [{"link": "https://videos.example/3000.mp4", "width": 1920, "height": 1080}],
+                        )
+                    ]
+                ),
+            ) as post,
+        ):
+            material.search_videos_library(
+                "seeded",
+                minimum_duration=5,
+                video_aspect=material.VideoAspect.landscape,
+                page=2,
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["exclude_urls"], ["https://videos.example/from-cache.mp4"])
+
     def test_search_library_fail_open_on_request_error(self):
         """服务不可达：记 warning、返回空列表，绝不抛异常（fail-open）。"""
         with patch(
