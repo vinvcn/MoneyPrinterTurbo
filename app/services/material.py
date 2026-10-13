@@ -1,10 +1,11 @@
+import ipaddress
 import os
 import random
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, List
-from urllib.parse import quote_plus, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote_plus, urlencode, urlparse, urlsplit, urlunsplit
 
 import requests
 from loguru import logger
@@ -799,25 +800,32 @@ def _library_proxies(base_url: str) -> dict | None:
     """
     本地检索服务的代理策略。
 
-    命中 [proxy] 的 no 列表、loopback 或 Docker 单标签主机名（如
+    命中 [proxy] 的 no 列表、loopback/私网地址或 Docker 单标签主机名（如
     vpc-retrieval）时直连：宿主代理解析不了容器内网名字，会把请求变成
-    502。其余情况（远端部署的素材库）沿用与在线 provider 相同的代理。
+    502（e2e 实测踩坑）。直连用 {"http": None, "https": None} 显式置空——
+    requests 在 trust_env 下仍会合并宿主环境代理，proxies=None 并不保证
+    绕过。其余情况（远端部署的素材库）沿用 [proxy] 配置。
     """
-    from urllib.parse import urlparse
-
     host = (urlparse(base_url).hostname or "").lower()
     if not host:
         return None
+    direct = {"http": None, "https": None}
+    if host == "localhost" or "." not in host:
+        return direct
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        addr = None
+    if addr is not None and (addr.is_loopback or addr.is_private):
+        return direct
     proxy_conf = config.proxy if isinstance(config.proxy, dict) else {}
     no_list = [
         item.strip().lower() for item in str(proxy_conf.get("no", "")).split(",") if item.strip()
     ]
-    if host in {"localhost", "127.0.0.1", "::1"} or "." not in host:
-        return None
     for item in no_list:
         # 标准 no_proxy 语义：以点开头的条目按域名后缀匹配。
         if (item.startswith(".") and host.endswith(item)) or host == item:
-            return None
+            return direct
     return dict(proxy_conf) or None
 
 
@@ -836,13 +844,13 @@ def _pick_library_rendition(
     target_width, target_height = aspect.to_resolution()
     best: dict[str, Any] | None = None
     best_pixels = -1
-    for file in video_files:
-        if not isinstance(file, dict):
+    for entry in video_files:
+        if not isinstance(entry, dict):
             continue
-        link = file.get("link")
+        link = entry.get("link")
         try:
-            width = int(file.get("width") or 0)
-            height = int(file.get("height") or 0)
+            width = int(entry.get("width") or 0)
+            height = int(entry.get("height") or 0)
         except (TypeError, ValueError):
             continue
         if not link or width <= 0 or height <= 0:
@@ -850,11 +858,29 @@ def _pick_library_rendition(
         if not _matches_video_aspect(width, height, aspect):
             continue
         if width == target_width and height == target_height:
-            return file
+            return entry
         if width * height > best_pixels:
-            best = file
+            best = entry
             best_pixels = width * height
     return best
+
+
+#: 已向调用方返回过的素材库 URL（key：(base_url, search_term)）。翻页时作为
+#: exclude_urls 传回服务端，让服务剔除旧候选并用候补补位，页数不受 depth 上限
+#: 影响；进程级缓存，容量有界。
+_LIBRARY_SEEN: dict[tuple[str, str], list[str]] = {}
+_LIBRARY_SEEN_CAP = 200
+
+
+def _remember_library_urls(base_url: str, search_term: str, items: List[MaterialInfo]) -> None:
+    """记录本次返回的素材 URL，供后续翻页做服务端剔除。"""
+    key = (base_url, search_term)
+    seen = _LIBRARY_SEEN.setdefault(key, [])
+    for item in items:
+        if item.url and item.url not in seen:
+            seen.append(item.url)
+    if len(seen) > _LIBRARY_SEEN_CAP:
+        del seen[: len(seen) - _LIBRARY_SEEN_CAP]
 
 
 def search_videos_library(
@@ -867,9 +893,10 @@ def search_videos_library(
     本地素材库检索（vpc-retrieval 服务，video_source = "library"）。
 
     与在线 provider 同契约。fail-open：服务不可达或响应异常时记 warning 并
-    返回空列表，由调用方既有逻辑处理空素材段，绝不抛异常。服务无分页参数，
-    用 ``k = min(100, page*30)`` 拉取后滑窗口截取本页 30 条模拟翻页；重复
-    候选由 match_segments 既有去重保证。
+    返回空列表，由调用方既有逻辑处理空素材段，绝不抛异常。翻页 = 把本进程
+    已返回过的 URL 作为 exclude_urls 传回服务端剔除并补位，再从新候选里取
+    前 30 条——服务端 k 上限 100，此方式让任意页数都能拿到新候选；重复候选
+    由 match_segments 既有去重兜底。
     """
     aspect = VideoAspect(video_aspect)
     base_url, timeout = _library_settings()
@@ -878,15 +905,18 @@ def search_videos_library(
         return []
 
     page_number = max(1, int(page or 1))
+    seen_urls = list(_LIBRARY_SEEN.get((base_url, search_term), ()))
     payload = {
         "terms": [search_term],
         "orientation": aspect.name,
         "min_duration": int(minimum_duration or 0),
-        "k": min(100, page_number * 30),
+        "k": 30,
     }
+    if seen_urls:
+        payload["exclude_urls"] = seen_urls
     logger.info(
         f"searching videos on library: term={search_term!r}, "
-        f"endpoint={base_url}, page={page_number}"
+        f"endpoint={base_url}, page={page_number}, exclude={len(seen_urls)}"
     )
     try:
         response = requests.post(
@@ -894,7 +924,7 @@ def search_videos_library(
             json=payload,
             proxies=_library_proxies(base_url),
             verify=_get_tls_verify(),
-            timeout=(10, timeout),
+            timeout=(timeout, timeout),
         )
         if response.status_code != 200:
             logger.warning(
@@ -933,6 +963,7 @@ def search_videos_library(
             rendition_height = int(rendition.get("height") or 0)
         except (TypeError, ValueError):
             rendition_width, rendition_height = 0, 0
+        creator_name = hit.get("creator")
         item = MaterialInfo()
         item.provider = "library"
         item.url = str(rendition.get("link") or "")
@@ -944,7 +975,7 @@ def search_videos_library(
                 str(hit.get("pexels_id")) if hit.get("pexels_id") is not None else None
             ),
             "source_page": _safe_public_url(hit.get("url")),
-            "creator": None,
+            "creator": {"name": creator_name} if creator_name else None,
             "thumbnail_url": _safe_public_url(hit.get("thumbnail_url")),
             "rendition": {
                 "id": None,
@@ -954,9 +985,11 @@ def search_videos_library(
         }
         items.append(item)
 
-    # 模拟翻页：服务端总是从第 1 名返回，这里按页滑窗口。
-    page_start = (page_number - 1) * 30
-    return items[page_start : page_start + 30]
+    # 本页取新鲜候选的前 30 条；已返回过的 URL 记入 seen，作为下一页的
+    # exclude_urls 传回服务端剔除并补位。
+    items = items[:30]
+    _remember_library_urls(base_url, search_term, items)
+    return items
 
 
 def _search_videos_with_cache(

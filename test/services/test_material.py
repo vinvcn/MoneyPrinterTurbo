@@ -1455,6 +1455,7 @@ class TestLibraryProvider(unittest.TestCase):
         config.library["base_url"] = "http://vpc-retrieval:8787"
         config.library["timeout"] = 30
         config.proxy.clear()
+        material._LIBRARY_SEEN.clear()
 
     def tearDown(self):
         config.app.clear()
@@ -1463,6 +1464,7 @@ class TestLibraryProvider(unittest.TestCase):
         config.proxy.update(self.original_proxy_config)
         config.library.clear()
         config.library.update(self.original_library_config)
+        material._LIBRARY_SEEN.clear()
 
     @staticmethod
     def _fake_response(hits: list[dict]) -> SimpleNamespace:
@@ -1480,7 +1482,7 @@ class TestLibraryProvider(unittest.TestCase):
 
     def test_search_library_maps_hits_and_prefers_target_resolution(self):
         """hit → MaterialInfo 映射：精确目标分辨率优先、横屏档位被过滤、
-        时长下限生效、source_info 完整；请求形状（orientation/k）正确。"""
+        时长下限生效、source_info 完整（含 creator）；请求形状正确。"""
         hits = [
             self._hit(
                 123,
@@ -1497,6 +1499,7 @@ class TestLibraryProvider(unittest.TestCase):
                 [{"link": "https://videos.example/456.mp4", "width": 1080, "height": 1920}],
             ),
         ]
+        hits[0]["creator"] = "Some Creator"
         with patch(
             "app.services.material.requests.post",
             return_value=self._fake_response(hits),
@@ -1518,6 +1521,7 @@ class TestLibraryProvider(unittest.TestCase):
             item.source_info["source_page"],
             "https://www.pexels.com/video/example-123/",
         )
+        self.assertEqual(item.source_info["creator"], {"name": "Some Creator"})
         self.assertEqual(
             item.source_info["thumbnail_url"],
             "https://images.pexels.com/t/123.jpeg",
@@ -1532,31 +1536,55 @@ class TestLibraryProvider(unittest.TestCase):
         self.assertEqual(payload["orientation"], "portrait")
         self.assertEqual(payload["min_duration"], 5)
         self.assertEqual(payload["k"], 30)
+        self.assertNotIn("exclude_urls", payload)
 
-    def test_search_library_page_slicing(self):
-        """page=2 用 k=60 拉取后滑窗口返回第 30~59 名（这里是 30..44）。"""
-        hits = [
+    def test_search_library_paging_excludes_seen_urls(self):
+        """翻页 = 把上一页返回的 URL 作为 exclude_urls 传回服务端剔除补位，
+        再从新候选取前 30 条（服务端 k 上限 100，此方式不受页数限制）。"""
+        first_hits = [
             self._hit(
                 1000 + i,
                 10,
                 [{"link": f"https://videos.example/{1000 + i}.mp4", "width": 1920, "height": 1080}],
             )
-            for i in range(45)
+            for i in range(35)
         ]
         with patch(
             "app.services.material.requests.post",
-            return_value=self._fake_response(hits),
+            return_value=self._fake_response(first_hits),
         ) as post:
-            results = material.search_videos_library(
+            first = material.search_videos_library(
+                "city",
+                minimum_duration=5,
+                video_aspect=material.VideoAspect.landscape,
+                page=1,
+            )
+        self.assertEqual(len(first), 30)  # 本页最多 30 条
+        self.assertEqual(post.call_args.kwargs["json"]["k"], 30)
+
+        second_hits = [
+            self._hit(
+                2000 + i,
+                10,
+                [{"link": f"https://videos.example/{2000 + i}.mp4", "width": 1920, "height": 1080}],
+            )
+            for i in range(12)
+        ]
+        with patch(
+            "app.services.material.requests.post",
+            return_value=self._fake_response(second_hits),
+        ) as post2:
+            second = material.search_videos_library(
                 "city",
                 minimum_duration=5,
                 video_aspect=material.VideoAspect.landscape,
                 page=2,
             )
-
-        self.assertEqual(post.call_args.kwargs["json"]["k"], 60)
-        self.assertEqual(len(results), 15)
-        self.assertEqual(results[0].source_info["asset_id"], "1030")
+        payload = post2.call_args.kwargs["json"]
+        self.assertEqual(len(payload["exclude_urls"]), 30)
+        self.assertIn("https://videos.example/1000.mp4", payload["exclude_urls"])
+        self.assertEqual(len(second), 12)
+        self.assertEqual(second[0].source_info["asset_id"], "2000")
 
     def test_search_library_fail_open_on_request_error(self):
         """服务不可达：记 warning、返回空列表，绝不抛异常（fail-open）。"""
@@ -1589,19 +1617,21 @@ class TestLibraryProvider(unittest.TestCase):
         self.assertEqual(material._search_provider_of(search), "library")
 
     def test_library_proxies_bypass_for_local_names(self):
-        """容器内网名 / loopback / no 列表一律直连；远端部署才走代理。
+        """容器内网名 / loopback / 私网 IP / no 列表一律直连；远端部署才走代理。
 
-        宿主代理无法解析 Docker 内网名（vpc-retrieval），不绕过会把请求
-        变成 502（e2e 实测踩坑）。
+        直连返回 {"http": None, "https": None}：requests 在 trust_env 下仍会
+        合并宿主环境代理，proxies=None 并不保证绕过（e2e 实测 502 踩坑）。
         """
         config.proxy["http"] = "http://host.docker.internal:7897"
         config.proxy["https"] = "http://host.docker.internal:7897"
         config.proxy["no"] = "localhost,127.0.0.1,.internal"
+        direct = {"http": None, "https": None}
 
-        self.assertIsNone(material._library_proxies("http://vpc-retrieval:8787"))
-        self.assertIsNone(material._library_proxies("http://localhost:8787"))
-        self.assertIsNone(material._library_proxies("http://127.0.0.1:8787"))
-        self.assertIsNone(material._library_proxies("http://host.internal:8787"))
+        self.assertEqual(material._library_proxies("http://vpc-retrieval:8787"), direct)
+        self.assertEqual(material._library_proxies("http://localhost:8787"), direct)
+        self.assertEqual(material._library_proxies("http://127.0.0.1:8787"), direct)
+        self.assertEqual(material._library_proxies("http://192.168.1.50:8787"), direct)
+        self.assertEqual(material._library_proxies("http://host.internal:8787"), direct)
 
         remote = material._library_proxies("https://library.example.com")
         self.assertEqual(remote.get("http"), "http://host.docker.internal:7897")
@@ -1610,6 +1640,42 @@ class TestLibraryProvider(unittest.TestCase):
         """没有代理配置时返回 None（不改变直连行为）。"""
         config.proxy.clear()
         self.assertIsNone(material._library_proxies("https://library.example.com"))
+
+    def test_download_videos_library_source_dispatches_to_library_search(self):
+        """经典流程 download_videos(source="library") 经统一分发命中素材库搜索。"""
+        captured = {}
+
+        def fake_search(search_term, minimum_duration, video_aspect):
+            captured["term"] = search_term
+            item = material.MaterialInfo()
+            item.provider = "library"
+            item.url = "https://videos.example/999.mp4"
+            item.duration = 10
+            item.source_info = {
+                "provider": "library",
+                "asset_id": "999",
+                "rendition": {"width": 1080, "height": 1920},
+            }
+            return [item]
+
+        with (
+            patch.object(material, "search_videos_with_cache_for_source") as factory,
+            patch.object(material, "save_video", return_value="/tmp/vid-999.mp4"),
+            patch.object(material, "_persist_material_sources"),
+            patch.object(material, "_persist_search_records"),
+        ):
+            factory.return_value = fake_search
+            paths = material.download_videos(
+                task_id="t-library",
+                search_terms=["rainy night"],
+                source="library",
+                video_aspect=material.VideoAspect.portrait,
+                max_clip_duration=5,
+            )
+
+        factory.assert_called_once_with("library")
+        self.assertEqual(captured["term"], "rainy night")
+        self.assertEqual(paths, ["/tmp/vid-999.mp4"])
 
     def test_assert_library_requires_base_url(self):
         """library 预检看 [library] base_url，与官方 key 无关。"""
