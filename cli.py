@@ -212,8 +212,8 @@ Output and exit status:
     material_group.add_argument(
         "--video-source",
         default="pexels",
-        choices=["pexels", "pixabay", "coverr", "local"],
-        help="video material provider; online providers require matching API keys in config.toml",
+        choices=["pexels", "pixabay", "coverr", "local", "library"],
+        help="video material provider; online providers require matching API keys in config.toml; library uses the local retrieval service ([library] base_url)",
     )
     material_group.add_argument(
         "--video-materials",

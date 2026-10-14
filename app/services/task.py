@@ -1261,18 +1261,30 @@ def _run_segment_first_pipeline(
         video_aspect=None,
         page: int = 1,
     ):
-        # 页感知搜索回调：match_segments 按 (词条, 页) 逐页取候选，这里把
-        # 页码透传给多供应商并行搜索（segment-first 并行查询所有已配置
-        # key 的供应商），只服务单次 (词条, 页) 取数；(词条, 页) 级备忘由
-        # match_segments 自持。
+        # 页感知搜索回调：match_segments 按 (词条, 页) 逐页取候选。
+        # library 模式下本地素材库是唯一来源（不与在线供应商并行）；其余
+        # 模式把页码透传给多供应商并行搜索，只服务单次 (词条, 页) 取数；
+        # (词条, 页) 级备忘由 match_segments 自持。
+        resolved_duration = (
+            params.video_clip_duration
+            if minimum_duration is None
+            else minimum_duration
+        )
+        resolved_aspect = (
+            params.video_aspect if video_aspect is None else video_aspect
+        )
+        if params.video_source == "library":
+            return material.search_videos_with_cache_for_source(
+                "library", page=max(1, int(page or 1))
+            )(
+                search_term=search_term,
+                minimum_duration=resolved_duration,
+                video_aspect=resolved_aspect,
+            )
         return material.search_videos_multi_provider(
             search_term=search_term,
-            minimum_duration=params.video_clip_duration
-            if minimum_duration is None
-            else minimum_duration,
-            video_aspect=params.video_aspect
-            if video_aspect is None
-            else video_aspect,
+            minimum_duration=resolved_duration,
+            video_aspect=resolved_aspect,
             page=max(1, int(page or 1)),
         )
 
@@ -1301,7 +1313,7 @@ def _run_segment_first_pipeline(
     # VLM-on 才会搜索素材：零 key 在搜索开始前快速失败并给出可操作提示；
     # VLM-off 时整段走 image-gen 回填，不触在线供应商，预检跳过。
     if vlm_judge.is_enabled():
-        material.assert_search_provider_available()
+        material.assert_search_provider_available(params.video_source)
 
     materials = video_match.match_segments(
         segments=segment_records,

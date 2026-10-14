@@ -1,10 +1,11 @@
+import ipaddress
 import os
 import random
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, List
-from urllib.parse import quote_plus, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote_plus, urlencode, urlparse, urlsplit, urlunsplit
 
 import requests
 from loguru import logger
@@ -186,7 +187,7 @@ def _search_provider_of(search_videos: Callable[..., List[MaterialInfo]]) -> str
             value = cell.cell_contents
         except ValueError:
             continue
-        if isinstance(value, str) and value in {"pexels", "pixabay", "coverr"}:
+        if isinstance(value, str) and value in {"pexels", "pixabay", "coverr", "library"}:
             return value
     return "unknown"
 
@@ -785,6 +786,260 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     return ""
 
 
+def _library_settings() -> tuple[str, float]:
+    """（base_url, timeout）来自 [library] 配置；缺省指向容器网络内的检索服务。"""
+    base_url = str(config.library.get("base_url") or "").strip().rstrip("/")
+    try:
+        timeout = float(config.library.get("timeout", 30) or 30)
+    except (TypeError, ValueError):
+        timeout = 30.0
+    return base_url, timeout
+
+
+def _library_proxies(base_url: str) -> dict | None:
+    """
+    本地检索服务的代理策略。
+
+    命中 [proxy] 的 no 列表、loopback/私网地址或 Docker 单标签主机名（如
+    vpc-retrieval）时直连：宿主代理解析不了容器内网名字，会把请求变成
+    502（e2e 实测踩坑）。直连用 {"http": None, "https": None} 显式置空——
+    requests 在 trust_env 下仍会合并宿主环境代理，proxies=None 并不保证
+    绕过。其余情况（远端部署的素材库）沿用 [proxy] 配置。
+    """
+    host = (urlparse(base_url).hostname or "").lower()
+    if not host:
+        return None
+    direct = {"http": None, "https": None}
+    if host == "localhost" or "." not in host:
+        return direct
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        addr = None
+    if addr is not None and (addr.is_loopback or addr.is_private):
+        return direct
+    proxy_conf = config.proxy if isinstance(config.proxy, dict) else {}
+    no_list = [
+        item.strip().lower() for item in str(proxy_conf.get("no", "")).split(",") if item.strip()
+    ]
+    for item in no_list:
+        # 标准 no_proxy 语义：以点开头的条目按域名后缀匹配。
+        if (item.startswith(".") and host.endswith(item)) or host == item:
+            return direct
+    return dict(proxy_conf) or None
+
+
+def _pick_library_rendition(
+    video_files: list[dict[str, Any]],
+    video_aspect: VideoAspect,
+) -> dict[str, Any] | None:
+    """
+    从素材库 hit 的全部转码档位中挑出与目标画幅匹配的一档。
+
+    优先精确匹配目标分辨率（与 Pexels provider 相同的行为），否则取方向
+    匹配档位中分辨率最高的一档；没有方向匹配的档位返回 None（下游
+    _filter_materials_by_aspect 也会按 rendition 丢弃方向不符的候选）。
+    """
+    aspect = VideoAspect(video_aspect)
+    target_width, target_height = aspect.to_resolution()
+    best: dict[str, Any] | None = None
+    best_pixels = -1
+    for entry in video_files:
+        if not isinstance(entry, dict):
+            continue
+        link = entry.get("link")
+        try:
+            width = int(entry.get("width") or 0)
+            height = int(entry.get("height") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not link or width <= 0 or height <= 0:
+            continue
+        if not _matches_video_aspect(width, height, aspect):
+            continue
+        if width == target_width and height == target_height:
+            return entry
+        if width * height > best_pixels:
+            best = entry
+            best_pixels = width * height
+    return best
+
+
+#: 已向调用方返回过的素材库 URL，key：(base_url, search_term, min_duration, aspect)。
+#: 翻页时并入 exclude_urls 传回服务端，让服务剔除旧候选并用候补补位；每键容量
+#: 与键总数都有界（FIFO 淘汰最早插入的键），跨任务使用只会多排除、不会重发。
+_LIBRARY_SEEN: dict[tuple[str, str, int, str], list[str]] = {}
+_LIBRARY_SEEN_CAP = 200
+_LIBRARY_SEEN_KEYS_CAP = 64
+_LIBRARY_PAGE_SIZE = 30
+
+
+def _library_seen_key(
+    base_url: str, search_term: str, minimum_duration: int, aspect: VideoAspect
+) -> tuple[str, str, int, str]:
+    """排除集的键：词条 + 时长下限 + 画幅（任一不同即不同候选集合）。"""
+    return (base_url, search_term, int(minimum_duration or 0), aspect.name)
+
+
+def _remember_library_urls(key: tuple[str, str, int, str], items: List[MaterialInfo]) -> None:
+    """记录本次返回的素材 URL，供后续翻页做服务端剔除。"""
+    seen = _LIBRARY_SEEN.setdefault(key, [])
+    for item in items:
+        if item.url and item.url not in seen:
+            seen.append(item.url)
+    if len(seen) > _LIBRARY_SEEN_CAP:
+        del seen[: len(seen) - _LIBRARY_SEEN_CAP]
+    while len(_LIBRARY_SEEN) > _LIBRARY_SEEN_KEYS_CAP:
+        _LIBRARY_SEEN.pop(next(iter(_LIBRARY_SEEN)))
+
+
+def _cached_library_urls(
+    base_url: str,
+    search_term: str,
+    minimum_duration: int,
+    aspect: VideoAspect,
+    page: int,
+) -> list[str]:
+    """
+    把低页码的历史缓存结果并入排除集。
+
+    缓存命中不经过 provider（本函数调用方），进程内的 seen 列表可能滞后；
+    用 24h 缓存补齐后，翻页在任意冷/热组合下都不会重发已返回过的候选。
+    """
+    urls: list[str] = []
+    for previous in range(1, max(1, int(page))):
+        try:
+            items = material_cache.load_material_search_cache(
+                provider="library",
+                search_term=search_term,
+                minimum_duration=minimum_duration,
+                video_aspect=aspect,
+                page=previous,
+            )
+        except Exception:
+            items = None
+        for item in items or []:
+            if item.url and item.url not in urls:
+                urls.append(item.url)
+    return urls
+
+
+def search_videos_library(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    page: int = 1,
+) -> List[MaterialInfo]:
+    """
+    本地素材库检索（vpc-retrieval 服务，video_source = "library"）。
+
+    与在线 provider 同契约。fail-open：服务不可达或响应异常时记 warning 并
+    返回空列表，由调用方既有逻辑处理空素材段，绝不抛异常。翻页 = 把本进程
+    已返回过的 URL 作为 exclude_urls 传回服务端剔除并补位，再从新候选里取
+    前 30 条——服务端 k 上限 100，此方式让任意页数都能拿到新候选；重复候选
+    由 match_segments 既有去重兜底。
+    """
+    aspect = VideoAspect(video_aspect)
+    base_url, timeout = _library_settings()
+    if not base_url:
+        logger.warning("library search skipped: [library] base_url is empty")
+        return []
+
+    page_number = max(1, int(page or 1))
+    seen_key = _library_seen_key(base_url, search_term, minimum_duration, aspect)
+    seen_urls = list(_LIBRARY_SEEN.get(seen_key, ()))
+    for url in _cached_library_urls(
+        base_url, search_term, minimum_duration, aspect, page_number
+    ):
+        if url not in seen_urls:
+            seen_urls.append(url)
+    payload = {
+        "terms": [search_term],
+        "orientation": aspect.name,
+        "min_duration": int(minimum_duration or 0),
+        "k": _LIBRARY_PAGE_SIZE,
+    }
+    if seen_urls:
+        payload["exclude_urls"] = seen_urls
+    logger.info(
+        f"searching videos on library: term={search_term!r}, "
+        f"endpoint={base_url}, page={page_number}, exclude={len(seen_urls)}"
+    )
+    try:
+        response = requests.post(
+            f"{base_url}/search",
+            json=payload,
+            proxies=_library_proxies(base_url),
+            verify=_get_tls_verify(),
+            timeout=(timeout, timeout),
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "library search returned non-200: "
+                f"status={response.status_code}, term={search_term!r}"
+            )
+            return []
+        body = response.json()
+    except Exception as e:
+        logger.warning(
+            "library search failed: "
+            f"error={type(e).__name__}, detail={_redact_request_error(e)}"
+        )
+        return []
+
+    hits = body.get("hits") if isinstance(body, dict) else None
+    if not isinstance(hits, list):
+        logger.warning("library search returned an unsupported response")
+        return []
+
+    items: List[MaterialInfo] = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        try:
+            duration = int(hit.get("duration") or 0)
+        except (TypeError, ValueError):
+            duration = 0
+        if duration < minimum_duration:
+            continue
+        rendition = _pick_library_rendition(hit.get("video_files") or [], aspect)
+        if rendition is None:
+            continue
+        try:
+            rendition_width = int(rendition.get("width") or 0)
+            rendition_height = int(rendition.get("height") or 0)
+        except (TypeError, ValueError):
+            rendition_width, rendition_height = 0, 0
+        creator_name = str(hit.get("creator")).strip() if hit.get("creator") else None
+
+        item = MaterialInfo()
+        item.provider = "library"
+        item.url = str(rendition.get("link") or "")
+        item.duration = duration
+        item.source_info = {
+            "provider": "library",
+            "search_term": search_term,
+            "asset_id": (
+                str(hit.get("pexels_id")) if hit.get("pexels_id") is not None else None
+            ),
+            "source_page": _safe_public_url(hit.get("url")),
+            "creator": {"name": creator_name} if creator_name else None,
+            "thumbnail_url": _safe_public_url(hit.get("thumbnail_url")),
+            "rendition": {
+                "id": None,
+                "width": rendition_width,
+                "height": rendition_height,
+            },
+        }
+        items.append(item)
+
+    # 本页取新鲜候选的前 30 条；已返回过的 URL 记入 seen，作为下一页的
+    # exclude_urls 传回服务端剔除并补位。
+    items = items[:_LIBRARY_PAGE_SIZE]
+    _remember_library_urls(seen_key, items)
+    return items
+
+
 def _search_videos_with_cache(
     provider: str,
     search_videos: Callable[..., List[MaterialInfo]],
@@ -918,6 +1173,9 @@ def search_videos_with_cache_for_source(
     elif source == "coverr":
         provider = "coverr"
         remote_search_videos = search_videos_coverr
+    elif source == "library":
+        provider = "library"
+        remote_search_videos = search_videos_library
 
     def search_videos(
         search_term: str,
@@ -953,13 +1211,24 @@ def _available_video_providers() -> list[tuple[str, Callable]]:
     return providers
 
 
-def assert_search_provider_available() -> None:
+def assert_search_provider_available(video_source: str | None = None) -> None:
     """
-    segment-first 搜索前置检查：一个在线供应商都不可用时快速失败。
+    segment-first 搜索前置检查：一个可用供应商都没有时快速失败。
 
-    报错镜像 get_api_key 的提示风格，并一次性列出全部三个 key 配置，
-    避免用户配好一个后又撞到下一个缺失提示。
+    video_source == "library" 时改查 [library] base_url（本地素材库不需要
+    官方 API key）；其余情况镜像 get_api_key 的提示风格，并一次性列出全部
+    三个 key 配置，避免用户配好一个后又撞到下一个缺失提示。
     """
+    if video_source == "library":
+        base_url, _ = _library_settings()
+        if base_url:
+            return
+        raise ValueError(
+            "\n\n##### [library] base_url is not set #####\n\n"
+            'video_source = "library" routes material search to the local '
+            "retrieval service; set the [library] base_url in:\n"
+            f"{config.config_file}\n"
+        )
     if _available_video_providers():
         return
     raise ValueError(
