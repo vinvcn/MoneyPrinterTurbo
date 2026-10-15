@@ -37,7 +37,7 @@ from app.services.segment_material import (
     english_search_term,
 )
 from app.services.video import segment_window_plan
-from app.services.vlm_judge import download_thumbnail_bytes, to_data_uri
+from app.services.vlm_judge import fetch_image_bytes, to_data_uri
 
 # 解析失败的最大尝试次数：range(1, _MAX_RETRIES + 1) 即最多 2 次调用，
 # 逐段搜索词提炼与查询包生成共用同一重试语义。
@@ -316,6 +316,7 @@ def coarse_rank(
                 url,
                 str(cand.get("data_uri") or ""),
                 coarse_query,
+                asset_id=str(cand.get("asset_id") or ""),
             )
             if record is not None:
                 # 走查前向量已全部预热进共享缓存，此步不产生新的嵌入调用。
@@ -336,6 +337,59 @@ def coarse_rank(
     return selected, duplicate_skips
 
 
+def _coarse_rank_mode() -> str:
+    """选材模式：'library' 按库序（不嵌入），'embed' 走余弦粗排（历史行为）。"""
+    value = str(config.app.get("coarse_rank_mode", "embed") or "embed").strip().lower()
+    return value if value in ("library", "embed") else "embed"
+
+
+def _library_first() -> bool:
+    """True = 素材库排序即选材序，粗排嵌入完全退场。"""
+    return _coarse_rank_mode() == "library"
+
+
+def _select_by_library_order(
+    pool: list[dict],
+    embedding_gate: image_embedding.EmbeddingGate | None,
+) -> tuple[list[dict], list[dict]]:
+    """库优先选材：池序即库序，查重门按序走查到 top-30。
+
+    与 coarse_rank 的差异只在排序来源：这里不做任何嵌入调用；查重门在
+    判定边界按需取候选向量（门自身有 url→向量缓存，同一 URL 只嵌一次）。
+    门为 None（duplicate_gate 关闭）时直接截前 30，与 coarse_rank 同语义。
+    """
+    if embedding_gate is None:
+        return list(pool)[:_COARSE_TOP_K], []
+
+    selected: list[dict] = []
+    duplicate_skips: list[dict] = []
+    for cand in pool:
+        if len(selected) >= _COARSE_TOP_K:
+            break
+        url = str(cand.get("url") or "")
+        record = embedding_gate.judge_candidate_embedding(
+            url,
+            _ensure_data_uri(cand),
+            str(cand.get("term") or ""),
+            asset_id=str(cand.get("asset_id") or ""),
+        )
+        if record is not None:
+            duplicate_skips.append(
+                {
+                    "asset_id": cand.get("asset_id"),
+                    "url": url,
+                    "reason": record.get("reason") or record.get("verdict"),
+                }
+            )
+            continue
+        selected.append(cand)
+    logger.info(
+        f"video match: library-order selection pool={len(pool)} "
+        f"selected={len(selected)} duplicates={len(duplicate_skips)}"
+    )
+    return selected, duplicate_skips
+
+
 # ---------------------------------------------------------------------------
 # 三段漏斗主编排：每段 查询包 → 搜索聚池（页优先 interleave）→
 # 粗排 → 精排 → VLM 走查（配额满提前退出）→ image-gen 回填。替代
@@ -344,18 +398,20 @@ def coarse_rank(
 
 
 def _thumbnail_data_uri(item: MaterialInfo) -> str:
-    """候选缩略图 → base64 data URI（粗排嵌入与查重门的判定输入）。
+    """候选缩略图 → base64 data URI（查重门的判定输入）。
 
-    缩略图缺失或下载失败返回空串：粗排把空 URI 候选按嵌入失败沉底，
-    查重门 fail-open 放行，VLM 走查里由判定回调自行取首帧兜底——
-    预览图层失败绝不阻塞流水线（与 vlm_judge 的降级哲学一致）。
+    缩略图缺失或下载失败返回空串：查重门 fail-open 放行，VLM 走查里由
+    判定回调自行取首帧兜底——预览图层失败绝不阻塞流水线（与 vlm_judge
+    的降级哲学一致）。库优先模式下本函数只在查重门判定时按需调用（见
+    _ensure_data_uri），池构建阶段不再为全部候选取图。
     """
     source = item.source_info if isinstance(item.source_info, dict) else {}
     thumbnail = str(source.get("thumbnail_url") or "").strip()
     if not thumbnail:
         return ""
     try:
-        payload, _size = download_thumbnail_bytes(thumbnail)
+        asset_id = str(source.get("asset_id") or "").strip()
+        payload, _size, _image_source = fetch_image_bytes(asset_id, thumbnail)
     except Exception as exc:
         logger.warning(
             "video match: thumbnail download failed, continue without "
@@ -365,17 +421,27 @@ def _thumbnail_data_uri(item: MaterialInfo) -> str:
     return to_data_uri(payload)
 
 
+def _ensure_data_uri(candidate: dict) -> str:
+    """按需取候选预览图：取过一次就回写在候选 dict 上（同任务内不重复取）。"""
+    if not candidate.get("data_uri"):
+        item = candidate.get("item")
+        if isinstance(item, MaterialInfo):
+            candidate["data_uri"] = _thumbnail_data_uri(item)
+    return str(candidate.get("data_uri") or "")
+
+
 def _candidate_from_item(item: MaterialInfo, term: str) -> dict:
     """MaterialInfo → 粗排候选 dict。
 
-    url/data_uri/asset_id 供粗排与查重门读取（coarse_rank 的既有契约），
-    item/term 供 VLM 走查把 MaterialInfo 原样交回判定回调并携带出处词条。
+    url/asset_id/term/item 供各阶段读取；data_uri（查重门判定输入）只在
+    embed 粗排模式下随池构建一次性取齐（粗排要嵌入全部候选），库优先模式
+    留空、由 _ensure_data_uri 在判定边界按需补。
     """
     source = item.source_info if isinstance(item.source_info, dict) else {}
     return {
         "asset_id": str(source.get("asset_id") or ""),
         "url": item.url,
-        "data_uri": _thumbnail_data_uri(item),
+        "data_uri": _thumbnail_data_uri(item) if not _library_first() else "",
         "term": term,
         "item": item,
     }
@@ -562,6 +628,11 @@ def match_segments(
         #    失败 fail-open 为空包，降级由下方各阶段自行处理。
         queries = generate_segment_queries(str(video_subject or ""), segment_text)
         terms = _search_terms_for_queries(queries, subject)
+        if _library_first() and queries.coarse_query and queries.coarse_query not in terms:
+            # 库优先：整段场景描述先进池。服务端 resolve_query 对词条与
+            # 整句等价（空 coarse_query 时把 terms 空格连接），所以这里只是
+            # 复用既有搜索回调；interleave 天然把整句命中排在每页最前。
+            terms = [queries.coarse_query, *terms]
 
         clips: list[str] = []
         clip_sources: list[dict] = []
@@ -617,15 +688,21 @@ def match_segments(
             )
 
             # 多供应商合并后池序带固定拼接偏差（供应商声明序 × 词条序 × 页序），
-            # 粗排前打乱消除拼接偏差；测试用 random.seed 固定。
-            random.shuffle(pool)
+            # 粗排前打乱消除拼接偏差；测试用 random.seed 固定。库优先模式
+            # 不打乱——池序就是库的排序，打乱会直接抹掉它。
+            if not _library_first():
+                random.shuffle(pool)
 
-            # 3. 粗排：coarse_query 余弦排序 + 查重门走查 → top-30 非重复。
-            #    重复计数由 coarse_rank 的既有汇总行落日志（grep 锚点
-            #    "video match: coarse rank ... duplicates=N"），不重复打点。
-            top30, _dup_skips = coarse_rank(
-                pool, queries.coarse_query, vector_cache, embedding_gate
-            )
+            # 3. 选材：库优先 = 池序即库序，查重门按序走查到 top-30（门内
+            #    按需嵌入）；embed = coarse_query 余弦粗排（历史行为，先把
+            #    查重门需要的向量预热进共享缓存再选）。两种模式的重复计数
+            #    都由各自的汇总行落日志，不重复打点。
+            if _library_first():
+                top30, _dup_skips = _select_by_library_order(pool, embedding_gate)
+            else:
+                top30, _dup_skips = coarse_rank(
+                    pool, queries.coarse_query, vector_cache, embedding_gate
+                )
 
             # 4. 精排：fine_query 全量降序重排；开关关闭 → 粗排序 + 独立
             #    日志行；调用本身抛异常 → 粗排序兜底（重排模块内部已
@@ -666,8 +743,9 @@ def match_segments(
                     duplicate = (
                         embedding_gate.judge_candidate_embedding(
                             url,
-                            str(candidate.get("data_uri") or ""),
+                            _ensure_data_uri(candidate),
                             term,
+                            asset_id=asset_id,
                         )
                         if embedding_gate is not None
                         else None

@@ -10,10 +10,20 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.config import config
 from app.services import vlm_judge
+
+
+@pytest.fixture(autouse=True)
+def _isolate_thumbnail_cache():
+    """fetch_image_bytes caches images by key in-process; tests must not leak."""
+    vlm_judge._BYTES_CACHE.clear()
+    yield
+    vlm_judge._BYTES_CACHE.clear()
 
 
 def _vlm_response(verdict="relevant", reason="matches"):

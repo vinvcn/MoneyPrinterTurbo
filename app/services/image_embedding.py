@@ -39,6 +39,9 @@ DEFAULT_EMBEDDING_MODEL = "tongyi-embedding-vision-flash"
 # 仍被限流则 fail-open 放行，不做无限退避。
 RATE_LIMIT_BACKOFF_SECONDS = (1.5, 3.0, 6.0)
 DEFAULT_DUPLICATE_THRESHOLD = 0.68
+# 查重门向量来源：'service' = 检索服务 POST /embed（惰性持久化，进程外缓存，
+# MPT 不再直连供应商）；'dashscope' = 本进程直连 DashScope（历史行为，A/B 基线）。
+DEFAULT_GATE_BACKEND = "dashscope"
 
 
 def embed_image(
@@ -117,6 +120,53 @@ def embed_image(
             return None
         return [float(v) for v in embedding]
     return None
+
+
+def service_base_url() -> str:
+    """[library] base_url —— 检索服务地址，与素材库搜索共用同一配置。"""
+    section = getattr(config, "library", None) or {}
+    return str(section.get("base_url", "") or "").strip() or "http://vpc-retrieval:8787"
+
+
+def embed_via_service(asset_id: str, timeout: float = 30.0) -> list[float] | None:
+    """经检索服务 `POST /embed` 取候选向量。
+
+    服务端缓存优先：命中只做一次 DB 查询（毫秒级），未命中才读本地缩略图
+    并调供应商、按 `pexels:<id>` 持久化——MPT 进程从此不直连嵌入供应商，
+    重复素材图全机只嵌一次。任何失败返回 None（fail-open）：VLM 走查仍是
+    终审，查重门绝不阻塞流水线。容器网络名直连，不走代理。
+    """
+    asset_id = str(asset_id or "").strip()
+    if not asset_id:
+        return None
+    try:
+        response = requests.post(
+            f"{service_base_url()}/embed",
+            json={"asset_id": asset_id},
+            timeout=(timeout, timeout),
+            proxies={},
+        )
+    except Exception as exc:
+        logger.warning(
+            "service embed request failed: "
+            f"asset_id={asset_id}, error={type(exc).__name__}"
+        )
+        return None
+    if response.status_code != 200:
+        logger.warning(
+            "service embed returned non-200: "
+            f"asset_id={asset_id}, status={response.status_code}"
+        )
+        return None
+    try:
+        vector = response.json().get("vector") or []
+        return [float(v) for v in vector] or None
+    except Exception as exc:
+        logger.warning(
+            "service embed response malformed: "
+            f"asset_id={asset_id}, error={type(exc).__name__}"
+        )
+        return None
 
 
 def embed_text(query: str) -> list[float] | None:
@@ -257,6 +307,7 @@ class EmbeddingGate:
         url: str,
         data_uri: str,
         term: str = "",
+        asset_id: str = "",
     ) -> dict[str, Any] | None:
         """
         嵌入候选并与已采纳注册表查重。
@@ -266,22 +317,13 @@ class EmbeddingGate:
         注册表逐对算余弦，命中重复返回审计记录（verdict="duplicate"），
         重复是终审拒绝。其余情况返回 None 放行；register_accepted 只对
         真正被采纳的 URL 生效。term 保留在调用契约上（审计记录携带搜索
-        词），门内不再使用。
+        词），门内不再使用；asset_id 是 service 后端的取向量键。
         """
-        if not str(data_uri or ""):
-            # 空 data_uri 无法嵌入：直接放行（fail-open），不发起必然
-            # 400 的调用；候选交由 VLM 走查的首帧兜底自行取图。
-            return None
         vec = self._candidates.get(url)
         if vec is None and self._shared_cache is not None:
             vec = self._shared_cache.get(url)
         if vec is None:
-            vec = embed_image(
-                data_uri=data_uri,
-                model=self.model,
-                api_key=self.api_key,
-                base_url=self.base_url,
-            )
+            vec = self._embed_candidate(data_uri, asset_id)
             if vec is None:
                 return None
             self._candidates[url] = vec
@@ -299,6 +341,28 @@ class EmbeddingGate:
                 "cos": cos,
             }
         return None
+
+    def _embed_candidate(self, data_uri: str, asset_id: str) -> list[float] | None:
+        """按 [image_embedding] backend 取候选向量。
+
+        service：检索服务 POST /embed（惰性持久化；按 asset_id 取，不需要
+        data_uri）。任何失败返回 None（fail-open 放行，VLM 终审）——不静默
+        回落 dashscope，A/B 的两条路径保持可区分。dashscope：本进程直连
+        嵌入 data_uri（历史行为；空 data_uri 直接 None，避免必然 400 的
+        调用）。
+        """
+        if _gate_backend() == "service":
+            return embed_via_service(asset_id)
+        if not str(data_uri or ""):
+            # 空 data_uri 无法嵌入：直接放行（fail-open），候选交由 VLM
+            # 走查的首帧兜底自行取图。
+            return None
+        return embed_image(
+            data_uri=data_uri,
+            model=self.model,
+            api_key=self.api_key,
+            base_url=self.base_url,
+        )
 
     def register_accepted(self, url: str) -> None:
         """把候选缓存向量挪入已采纳注册表（无 API 调用）。"""
@@ -333,6 +397,12 @@ def _gate_setting(key: str, default: str) -> str:
     section = getattr(config, "image_embedding", None) or {}
     value = str(section.get(key, "") or "").strip()
     return value or default
+
+
+def _gate_backend() -> str:
+    """[image_embedding] backend：'service'（检索服务）| 'dashscope'（直连）。"""
+    value = _gate_setting("backend", DEFAULT_GATE_BACKEND).lower()
+    return value if value in ("service", "dashscope") else DEFAULT_GATE_BACKEND
 
 
 def _gate_threshold() -> float:

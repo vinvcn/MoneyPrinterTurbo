@@ -615,6 +615,10 @@ class TestMatchSegments(unittest.TestCase):
         def fake_download_thumbnail(url):
             return (url.encode(), (640, 320))
 
+        def fake_fetch_image_bytes(asset_id, url):
+            payload, size = fake_download_thumbnail(url)
+            return payload, size, "cdn"
+
         stub_embed = _StubEmbedImage(vectors)
         gate_obj = None
         gate_cache: dict[str, list[float]] = {}
@@ -645,7 +649,7 @@ class TestMatchSegments(unittest.TestCase):
                 video_match.llm, "generate_response", side_effect=fake_llm
             ),
             patch.object(
-                video_match, "download_thumbnail_bytes", fake_download_thumbnail
+                video_match, "fetch_image_bytes", fake_fetch_image_bytes
             ),
             patch.object(video_match, "to_data_uri", lambda payload: payload.decode()),
             patch.object(
