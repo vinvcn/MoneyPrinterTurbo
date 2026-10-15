@@ -1444,7 +1444,7 @@ class TestLibraryProvider(unittest.TestCase):
     """
     video_source = "library"：本地素材库检索（vpc-retrieval 服务）。
 
-    映射、档位选择、模拟翻页、fail-open 与来源审计。全部 patch
+    映射、档位选择、模拟翻页、fail-fast 与来源审计。全部 patch
     requests.post，测试不触网、不落缓存。
     """
 
@@ -1622,11 +1622,56 @@ class TestLibraryProvider(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["exclude_urls"], ["https://videos.example/from-cache.mp4"])
 
-    def test_search_library_fail_open_on_request_error(self):
-        """服务不可达：记 warning、返回空列表，绝不抛异常（fail-open）。"""
+    def test_search_library_raises_on_request_error(self):
+        """服务不可达：抛 LibraryUnavailableError，任务带原因失败（fail-fast）。
+
+        library 没有可退守的兜底 provider，静默返回空列表会让任务以
+        "failed to download video materials" 这种看不出原因的方式失败。
+        """
         with patch(
             "app.services.material.requests.post",
             side_effect=requests.ConnectionError("boom"),
+        ):
+            with self.assertRaises(material.LibraryUnavailableError) as ctx:
+                material.search_videos_library(
+                    "ocean",
+                    minimum_duration=5,
+                    video_aspect=material.VideoAspect.portrait,
+                )
+        self.assertIn("vpc-retrieval:8787", str(ctx.exception))
+        self.assertIn("ConnectionError", str(ctx.exception))
+
+    def test_search_library_non_200_raises(self):
+        with patch(
+            "app.services.material.requests.post",
+            return_value=SimpleNamespace(status_code=503, json=lambda: {}),
+        ):
+            with self.assertRaises(material.LibraryUnavailableError) as ctx:
+                material.search_videos_library(
+                    "ocean",
+                    minimum_duration=5,
+                    video_aspect=material.VideoAspect.portrait,
+                )
+        self.assertIn("status=503", str(ctx.exception))
+
+    def test_search_library_broken_contract_raises(self):
+        """200 但响应不是 {hits: [...]}：契约损坏，同样 fail-fast。"""
+        with patch(
+            "app.services.material.requests.post",
+            return_value=SimpleNamespace(status_code=200, json=lambda: {"items": []}),
+        ):
+            with self.assertRaises(material.LibraryUnavailableError):
+                material.search_videos_library(
+                    "ocean",
+                    minimum_duration=5,
+                    video_aspect=material.VideoAspect.portrait,
+                )
+
+    def test_search_library_empty_hits_returns_empty(self):
+        """服务正常但没有可用素材：返回空列表，不算故障。"""
+        with patch(
+            "app.services.material.requests.post",
+            return_value=self._fake_response([]),
         ):
             results = material.search_videos_library(
                 "ocean",
@@ -1635,17 +1680,15 @@ class TestLibraryProvider(unittest.TestCase):
             )
         self.assertEqual(results, [])
 
-    def test_search_library_non_200_returns_empty(self):
-        with patch(
-            "app.services.material.requests.post",
-            return_value=SimpleNamespace(status_code=503, json=lambda: {}),
-        ):
-            results = material.search_videos_library(
+    def test_search_library_empty_base_url_raises(self):
+        """[library] base_url 为空是配置错误，必须报出来而不是静默空素材。"""
+        config.library["base_url"] = ""
+        with self.assertRaises(material.LibraryUnavailableError):
+            material.search_videos_library(
                 "ocean",
                 minimum_duration=5,
                 video_aspect=material.VideoAspect.portrait,
             )
-        self.assertEqual(results, [])
 
     def test_library_dispatch_and_provider_audit(self):
         """dispatch：source="library" 的缓存闭包能还原审计 provider。"""

@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any, List, Literal, Optional, Union
 
 import pydantic
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.config import config
 
@@ -61,6 +61,20 @@ class MaterialInfo:
     source_info: Optional[dict[str, Any]] = None
 
 
+def configured_video_source() -> str:
+    """
+    返回 config.toml ``[app] video_source`` 的当前值，缺省或空值时为 "pexels"。
+
+    请求显式携带 ``video_source`` 时不使用本函数；只有请求省略（或传空值）
+    时它才决定素材来源。读取发生在每次校验时，因此 WebUI 运行期改配置后
+    新提交的任务立即生效。
+    """
+    value = config.app.get("video_source", "pexels")
+    if isinstance(value, str) and value.strip():
+        return value
+    return "pexels"
+
+
 class VideoParams(BaseModel):
     """
     {
@@ -87,7 +101,9 @@ class VideoParams(BaseModel):
     match_materials_to_script: bool = False
     video_count: int = Field(default=1, ge=1)
 
-    video_source: Optional[str] = "pexels"
+    # 素材来源：请求显式给值时以请求为准；省略或传空值时回落到
+    # config.toml 的 [app] video_source（见 configured_video_source）。
+    video_source: Optional[str] = Field(default_factory=configured_video_source)
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
     )
@@ -122,6 +138,14 @@ class VideoParams(BaseModel):
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
+
+    @field_validator("video_source", mode="before")
+    @classmethod
+    def _empty_video_source_means_config(cls, value: Optional[str]) -> str:
+        """空串与 None 都表示“未指定”，按 config.toml 取值。"""
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return configured_video_source()
+        return value
 
 
 class SubtitleRequest(BaseModel):

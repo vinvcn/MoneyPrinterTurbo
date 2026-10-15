@@ -36,6 +36,8 @@ tls_verify = true
 # Available values: "pexels", "pixabay", "coverr", "local", "library".
 # segment-first 素材流程并行查询所有已配置 API key 的供应商，video_source 仅作用于经典流程。
 # "library" 使用本地素材库检索服务（[library] base_url，不需要官方 API key），两条流程都生效。
+# 这里的取值是**请求默认值**：API/WebUI 请求显式带 video_source 时以请求为准，
+# 请求省略该字段时用本行的值。
 video_source = "pexels"
 
 # API key lists support key rotation. Use straight ASCII double quotes and
@@ -436,8 +438,10 @@ base_url = ""
 # -----------------------------------------------------------------------------
 # video_source = "library" 时的检索服务地址（vpc-retrieval）。容器部署默认
 # 走共享网络内的容器名（dev-middleware_data-platform）；宿主机直连可改为
-# "http://127.0.0.1:8787"。服务不需要官方 API key（fail-open：不可达时
-# 记 warning 并返回空素材段，任务不中断）。
+# "http://127.0.0.1:8787"。服务不需要官方 API key。
+# 失败策略是 fail-fast：服务不可达、返回非 200 或响应契约损坏时任务以明确
+# 原因失败（LibraryUnavailableError），不会静默改用在线 provider；服务正常
+# 但没有匹配素材时仍按“无素材”处理。
 # -----------------------------------------------------------------------------
 [library]
 base_url = "http://vpc-retrieval:8787"
