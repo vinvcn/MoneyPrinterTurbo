@@ -21,6 +21,7 @@ VLM 下载前相关性过滤（segment-first 流水线专用）。
 import base64
 import json
 import os
+import threading
 from collections import OrderedDict
 from typing import Any
 
@@ -245,25 +246,30 @@ def download_thumbnail_bytes(thumbnail_url: str) -> tuple[bytes, tuple[int, int]
 
 _BYTES_CACHE_MAX = 256
 # 进程内 图像key -> (字节, 分辨率) 缓存：查重门的 data_uri 与 VLM 走查
-# 对同一张缩略图只取一次（此前各取各的，同一文件下载两遍）。
+# 对同一张缩略图只取一次（此前各取各的，同一文件下载两遍）。多任务线程
+# 共享，读写都在 _BYTES_CACHE_LOCK 内进行（OrderedDict 的 move_to_end /
+# popitem 非线程安全）。
 _BYTES_CACHE: "OrderedDict[str, tuple[bytes, tuple[int, int]]]" = OrderedDict()
+_BYTES_CACHE_LOCK = threading.Lock()
 
 
 def _cache_get(key: str) -> tuple[bytes, tuple[int, int]] | None:
-    hit = _BYTES_CACHE.get(key)
-    if hit is not None:
-        _BYTES_CACHE.move_to_end(key)
-    return hit
+    with _BYTES_CACHE_LOCK:
+        hit = _BYTES_CACHE.get(key)
+        if hit is not None:
+            _BYTES_CACHE.move_to_end(key)
+        return hit
 
 
 def _cache_put(key: str, payload: bytes, size: tuple[int, int]) -> None:
-    _BYTES_CACHE[key] = (payload, size)
-    _BYTES_CACHE.move_to_end(key)
-    while len(_BYTES_CACHE) > _BYTES_CACHE_MAX:
-        _BYTES_CACHE.popitem(last=False)
+    with _BYTES_CACHE_LOCK:
+        _BYTES_CACHE[key] = (payload, size)
+        _BYTES_CACHE.move_to_end(key)
+        while len(_BYTES_CACHE) > _BYTES_CACHE_MAX:
+            _BYTES_CACHE.popitem(last=False)
 
 
-def fetch_image_bytes(asset_id: str, thumbnail_url: str) -> tuple[bytes, tuple[int, int], str]:
+def fetch_image_bytes(asset_id: str, thumbnail_url: str) -> tuple[bytes, tuple[int, int]]:
     """候选预览图的唯一入口：查重门与 VLM 走查共用。
 
     [image_embedding] backend = "service" 且候选带 asset_id 时先取检索服务
@@ -276,8 +282,8 @@ def fetch_image_bytes(asset_id: str, thumbnail_url: str) -> tuple[bytes, tuple[i
     key = f"asset:{asset_id}" if asset_id else str(thumbnail_url or "")
     hit = _cache_get(key)
     if hit is not None:
-        return hit[0], hit[1], "cache"
-    if asset_id and image_embedding._gate_backend() == "service":
+        return hit[0], hit[1]
+    if asset_id and image_embedding.service_backend():
         try:
             response = requests.get(
                 f"{image_embedding.service_base_url()}/thumbnail/{asset_id}",
@@ -287,7 +293,7 @@ def fetch_image_bytes(asset_id: str, thumbnail_url: str) -> tuple[bytes, tuple[i
             if response.status_code == 200 and response.content:
                 size = _probe_image_size(response.content)
                 _cache_put(key, response.content, size)
-                return response.content, size, "service"
+                return response.content, size
         except Exception as exc:
             logger.warning(
                 "service thumbnail fetch failed: "
@@ -295,7 +301,7 @@ def fetch_image_bytes(asset_id: str, thumbnail_url: str) -> tuple[bytes, tuple[i
             )
     payload, size = download_thumbnail_bytes(thumbnail_url)
     _cache_put(key, payload, size)
-    return payload, size, "cdn"
+    return payload, size
 
 
 def _probe_image_size(payload: bytes) -> tuple[int, int]:
@@ -419,9 +425,7 @@ def make_default_judge(embedding_gate: Any = None):
         # 路径 1：缩略图（backend=service 时先取检索服务的本地文件，404 回落 CDN）。
         if thumbnail_url:
             try:
-                payload, (width, height), _image_source = fetch_image_bytes(
-                    asset_id, thumbnail_url
-                )
+                payload, (width, height) = fetch_image_bytes(asset_id, thumbnail_url)
                 if width >= min_width and height >= min_height:
                     image_source = "thumbnail"
                     image_data_uri = to_data_uri(payload)

@@ -41,7 +41,9 @@ RATE_LIMIT_BACKOFF_SECONDS = (1.5, 3.0, 6.0)
 DEFAULT_DUPLICATE_THRESHOLD = 0.68
 # 查重门向量来源：'service' = 检索服务 POST /embed（惰性持久化，进程外缓存，
 # MPT 不再直连供应商）；'dashscope' = 本进程直连 DashScope（历史行为，A/B 基线）。
-DEFAULT_GATE_BACKEND = "dashscope"
+BACKEND_DASHSCOPE = "dashscope"
+BACKEND_SERVICE = "service"
+DEFAULT_GATE_BACKEND = BACKEND_DASHSCOPE
 
 
 def embed_image(
@@ -351,7 +353,7 @@ class EmbeddingGate:
         嵌入 data_uri（历史行为；空 data_uri 直接 None，避免必然 400 的
         调用）。
         """
-        if _gate_backend() == "service":
+        if _gate_backend() == BACKEND_SERVICE:
             return embed_via_service(asset_id)
         if not str(data_uri or ""):
             # 空 data_uri 无法嵌入：直接放行（fail-open），候选交由 VLM
@@ -400,9 +402,17 @@ def _gate_setting(key: str, default: str) -> str:
 
 
 def _gate_backend() -> str:
-    """[image_embedding] backend：'service'（检索服务）| 'dashscope'（直连）。"""
+    """[image_embedding] backend：service（检索服务）| dashscope（直连）。"""
     value = _gate_setting("backend", DEFAULT_GATE_BACKEND).lower()
-    return value if value in ("service", "dashscope") else DEFAULT_GATE_BACKEND
+    return value if value in (BACKEND_SERVICE, BACKEND_DASHSCOPE) else DEFAULT_GATE_BACKEND
+
+
+def service_backend() -> bool:
+    """True = 查重门向量（与候选预览图）走检索服务，MPT 不直连供应商。
+
+    供跨模块判定（video_match / vlm_judge），不暴露私有配置读取。
+    """
+    return _gate_backend() == BACKEND_SERVICE
 
 
 def _gate_threshold() -> float:

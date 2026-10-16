@@ -617,7 +617,7 @@ class TestMatchSegments(unittest.TestCase):
 
         def fake_fetch_image_bytes(asset_id, url):
             payload, size = fake_download_thumbnail(url)
-            return payload, size, "cdn"
+            return payload, size
 
         stub_embed = _StubEmbedImage(vectors)
         gate_obj = None

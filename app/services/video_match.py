@@ -223,6 +223,11 @@ def generate_segment_queries(subject: str, segment_text: str) -> SegmentQueries:
 # 粗排最多放行的候选数：漏斗约定粗排产出 top-30，重复候选不计入配额。
 _COARSE_TOP_K = 30
 
+# 选材模式常量（[app] coarse_rank_mode）：
+#   library = 池序即库序直接选 top-30（不嵌入）；embed = 余弦粗排（历史行为）。
+MODE_LIBRARY = "library"
+MODE_EMBED = "embed"
+
 
 def coarse_rank(
     pool: list[dict],
@@ -308,27 +313,14 @@ def coarse_rank(
         # 查重门关闭（调用方未注入）：跳过走查，排序前 30 直接放行。
         selected = [cand for _, cand in scored[:_COARSE_TOP_K]]
     else:
-        for _, cand in scored:
-            if len(selected) >= _COARSE_TOP_K:
-                break
-            url = str(cand.get("url") or "")
-            record = embedding_gate.judge_candidate_embedding(
-                url,
-                str(cand.get("data_uri") or ""),
-                coarse_query,
-                asset_id=str(cand.get("asset_id") or ""),
-            )
-            if record is not None:
-                # 走查前向量已全部预热进共享缓存，此步不产生新的嵌入调用。
-                duplicate_skips.append(
-                    {
-                        "asset_id": cand.get("asset_id"),
-                        "url": url,
-                        "reason": record.get("reason") or record.get("verdict"),
-                    }
-                )
-                continue
-            selected.append(cand)
+        # 走查骨架与库优先选材共用（_walk_gate）；粗排的判定输入是
+        # 池构建时预取的 data_uri 与候选词条。
+        selected, duplicate_skips = _walk_gate(
+            [cand for _, cand in scored],
+            embedding_gate,
+            data_uri_of=lambda cand: str(cand.get("data_uri") or ""),
+            term_of=lambda cand: str(cand.get("term") or ""),
+        )
 
     logger.info(
         f"video match: coarse rank query={coarse_query!r} pool={len(pool)} "
@@ -339,38 +331,51 @@ def coarse_rank(
 
 def _coarse_rank_mode() -> str:
     """选材模式：'library' 按库序（不嵌入），'embed' 走余弦粗排（历史行为）。"""
-    value = str(config.app.get("coarse_rank_mode", "embed") or "embed").strip().lower()
-    return value if value in ("library", "embed") else "embed"
+    value = str(config.app.get("coarse_rank_mode", MODE_EMBED) or MODE_EMBED).strip().lower()
+    return value if value in (MODE_LIBRARY, MODE_EMBED) else MODE_EMBED
 
 
 def _library_first() -> bool:
     """True = 素材库排序即选材序，粗排嵌入完全退场。"""
-    return _coarse_rank_mode() == "library"
+    return _coarse_rank_mode() == MODE_LIBRARY
 
 
-def _select_by_library_order(
-    pool: list[dict],
+def _data_uri_for_gate(candidate: dict) -> str:
+    """查重门判定所需的预览图：service 后端不需要（向量按 asset_id 取），
+    dashscope 后端按需取一次并回写候选（同任务内不重复取）。"""
+    if image_embedding.service_backend():
+        return ""
+    return _ensure_data_uri(candidate)
+
+
+def _walk_gate(
+    candidates: list,
     embedding_gate: image_embedding.EmbeddingGate | None,
-) -> tuple[list[dict], list[dict]]:
-    """库优先选材：池序即库序，查重门按序走查到 top-30。
+    *,
+    data_uri_of,
+    term_of,
+    limit: int = _COARSE_TOP_K,
+) -> tuple[list, list[dict]]:
+    """选材走查的共享骨架：按序过查重门到 limit 个非重复候选。
 
-    与 coarse_rank 的差异只在排序来源：这里不做任何嵌入调用；查重门在
-    判定边界按需取候选向量（门自身有 url→向量缓存，同一 URL 只嵌一次）。
-    门为 None（duplicate_gate 关闭）时直接截前 30，与 coarse_rank 同语义。
+    coarse_rank（embed 模式）与 _select_by_library_order（library 模式）共用：
+    前者喂余弦排序后的候选，后者喂池序候选。data_uri_of / term_of 决定两种
+    模式各自的判定输入；门为 None（duplicate_gate 关闭）时直接截断，与
+    历史行为一致。返回 (selected, duplicate_skips)。
     """
     if embedding_gate is None:
-        return list(pool)[:_COARSE_TOP_K], []
+        return list(candidates)[:limit], []
 
-    selected: list[dict] = []
+    selected: list = []
     duplicate_skips: list[dict] = []
-    for cand in pool:
-        if len(selected) >= _COARSE_TOP_K:
+    for cand in candidates:
+        if len(selected) >= limit:
             break
         url = str(cand.get("url") or "")
         record = embedding_gate.judge_candidate_embedding(
             url,
-            _ensure_data_uri(cand),
-            str(cand.get("term") or ""),
+            data_uri_of(cand),
+            term_of(cand),
             asset_id=str(cand.get("asset_id") or ""),
         )
         if record is not None:
@@ -383,6 +388,26 @@ def _select_by_library_order(
             )
             continue
         selected.append(cand)
+    return selected, duplicate_skips
+
+
+def _select_by_library_order(
+    pool: list[dict],
+    embedding_gate: image_embedding.EmbeddingGate | None,
+) -> tuple[list[dict], list[dict]]:
+    """库优先选材：池序即库序，查重门按序走查到 top-30。
+
+    与 coarse_rank 的差异只在排序来源：这里不做任何嵌入调用；查重门在
+    判定边界按需取候选向量（门自身有 url→向量缓存，同一 URL 只嵌一次），
+    service 后端下连预览图都不取。重复计数走本函数的汇总行（与
+    coarse_rank 的汇总行同锚点前缀，模式名区分）。
+    """
+    selected, duplicate_skips = _walk_gate(
+        pool,
+        embedding_gate,
+        data_uri_of=_data_uri_for_gate,
+        term_of=lambda cand: str(cand.get("term") or ""),
+    )
     logger.info(
         f"video match: library-order selection pool={len(pool)} "
         f"selected={len(selected)} duplicates={len(duplicate_skips)}"
@@ -411,7 +436,7 @@ def _thumbnail_data_uri(item: MaterialInfo) -> str:
         return ""
     try:
         asset_id = str(source.get("asset_id") or "").strip()
-        payload, _size, _image_source = fetch_image_bytes(asset_id, thumbnail)
+        payload, _size = fetch_image_bytes(asset_id, thumbnail)
     except Exception as exc:
         logger.warning(
             "video match: thumbnail download failed, continue without "
@@ -743,7 +768,7 @@ def match_segments(
                     duplicate = (
                         embedding_gate.judge_candidate_embedding(
                             url,
-                            _ensure_data_uri(candidate),
+                            _data_uri_for_gate(candidate),
                             term,
                             asset_id=asset_id,
                         )
