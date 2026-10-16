@@ -924,6 +924,16 @@ def _cached_library_urls(
     return urls
 
 
+class LibraryUnavailableError(RuntimeError):
+    """
+    素材库（vpc-retrieval）不可用：library 来源失败即任务失败。
+
+    与在线 provider 不同，library 是本机唯一素材来源，没有可退守的兜底
+    provider，因此“服务不可达 / 非 200 / 响应契约损坏”必须向上抛出并让任务
+    带着原因失败；空结果（服务正常但没有可用素材）仍按“无素材”处理。
+    """
+
+
 def search_videos_library(
     search_term: str,
     minimum_duration: int,
@@ -933,8 +943,10 @@ def search_videos_library(
     """
     本地素材库检索（vpc-retrieval 服务，video_source = "library"）。
 
-    与在线 provider 同契约。fail-open：服务不可达或响应异常时记 warning 并
-    返回空列表，由调用方既有逻辑处理空素材段，绝不抛异常。翻页 = 把本进程
+    与在线 provider 同契约，但失败策略是 fail-fast：服务不可达、返回非 200、
+    或响应契约损坏时抛 LibraryUnavailableError，任务以明确原因失败（不静默
+    退回到在线 provider，那会让成片素材来源与配置不符）。服务正常但没有可用
+    素材时返回空列表，交由调用方的空素材逻辑处理。翻页 = 把本进程
     已返回过的 URL 作为 exclude_urls 传回服务端剔除并补位，再从新候选里取
     前 30 条——服务端 k 上限 100，此方式让任意页数都能拿到新候选；重复候选
     由 match_segments 既有去重兜底。
@@ -942,8 +954,10 @@ def search_videos_library(
     aspect = VideoAspect(video_aspect)
     base_url, timeout = _library_settings()
     if not base_url:
-        logger.warning("library search skipped: [library] base_url is empty")
-        return []
+        raise LibraryUnavailableError(
+            "[library] base_url is empty — set it in config.toml "
+            '(or remove video_source = "library")'
+        )
 
     page_number = max(1, int(page or 1))
     seen_key = _library_seen_key(base_url, search_term, minimum_duration, aspect)
@@ -974,23 +988,30 @@ def search_videos_library(
             timeout=(timeout, timeout),
         )
         if response.status_code != 200:
-            logger.warning(
-                "library search returned non-200: "
-                f"status={response.status_code}, term={search_term!r}"
+            raise LibraryUnavailableError(
+                f"library search returned status={response.status_code} "
+                f"from {base_url} (term={search_term!r})"
             )
-            return []
         body = response.json()
+    except LibraryUnavailableError:
+        raise
     except Exception as e:
-        logger.warning(
+        detail = _redact_request_error(e)
+        logger.error(
             "library search failed: "
-            f"error={type(e).__name__}, detail={_redact_request_error(e)}"
+            f"endpoint={base_url}, error={type(e).__name__}, detail={detail}"
         )
-        return []
+        raise LibraryUnavailableError(
+            f"library search unavailable at {base_url}: "
+            f"{type(e).__name__}: {detail}"
+        ) from e
 
     hits = body.get("hits") if isinstance(body, dict) else None
     if not isinstance(hits, list):
-        logger.warning("library search returned an unsupported response")
-        return []
+        raise LibraryUnavailableError(
+            f"library search returned an unsupported response from {base_url} "
+            f"(term={search_term!r})"
+        )
 
     items: List[MaterialInfo] = []
     for hit in hits:
