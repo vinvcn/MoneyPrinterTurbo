@@ -293,7 +293,7 @@ def test_match_segments_builds_premise_candidates_locally(registry):
             segments=[{"index": 0, "text": "A panda eats.", "duration": 3.0}],
             video_subject="panda",
             search_videos=lambda search_term, page=1, **_k: [] if page > 1 else list(items),
-            save_video=lambda url, save_dir="": "/saved/x.mp4",
+            save_video=lambda video_url, save_dir="": "/saved/x.mp4",
             video_aspect="9:16",
             clip_duration=3,
             judge_candidate=lambda **kw: _verdict(),
@@ -393,3 +393,196 @@ def test_pipeline_passes_source_and_premise_pool_to_match_segments(registry):
     assert callable(premise_pool)
     assert [i.url for i in premise_pool()] == [f"premise://{OWNER}/m1/0", f"premise://{OWNER}/m1/1"]
     assert callable(captured.get("search_videos")), "stock 回调照常在场（pass B / stock 单遍共用）"
+
+
+# ---------------------------------------------------------------------------
+# todo 8 单遍实现：match_segments 直接消费 source + premise_pool 参数
+# （上面的接线测试把 match_segments mock 掉了；这里走真实漏斗——premise
+#   零 stock 调用且不打乱、mixed 池前置 + stock 兜底、池读取失败 fail-open、
+#   显式 vector_cache 不被 gate 共享缓存改写。）
+# ---------------------------------------------------------------------------
+
+
+def _funnel_llm(prompt):
+    return json.dumps({"terms": ["terma"], "coarse_query": "A broad scene.", "fine_query": "fp"})
+
+
+def _accept_judge(*_a, **_kw):
+    return {"verdict": "relevant", "reason": "ok"}
+
+
+def _spy_coarse(captured):
+    def spy(pool, coarse_query, vector_cache, embedding_gate):
+        captured["pool"] = list(pool)
+        captured["cache"] = vector_cache
+        return list(pool), []
+
+    return spy
+
+
+def test_match_segments_premise_source_uses_pool_only(registry):
+    """source="premise"：池即全部候选——零 stock 调用、不打乱、本地首帧直读。"""
+    _seed_materials(count=2)
+    items = task.premise_pool_materials(OWNER)
+
+    def fail_search(*_a, **_k):
+        raise AssertionError("premise 单遍不得触发 stock 搜索")
+
+    captured: dict = {}
+    with (
+        patch.object(video_match.llm, "generate_response", side_effect=_funnel_llm),
+        patch.object(video_match, "fetch_image_bytes", side_effect=_no_http),
+        patch.object(video_match, "to_data_uri", side_effect=_no_http),
+        patch.object(video_match, "coarse_rank", side_effect=_spy_coarse(captured)),
+        patch.object(video_match.material_rerank, "is_rerank_enabled", return_value=False),
+        patch.object(video_match.material_rerank, "_walk_limit", return_value=5),
+        patch.object(video_match, "random") as fake_random,
+        patch.object(video_match, "logger"),
+    ):
+        results = video_match.match_segments(
+            segments=[{"index": 0, "text": "A panda eats.", "duration": 3.0}],
+            video_subject="panda",
+            search_videos=fail_search,
+            save_video=lambda video_url, save_dir="": f"/saved/{video_url.rsplit('/', 1)[-1]}",
+            video_aspect="9:16",
+            clip_duration=3,
+            judge_candidate=_accept_judge,
+            embedding_gate=None,
+            generate_image=None,
+            source="premise",
+            premise_pool=lambda: list(items),
+        )
+    fake_random.shuffle.assert_not_called()
+    assert [c["url"] for c in captured["pool"]] == [
+        f"premise://{OWNER}/m1/0",
+        f"premise://{OWNER}/m1/1",
+    ], "池序即 registry 序，不打乱、不翻页"
+    assert all(c["data_uri"].startswith("data:image/jpeg;base64,") for c in captured["pool"])
+    assert results[0].clips, "relevant 候选应被采纳"
+
+
+def test_match_segments_mixed_source_prepends_pool_and_keeps_stock(registry):
+    """source="mixed"：用户素材候选前置入池，stock 搜索继续兜底填充。"""
+    _seed_materials(count=1)
+    premise_items = task.premise_pool_materials(OWNER)
+    stock_item = MaterialInfo(provider="pexels", url="https://x/stock.mp4", duration=10)
+    searched: list = []
+
+    def fake_search(search_term, page=1, **_k):
+        searched.append((search_term, page))
+        return [stock_item] if page == 1 else []
+
+    captured: dict = {}
+    with (
+        patch.object(video_match.llm, "generate_response", side_effect=_funnel_llm),
+        patch.object(video_match, "fetch_image_bytes", side_effect=_no_http),
+        patch.object(video_match, "to_data_uri", side_effect=_no_http),
+        patch.object(
+            video_match, "_thumbnail_data_uri", return_value="data:image/jpeg;base64,STUB"
+        ),
+        patch.object(video_match, "coarse_rank", side_effect=_spy_coarse(captured)),
+        patch.object(video_match.material_rerank, "is_rerank_enabled", return_value=False),
+        patch.object(video_match.material_rerank, "_walk_limit", return_value=5),
+        patch.object(video_match, "random") as fake_random,
+        patch.object(video_match, "logger"),
+    ):
+        results = video_match.match_segments(
+            segments=[{"index": 0, "text": "A panda eats.", "duration": 3.0}],
+            video_subject="panda",
+            search_videos=fake_search,
+            save_video=lambda video_url, save_dir="": f"/saved/{video_url.rsplit('/', 1)[-1]}",
+            video_aspect="9:16",
+            clip_duration=3,
+            judge_candidate=_accept_judge,
+            embedding_gate=None,
+            generate_image=None,
+            source="mixed",
+            premise_pool=lambda: list(premise_items),
+        )
+    fake_random.shuffle.assert_not_called()
+    urls = [c["url"] for c in captured["pool"]]
+    assert urls[0] == f"premise://{OWNER}/m1/0", "mixed：池内候选前置"
+    assert "https://x/stock.mp4" in urls, "mixed：stock 候选继续入池"
+    assert searched, "mixed：stock 搜索继续兜底"
+    assert results[0].clips
+
+
+def test_match_segments_premise_pool_failure_fails_open(registry):
+    """premise 池读取失败：fail-open 空手而归（留 warning），不抛异常、不回退 stock。"""
+
+    def broken_pool():
+        raise RuntimeError("registry exploded")
+
+    def fail_search(*_a, **_k):
+        raise AssertionError("池失败后同样不得回退 stock 搜索")
+
+    captured: dict = {}
+    with (
+        patch.object(video_match.llm, "generate_response", side_effect=_funnel_llm),
+        patch.object(video_match, "fetch_image_bytes", side_effect=_no_http),
+        patch.object(video_match, "to_data_uri", side_effect=_no_http),
+        patch.object(video_match, "coarse_rank", side_effect=_spy_coarse(captured)),
+        patch.object(video_match.material_rerank, "is_rerank_enabled", return_value=False),
+        patch.object(video_match.material_rerank, "_walk_limit", return_value=5),
+        patch.object(video_match, "logger") as fake_logger,
+    ):
+        results = video_match.match_segments(
+            segments=[{"index": 0, "text": "A panda eats.", "duration": 3.0}],
+            video_subject="panda",
+            search_videos=fail_search,
+            save_video=lambda video_url, save_dir="": f"/saved/{video_url.rsplit('/', 1)[-1]}",
+            video_aspect="9:16",
+            clip_duration=3,
+            judge_candidate=_accept_judge,
+            embedding_gate=None,
+            generate_image=None,
+            source="premise",
+            premise_pool=broken_pool,
+        )
+    assert captured["pool"] == [], "fail-open：池失败不装填任何候选"
+    assert results[0].clips == [], "fail-open：空手而归，不抛异常"
+    assert any(
+        "premise pool read failed" in str(call)
+        for call in fake_logger.warning.call_args_list
+    ), "池失败必须留下 warning 审计"
+
+
+def test_match_segments_explicit_vector_cache_wins_over_gate_shared(registry):
+    """显式 vector_cache 优先于 gate 的 _shared_cache（PersistentVectorCache 契约）。"""
+    _seed_materials(count=1)
+    items = task.premise_pool_materials(OWNER)
+    explicit_cache: dict = {}
+    gate_shared: dict = {}
+
+    class _Gate:
+        _shared_cache = gate_shared
+
+        @staticmethod
+        def judge_candidate_embedding(*_a, **_k):
+            return None
+
+    captured: dict = {}
+    with (
+        patch.object(video_match.llm, "generate_response", side_effect=_funnel_llm),
+        patch.object(video_match, "fetch_image_bytes", side_effect=_no_http),
+        patch.object(video_match, "to_data_uri", side_effect=_no_http),
+        patch.object(video_match, "coarse_rank", side_effect=_spy_coarse(captured)),
+        patch.object(video_match.material_rerank, "is_rerank_enabled", return_value=False),
+        patch.object(video_match.material_rerank, "_walk_limit", return_value=5),
+        patch.object(video_match, "logger"),
+    ):
+        video_match.match_segments(
+            segments=[{"index": 0, "text": "A panda eats.", "duration": 3.0}],
+            video_subject="panda",
+            search_videos=lambda *_a, **_k: [],
+            save_video=lambda video_url, save_dir="": "/saved/x.mp4",
+            video_aspect="9:16",
+            clip_duration=3,
+            judge_candidate=_accept_judge,
+            embedding_gate=_Gate(),
+            generate_image=None,
+            vector_cache=explicit_cache,
+            source="premise",
+            premise_pool=lambda: list(items),
+        )
+    assert captured["cache"] is explicit_cache, "显式传入的 vector_cache 不得被 gate 共享缓存改写"

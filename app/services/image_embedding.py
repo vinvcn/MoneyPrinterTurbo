@@ -130,7 +130,7 @@ def service_base_url() -> str:
     return str(section.get("base_url", "") or "").strip() or "http://vpc-retrieval:8787"
 
 
-def embed_via_service(asset_id: str, timeout: float = 30.0) -> list[float] | None:
+def embed_via_service(asset_id: str, timeout: float | None = None) -> list[float] | None:
     """经检索服务 `POST /embed` 取候选向量。
 
     服务端缓存优先：命中只做一次 DB 查询（毫秒级），未命中才读本地缩略图
@@ -141,11 +141,18 @@ def embed_via_service(asset_id: str, timeout: float = 30.0) -> list[float] | Non
     asset_id = str(asset_id or "").strip()
     if not asset_id:
         return None
+    # timeout 未显式给值时读 [library] timeout（与素材库搜索共用同一配置段），
+    # 缺省回落 30s——与 config.example.toml 的默认值一致。
+    resolved_timeout = (
+        float(timeout)
+        if timeout is not None
+        else float((getattr(config, "library", None) or {}).get("timeout") or 30.0)
+    )
     try:
         response = requests.post(
             f"{service_base_url()}/embed",
             json={"asset_id": asset_id},
-            timeout=(timeout, timeout),
+            timeout=(resolved_timeout, resolved_timeout),
             proxies={},
         )
     except Exception as exc:

@@ -320,8 +320,7 @@ def coarse_rank(
             [cand for _, cand in scored],
             embedding_gate,
             data_uri_of=lambda cand: str(cand.get("data_uri") or ""),
-            term_of=lambda cand: str(cand.get("term") or ""),
-        )
+            )
 
     logger.info(
         f"video match: coarse rank query={coarse_query!r} pool={len(pool)} "
@@ -354,15 +353,15 @@ def _walk_gate(
     embedding_gate: image_embedding.EmbeddingGate | None,
     *,
     data_uri_of,
-    term_of,
     limit: int = _COARSE_TOP_K,
 ) -> tuple[list, list[dict]]:
     """选材走查的共享骨架：按序过查重门到 limit 个非重复候选。
 
     coarse_rank（embed 模式）与 _select_by_library_order（library 模式）共用：
-    前者喂余弦排序后的候选，后者喂池序候选。data_uri_of / term_of 决定两种
-    模式各自的判定输入；门为 None（duplicate_gate 关闭）时直接截断，与
-    历史行为一致。返回 (selected, duplicate_skips)。
+    前者喂余弦排序后的候选，后者喂池序候选。data_uri_of 决定两种模式各自
+    的判定输入；term 两种模式下同为候选构造时写入的词条，直接内联读取
+    （原两个调用点传的是同一 lambda）。门为 None（duplicate_gate 关闭）时
+    直接截断，与历史行为一致。返回 (selected, duplicate_skips)。
     """
     if embedding_gate is None:
         return list(candidates)[:limit], []
@@ -376,7 +375,7 @@ def _walk_gate(
         record = embedding_gate.judge_candidate_embedding(
             url,
             data_uri_of(cand),
-            term_of(cand),
+            str(cand.get("term") or ""),
             asset_id=str(cand.get("asset_id") or ""),
         )
         if record is not None:
@@ -407,7 +406,6 @@ def _select_by_library_order(
         pool,
         embedding_gate,
         data_uri_of=_data_uri_for_gate,
-        term_of=lambda cand: str(cand.get("term") or ""),
     )
     logger.info(
         f"video match: library-order selection pool={len(pool)} "
@@ -636,13 +634,15 @@ def match_segments(
 
     # 任务级 url->向量缓存：粗排与查重门共享同一份 dict。task.py 构造
     # gate 时注入 vector_cache，这里取回同一份（私有访问先例与
-    # material_rerank._walk_limit 相同）；gate 缺席时退化为局部缓存。
-    if vector_cache is None:
-        vector_cache = {}
-    if embedding_gate is not None:
+    # material_rerank._walk_limit 相同）。显式传入优先（main 侧
+    # PersistentVectorCache 契约：调用方显式传参时不得被改写）；未显式传入
+    # 时回落 gate 的共享缓存，gate 缺席再退化为局部缓存。
+    if vector_cache is None and embedding_gate is not None:
         shared = getattr(embedding_gate, "_shared_cache", None)
         if isinstance(shared, dict):
             vector_cache = shared
+    if vector_cache is None:
+        vector_cache = {}
 
     # VLM 走查预算：与旧实现同一先例——直接读 material_rerank._walk_limit
     # （私有访问先例已在 segment_material.py 建立），每次运行只读一次。
@@ -716,8 +716,8 @@ def match_segments(
             # premise/mixed：用户素材池优先（任务级一次读取，见 main 侧
             # todo 8 契约）。premise 单遍只用池内候选（零 stock 调用、不打乱）；
             # mixed 把池内候选前置，stock 搜索继续兜底。池读取失败 fail-open。
-            premise_mode = str(source or "").startswith(("premise", "mixed"))
-            if premise_mode and premise_pool is not None:
+            premise_pool_mode = str(source or "") in ("premise", "mixed")
+            if premise_pool_mode and premise_pool is not None:
                 try:
                     premise_items = list(premise_pool())
                 except Exception as exc:
@@ -782,7 +782,7 @@ def match_segments(
             # 多供应商合并后池序带固定拼接偏差（供应商声明序 × 词条序 × 页序），
             # 粗排前打乱消除拼接偏差；测试用 random.seed 固定。库优先模式与
             # premise/mixed 不打乱——前者池序即库序，后者用户素材天然前置。
-            if not _library_first() and not premise_mode:
+            if not _library_first() and not premise_pool_mode:
                 random.shuffle(pool)
 
             # 3. 选材：库优先 = 池序即库序，查重门按序走查到 top-30（门内

@@ -483,7 +483,7 @@ base_url = ""
 
 # -----------------------------------------------------------------------------
 # video_source = "library" 时的检索服务地址（vpc-retrieval）。容器部署默认
-# 走共享网络内的容器名（dev-middleware_data-platform）；宿主机直连可改为
+# 走共享网络内的容器名（vpc-retrieval，与 base_url 默认值一致）；宿主机直连可改为
 # "http://127.0.0.1:8787"。服务不需要官方 API key。
 # 失败策略是 fail-fast：服务不可达、返回非 200 或响应契约损坏时任务以明确
 # 原因失败（LibraryUnavailableError），不会静默改用在线 provider；服务正常
