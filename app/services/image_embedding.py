@@ -141,13 +141,18 @@ def embed_via_service(asset_id: str, timeout: float | None = None) -> list[float
     asset_id = str(asset_id or "").strip()
     if not asset_id:
         return None
-    # timeout 未显式给值时读 [library] timeout（与素材库搜索共用同一配置段），
-    # 缺省回落 30s——与 config.example.toml 的默认值一致。
-    resolved_timeout = (
-        float(timeout)
-        if timeout is not None
-        else float((getattr(config, "library", None) or {}).get("timeout") or 30.0)
-    )
+    # timeout 未显式给值时读 [library] timeout（与素材库搜索共用同一配置
+    # 段），缺省与非法配置（如 "30s"）一律回落 30s——与 material._library_
+    # settings 的兜底同款：配置错误既不穿透调用方，也不静默停用向量。
+    if timeout is not None:
+        resolved_timeout = float(timeout)
+    else:
+        try:
+            resolved_timeout = float(
+                (getattr(config, "library", None) or {}).get("timeout", 30) or 30
+            )
+        except (TypeError, ValueError):
+            resolved_timeout = 30.0
     try:
         response = requests.post(
             f"{service_base_url()}/embed",

@@ -1226,10 +1226,11 @@ def _preflight_search_provider(params) -> None:
 
 
 def _make_premise_pool(params):
-    """两段式 pass A 素材池回调（plan todo 8）；非 premise/mixed 返回 None。
+    """premise/mixed 的用户素材池回调；非 premise/mixed 返回 None。
 
-    match_segments 对回调做任务级一次读取（memo）；stock 搜索回调
-    （_make_search_videos）继续服务 pass B / 单遍 stock。
+    单遍实现（todo 8）：source="premise" 时 match_segments 只用池内候选
+    （零 stock 调用、不打乱）；"mixed" 时池内候选前置，stock 搜索回调
+    （_make_search_videos）同遍继续兜底。每段读取一次，池失败 fail-open。
     """
     source = str(getattr(params, "video_source", "") or "")
     if source not in _PREMISE_SOURCES:
@@ -1418,10 +1419,9 @@ def _run_segment_first_pipeline(
     # match_segments 自持）。
     search_videos = _make_search_videos(params)
     save_video = _make_save_video(params, task_material_dir)
-    # premise/mixed 的两段式池回调（池内候选前置；premise 单遍只用池）。
+    # premise/mixed 的用户素材池回调（todo 8 单遍实现）：premise 只用
+    # 池内候选（零 stock 调用），mixed 池前置 + stock 同遍兜底。
     premise_pool = _make_premise_pool(params)
-    # todo 8 两段式：match_segments 拿 source + 独立 premise_pool 回调跑 pass A，
-    # stock 搜索回调继续服务 mixed 的 pass B / 单遍 stock。
 
     def generate_image(
         segment: dict, duration=None, refined_prompt=None, framing=""

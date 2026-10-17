@@ -269,5 +269,38 @@ class TestLibraryModeEndToEnd(unittest.TestCase):
         self.assertEqual(results[0].clips, ["/saved/u0", "/saved/u1", "/saved/u2"])
 
 
+class TestEmbedViaServiceTimeout(unittest.TestCase):
+    """`embed_via_service` 的 [library] timeout 兜底：非法配置不穿透、不停用。"""
+
+    def setUp(self):
+        self._library_cfg = dict(config.library)
+        response = type(
+            "R", (), {"status_code": 200, "json": lambda self: {"vector": [0.1, 0.2]}}
+        )
+        patcher = patch.object(image_embedding.requests, "post", return_value=response())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        config.library.clear()
+        config.library.update(self._library_cfg)
+
+    def test_timeout_reads_library_section(self):
+        config.library["timeout"] = 5
+        self.assertEqual(image_embedding.embed_via_service("pexels:1"), [0.1, 0.2])
+        self.assertEqual(
+            image_embedding.requests.post.call_args.kwargs["timeout"], (5.0, 5.0)
+        )
+
+    def test_bad_timeout_config_falls_back_to_30s(self):
+        # 与 material._library_settings 同款兜底：非法值回落 30s，配置错误
+        # 既不抛 ValueError 穿透 fail-open 契约，也不静默停用向量路径。
+        config.library["timeout"] = "30s"
+        self.assertEqual(image_embedding.embed_via_service("pexels:2"), [0.1, 0.2])
+        self.assertEqual(
+            image_embedding.requests.post.call_args.kwargs["timeout"], (30.0, 30.0)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -571,6 +571,21 @@ def match_segments(
             各调用一次（≤ _BACKFILL_CONCURRENCY 并发，slot 序收集结果）；
             回调缺失或单窗口失败时该窗口记入 holes（尾部计划窗口，装配层
             黑场占位），绝不阻塞流水线。
+        vector_cache: 任务级 url->向量缓存（粗排与查重门共享）。显式传入
+            优先于 embedding_gate._shared_cache（main 侧 PersistentVectorCache
+            契约：调用方显式传参时不得被改写；task.py 接线两者本就是同一
+            对象）；未显式传入时取回 gate 注入的同一份。段级选材完成后若
+            缓存带 flush 则落库一次（持久缓存持久化，普通 dict 跳过）。
+        source: video_source 源路由（plan todo 7/8，单遍实现）："premise"
+            仅用户素材池——零 stock 调用、不打乱（shuffle 只消多供应商
+            拼接偏差，premise 池没有该偏差，池序即 registry 序）；"mixed"
+            池内候选前置入池，stock 搜索同遍继续兜底（两遍序 pass A/B 是
+            main 侧 todo 8 的后续，本线暂缓）。其余值（""/stock/legacy）
+            单遍 stock 行为不变。
+        premise_pool: 用户素材池读取回调（registry 派生 MaterialInfo），
+            仅 source ∈ {premise, mixed} 且注入时生效；每段读取一次，失败
+            fail-open（warn + 空池，绝不回退 stock）。premise:// 候选首帧
+            从本地素材目录直读（Metis #10，绝不走 HTTP）。
 
     Returns:
         与输入等长的 SegmentMaterials 列表（字段与旧实现一致）。
