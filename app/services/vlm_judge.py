@@ -21,13 +21,15 @@ VLM 下载前相关性过滤（segment-first 流水线专用）。
 import base64
 import json
 import os
+import threading
+from collections import OrderedDict
 from typing import Any
 
 import requests
 from loguru import logger
 
 from app.config import config
-from app.services import user_materials
+from app.services import image_embedding, user_materials
 from app.utils import utils
 
 # allow: SIZE_OK — 判定回调/图像获取/VLM 客户端同域内聚，拆分归 F4 评审。
@@ -242,6 +244,66 @@ def download_thumbnail_bytes(thumbnail_url: str) -> tuple[bytes, tuple[int, int]
     return payload, (width, height)
 
 
+_BYTES_CACHE_MAX = 256
+# 进程内 图像key -> (字节, 分辨率) 缓存：查重门的 data_uri 与 VLM 走查
+# 对同一张缩略图只取一次（此前各取各的，同一文件下载两遍）。多任务线程
+# 共享，读写都在 _BYTES_CACHE_LOCK 内进行（OrderedDict 的 move_to_end /
+# popitem 非线程安全）。
+_BYTES_CACHE: "OrderedDict[str, tuple[bytes, tuple[int, int]]]" = OrderedDict()
+_BYTES_CACHE_LOCK = threading.Lock()
+
+
+def _cache_get(key: str) -> tuple[bytes, tuple[int, int]] | None:
+    with _BYTES_CACHE_LOCK:
+        hit = _BYTES_CACHE.get(key)
+        if hit is not None:
+            _BYTES_CACHE.move_to_end(key)
+        return hit
+
+
+def _cache_put(key: str, payload: bytes, size: tuple[int, int]) -> None:
+    with _BYTES_CACHE_LOCK:
+        _BYTES_CACHE[key] = (payload, size)
+        _BYTES_CACHE.move_to_end(key)
+        while len(_BYTES_CACHE) > _BYTES_CACHE_MAX:
+            _BYTES_CACHE.popitem(last=False)
+
+
+def fetch_image_bytes(asset_id: str, thumbnail_url: str) -> tuple[bytes, tuple[int, int]]:
+    """候选预览图的唯一入口：查重门与 VLM 走查共用。
+
+    [image_embedding] backend = "service" 且候选带 asset_id 时先取检索服务
+    `GET /thumbnail/{pexels_id}`——服务读挂载的本地扁平目录，不走 CDN、
+    不走代理，worktree 里同样可用；404（或任何失败）回落 CDN。结果按
+    key（asset:<id>，无 id 时用 URL）缓存，第二次取同一张图零网络。
+    CDN 失败照旧抛异常，由调用方 fail-open。
+    """
+    asset_id = str(asset_id or "").strip()
+    key = f"asset:{asset_id}" if asset_id else str(thumbnail_url or "")
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit[0], hit[1]
+    if asset_id and image_embedding.service_backend():
+        try:
+            response = requests.get(
+                f"{image_embedding.service_base_url()}/thumbnail/{asset_id}",
+                timeout=THUMBNAIL_TIMEOUT,
+                proxies={},
+            )
+            if response.status_code == 200 and response.content:
+                size = _probe_image_size(response.content)
+                _cache_put(key, response.content, size)
+                return response.content, size
+        except Exception as exc:
+            logger.warning(
+                "service thumbnail fetch failed: "
+                f"asset_id={asset_id}, error={type(exc).__name__}"
+            )
+    payload, size = download_thumbnail_bytes(thumbnail_url)
+    _cache_put(key, payload, size)
+    return payload, size
+
+
 def _probe_image_size(payload: bytes) -> tuple[int, int]:
     """从 PNG/JPEG/WebP 头部解析像素尺寸，避免引入完整图像库依赖。"""
     if payload[:8] == b"\x89PNG\r\n\x1a\n" and len(payload) >= 24:
@@ -378,10 +440,10 @@ def make_default_judge(embedding_gate: Any = None):
         image_source = ""
         image_data_uri = ""
 
-        # 路径 1：缩略图。
+        # 路径 1：缩略图（backend=service 时先取检索服务的本地文件，404 回落 CDN）。
         if thumbnail_url:
             try:
-                payload, (width, height) = download_thumbnail_bytes(thumbnail_url)
+                payload, (width, height) = fetch_image_bytes(asset_id, thumbnail_url)
                 if width >= min_width and height >= min_height:
                     image_source = "thumbnail"
                     image_data_uri = to_data_uri(payload)
@@ -400,7 +462,9 @@ def make_default_judge(embedding_gate: Any = None):
         # 路径 1.5：premise:// 候选的首帧本就是本地文件（todo-2 registry），
         # 直接读入，跳过下面任何网络下载（Metis #10）。
         if not image_data_uri:
-            image_data_uri = premise_local_first_frame_data_uri(str(getattr(item, "url", "") or ""))
+            image_data_uri = premise_local_first_frame_data_uri(
+                str(getattr(item, "url", "") or "")
+            )
             if image_data_uri:
                 image_source = "premise_local"
 
