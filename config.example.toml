@@ -33,9 +33,19 @@ tls_verify = true
 # Video Materials / 视频素材
 # -----------------------------------------------------------------------------
 
-# Available values: "pexels", "pixabay", "coverr", "local".
+# Available values: "pexels", "pixabay", "coverr", "local", "library".
 # segment-first 素材流程并行查询所有已配置 API key 的供应商，video_source 仅作用于经典流程。
+# "library" 使用本地素材库检索服务（[library] base_url，不需要官方 API key），两条流程都生效。
+# 这里的取值是**请求默认值**：API/WebUI 请求显式带 video_source 时以请求为准，
+# 请求省略该字段时用本行的值。
 video_source = "pexels"
+
+# 素材漏斗的选材模式：
+#   "library" —— 按素材库的排序直接选 top-30（不嵌入、不粗排；池序 = 库序，
+#               不打乱）。整段场景描述（coarse_query）随角度词条一起进池。
+#   "embed"   —— 历史行为：coarse_query 文本向量对候选缩略图逐个余弦粗排
+#               （每段最多 ~90 次嵌入调用），再选 top-30。A/B 的基线。
+coarse_rank_mode = "embed"
 
 # API key lists support key rotation. Use straight ASCII double quotes and
 # separate multiple keys with commas, for example: ["key-1", "key-2"].
@@ -430,6 +440,15 @@ guidance_scale = 7.5
 model = "tongyi-embedding-vision-flash"
 api_key = ""
 # 留空使用 DashScope 默认多模态嵌入端点。
+
+# 查重门向量来源：
+#   "service"   —— 检索服务 POST /embed（[library] base_url）。服务端缓存优先、
+#                 按 pexels:<id> 持久化，重复素材图全机只嵌一次；VLM 走查的
+#                 缩略图也改从服务 GET /thumbnail/{pexels_id} 取（本地文件，
+#                 404 回落 CDN）。推荐与 coarse_rank_mode = "library" 搭配。
+#   "dashscope" —— 历史行为：本进程直连 DashScope 嵌入（api_key 必填），
+#                 A/B 的基线。
+backend = "dashscope"
 base_url = ""
 duplicate_gate = false
 # 余弦相似度 ≥ 该阈值判为重复（实测阳性 0.708-0.921，渗透上限 0.663）。
@@ -457,6 +476,22 @@ max_candidates_per_provider = 20
 timeout = 120
 api_key = ""
 base_url = ""
+
+# =============================================================================
+# Local Material Library / 本地素材库
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# video_source = "library" 时的检索服务地址（vpc-retrieval）。容器部署默认
+# 走共享网络内的容器名（vpc-retrieval，与 base_url 默认值一致）；宿主机直连可改为
+# "http://127.0.0.1:8787"。服务不需要官方 API key。
+# 失败策略是 fail-fast：服务不可达、返回非 200 或响应契约损坏时任务以明确
+# 原因失败（LibraryUnavailableError），不会静默改用在线 provider；服务正常
+# 但没有匹配素材时仍按“无素材”处理。
+# -----------------------------------------------------------------------------
+[library]
+base_url = "http://vpc-retrieval:8787"
+timeout = 30
 
 # =============================================================================
 # User Materials / 用户素材镜像库

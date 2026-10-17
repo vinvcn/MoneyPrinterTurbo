@@ -1186,6 +1186,20 @@ def _make_search_videos(params):
             if max(1, int(page or 1)) > 1:
                 return []
             return premise_pool_materials(owner_id)
+        if source == "library":
+            # 库优先选材：本地素材库是唯一来源；整句/词条/页码原样透传，
+            # 命中与翻页由服务端 RRF + exclude_urls 承接。
+            resolved_duration = (
+                params.video_clip_duration if minimum_duration is None else minimum_duration
+            )
+            resolved_aspect = params.video_aspect if video_aspect is None else video_aspect
+            return material.search_videos_with_cache_for_source(
+                "library", page=max(1, int(page or 1))
+            )(
+                search_term=search_term,
+                minimum_duration=resolved_duration,
+                video_aspect=resolved_aspect,
+            )
         return material.search_videos_multi_provider(
             search_term=search_term,
             minimum_duration=params.video_clip_duration
@@ -1199,19 +1213,24 @@ def _make_search_videos(params):
 
 
 def _preflight_search_provider(params) -> None:
-    """VLM-on 的 no-provider 快速失败；premise/mixed 跳过（零 key 不得硬失败）。"""
+    """VLM-on 的 no-provider 快速失败；premise/mixed 跳过（零 key 不得硬失败）。
+
+    library 交给 material.assert_search_provider_available 校验 [library]
+    base_url（服务不可用时就地失败）；stock 沿用在线 key 检查。
+    """
     source = str(getattr(params, "video_source", "") or "")
     if source in _PREMISE_SOURCES:
         return
     if vlm_judge.is_enabled():
-        material.assert_search_provider_available()
+        material.assert_search_provider_available(source or None)
 
 
 def _make_premise_pool(params):
-    """两段式 pass A 素材池回调（plan todo 8）；非 premise/mixed 返回 None。
+    """premise/mixed 的用户素材池回调；非 premise/mixed 返回 None。
 
-    match_segments 对回调做任务级一次读取（memo）；stock 搜索回调
-    （_make_search_videos）继续服务 pass B / 单遍 stock。
+    单遍实现（todo 8）：source="premise" 时 match_segments 只用池内候选
+    （零 stock 调用、不打乱）；"mixed" 时池内候选前置，stock 搜索回调
+    （_make_search_videos）同遍继续兜底。每段读取一次，池失败 fail-open。
     """
     source = str(getattr(params, "video_source", "") or "")
     if source not in _PREMISE_SOURCES:
@@ -1400,8 +1419,8 @@ def _run_segment_first_pipeline(
     # match_segments 自持）。
     search_videos = _make_search_videos(params)
     save_video = _make_save_video(params, task_material_dir)
-    # todo 8 两段式：match_segments 拿 source + 独立 premise_pool 回调跑 pass A，
-    # stock 搜索回调继续服务 mixed 的 pass B / 单遍 stock。
+    # premise/mixed 的用户素材池回调（todo 8 单遍实现）：premise 只用
+    # 池内候选（零 stock 调用），mixed 池前置 + stock 同遍兜底。
     premise_pool = _make_premise_pool(params)
 
     def generate_image(

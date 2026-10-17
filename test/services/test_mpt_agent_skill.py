@@ -131,9 +131,14 @@ class TestMptAgentSkill(unittest.TestCase):
             _, pixabay_missing = mpt_agent.missing_config(
                 config_path, ["--video-source", "pixabay"]
             )
+            _, library_missing = mpt_agent.missing_config(
+                config_path, ["--video-source", "library"]
+            )
 
             self.assertEqual(default_missing, ["pexels_api_keys"])
             self.assertEqual(pixabay_missing, [])
+            # library 走本地检索服务（[library] base_url），不需要官方 key
+            self.assertEqual(library_missing, [])
 
     def test_existing_provider_key_is_reused_without_asking_user(self):
         with tempfile.TemporaryDirectory() as temp_dir:

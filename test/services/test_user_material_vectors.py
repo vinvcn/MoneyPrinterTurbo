@@ -237,7 +237,7 @@ def test_gate_off_funnel_persists_through_explicit_param(registry):
     cache = PersistentVectorCache()
     with (
         patch.object(video_match.llm, "generate_response", side_effect=fake_llm),
-        patch.object(video_match, "download_thumbnail_bytes", side_effect=_no_http),
+        patch.object(video_match, "fetch_image_bytes", side_effect=_no_http),
         patch.object(video_match, "to_data_uri", side_effect=_no_http),
         patch.object(image_embedding, "embed_text", return_value=[1.0, 0.0]),
         patch.object(image_embedding, "embed_image", _StubEmbedImage({thumb_uri: [1.0, 0.0]})),
