@@ -3,10 +3,23 @@ still→mp4 转换与 make_subject_clip 编排（全 mock，ffmpeg 用真实二�
 极短视频）。"""
 
 import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from app.services import image_gen
+
+
+def _ffmpeg_cli_available() -> bool:
+    try:
+        from app.utils import utils
+
+        utils.get_ffmpeg_binary()
+    except Exception:
+        return False
+    return shutil.which("ffprobe") is not None
 
 
 class _FakeResponse:
@@ -188,6 +201,85 @@ class TestStillToClip(unittest.TestCase):
         d = os.path.join(os.path.dirname(__file__), "..", "..", "storage", "test-image-gen")
         os.makedirs(d, exist_ok=True)
         return d
+
+
+@unittest.skipUnless(_ffmpeg_cli_available(), "ffmpeg/ffprobe binary not available")
+class TestStillToClipDimensionNormalization(unittest.TestCase):
+    """回归：libx264/yuv420p 要求宽高为偶数。真实下载照片（如 pexels
+    原图 3743x5615）常为奇数尺寸，未归一化时 ffmpeg 报 "width not
+    divisible by 2" 并留下 0 字节 clip，段回填随之失败。测试只写临时目录。"""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="mpt-still2clip-")
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def _make_still(self, name: str, lavfi_source: str) -> str:
+        path = os.path.join(self._tmpdir.name, name)
+        from app.utils import utils
+
+        subprocess.run(
+            [
+                utils.get_ffmpeg_binary(),
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                lavfi_source,
+                "-frames:v",
+                "1",
+                path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return path
+
+    def _probe_video_stream(self, path: str) -> tuple[int, int, float]:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                path,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        width, height, duration = [
+            token
+            for line in result.stdout.splitlines()
+            for token in line.split(",")
+            if token.strip()
+        ]
+        return int(width), int(height), float(duration)
+
+    def test_odd_dimension_jpeg_produces_even_sized_clip(self):
+        src = self._make_still("odd.jpg", "testsrc=size=375x201:duration=1")
+        self.assertEqual(self._probe_video_stream(src)[:2], (375, 201))  # 源头确实两边都是奇数
+        clip = image_gen.still_to_clip(src, self._tmpdir.name, duration=0.4)
+        self.assertTrue(clip, "奇数尺寸 still 转 clip 失败（0 字节/空产物回归）")
+        self.assertTrue(os.path.exists(clip))
+        self.assertGreater(os.path.getsize(clip), 0)
+        width, height, duration = self._probe_video_stream(clip)
+        self.assertEqual(width % 2, 0)
+        self.assertEqual(height % 2, 0)
+        self.assertGreater(duration, 0)
+
+    def test_even_dimension_still_keeps_exact_dimensions(self):
+        src = self._make_still("even.png", "color=c=green:s=320x240:d=0.1")
+        clip = image_gen.still_to_clip(src, self._tmpdir.name, duration=0.4)
+        self.assertTrue(clip)
+        width, height, _ = self._probe_video_stream(clip)
+        self.assertEqual((width, height), (320, 240))  # 偶数源不得被意外重采样
 
 
 class TestMakeSubjectClip(unittest.TestCase):

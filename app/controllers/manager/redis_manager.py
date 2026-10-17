@@ -5,9 +5,12 @@ import redis
 from loguru import logger
 from pydantic import ValidationError
 
-from app.controllers.manager.base_manager import TaskManager
+from app.controllers.manager.base_manager import (
+    EXECUTION_MODE_THREAD,
+    TaskManager,
+)
 from app.models import const
-from app.models.schema import VideoParams
+from app.models.schema import TaskVideoRequest, VideoParams
 from app.services import state as sm
 from app.services import task as tm
 
@@ -23,9 +26,14 @@ class RedisTaskManager(TaskManager):
         max_concurrent_tasks: int,
         redis_url: str,
         max_queued_tasks: int = 100,
+        execution_mode: str = EXECUTION_MODE_THREAD,
     ):
         self.redis_client = redis.Redis.from_url(redis_url)
-        super().__init__(max_concurrent_tasks, max_queued_tasks=max_queued_tasks)
+        super().__init__(
+            max_concurrent_tasks,
+            max_queued_tasks=max_queued_tasks,
+            execution_mode=execution_mode,
+        )
 
     def create_queue(self):
         return "task_queue"
@@ -75,7 +83,13 @@ class RedisTaskManager(TaskManager):
                 task_info["kwargs"]["params"], dict
             ):
                 try:
-                    task_info["kwargs"]["params"] = VideoParams(
+                    # 重建为请求子类而非 VideoParams 基类：基类的默认
+                    # extra=ignore 会静默丢弃只声明在 TaskVideoRequest 上的
+                    # 字段（owner_id），使每个 premise/mixed 任务在素材阶段
+                    # 死于 owner_id_required（T12 QA BUG-1）。子类字段校验
+                    # 与基类完全一致且只多两个带默认值的可选项，旧队列条目
+                    # （纯基类 dict）重建行为不变，校验失败的丢弃路径不变。
+                    task_info["kwargs"]["params"] = TaskVideoRequest(
                         **task_info["kwargs"]["params"]
                     )
                 except ValidationError as e:

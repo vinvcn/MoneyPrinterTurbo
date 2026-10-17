@@ -314,6 +314,11 @@ def still_to_clip(image_path: str, save_dir: str, duration: float = _CLIP_DURATI
         "1",
         "-i",
         image_path,
+        # libx264/yuv420p 要求宽高为偶数；下载照片常为奇数尺寸（如
+        # 3743x5615），不归一化会 "width not divisible by 2" 并产出 0 字节
+        # clip。截断取偶：偶数尺寸原样保留，奇数尺寸仅减 1 像素。
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
         "-t",
         f"{float(duration):.3f}",
         "-r",

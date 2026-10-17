@@ -3,7 +3,43 @@ from typing import Any, Callable, Dict
 
 from loguru import logger
 
+from app.controllers.manager.process_executor import ProcessTaskExecutor
 from app.models import const
+
+
+EXECUTION_MODE_THREAD = "thread"
+EXECUTION_MODE_PROCESS = "process"
+_SUPPORTED_EXECUTION_MODES = (EXECUTION_MODE_THREAD, EXECUTION_MODE_PROCESS)
+
+
+def resolve_execution_mode(configured_mode: Any, redis_enabled: bool) -> str:
+    """
+    解析 ``task_execution_mode``，并在不安全的组合下强制回退到线程模式。
+
+    进程模式下每个 worker 是独立解释器，任务状态必须经由 Redis 共享。
+    ``enable_redis = false`` 时使用 MemoryState（进程私有），worker 写入的进度
+    和终态父进程永远读不到，任务会在 API 里永远显示"生成中"，因此这种组合
+    必须降级而不是硬着头皮跑。
+    """
+    mode = str(configured_mode or "").strip().lower()
+    if not mode:
+        return EXECUTION_MODE_THREAD
+
+    if mode not in _SUPPORTED_EXECUTION_MODES:
+        logger.warning(
+            f"unsupported task_execution_mode: {configured_mode!r}, "
+            f"fallback to {EXECUTION_MODE_THREAD}"
+        )
+        return EXECUTION_MODE_THREAD
+
+    if mode == EXECUTION_MODE_PROCESS and not redis_enabled:
+        logger.error(
+            "task_execution_mode = process requires enable_redis = true, "
+            f"fallback to {EXECUTION_MODE_THREAD}"
+        )
+        return EXECUTION_MODE_THREAD
+
+    return mode
 
 
 class TaskQueueFullError(ValueError):
@@ -11,12 +47,27 @@ class TaskQueueFullError(ValueError):
 
 
 class TaskManager:
-    def __init__(self, max_concurrent_tasks: int, max_queued_tasks: int = 100):
+    def __init__(
+        self,
+        max_concurrent_tasks: int,
+        max_queued_tasks: int = 100,
+        execution_mode: str = EXECUTION_MODE_THREAD,
+    ):
         self.max_concurrent_tasks = max_concurrent_tasks
         self.max_queued_tasks = max_queued_tasks
+        self.execution_mode = execution_mode
         self.current_tasks = 0
-        self.lock = threading.Lock()
+        # 必须可重入：进程模式下若 Future 在 add_done_callback 注册时已经完成，
+        # 回调会在当前线程内联执行，而这个线程正持有 self.lock（add_task /
+        # check_queue 都是持锁调用 execute_task）。用非重入的 Lock 会自死锁。
+        self.lock = threading.RLock()
         self.queue = self.create_queue()
+        # 进程池按需创建：进入进程模式但尚无任务时不应启动任何子进程。
+        self._process_executor = (
+            ProcessTaskExecutor(max_concurrent_tasks)
+            if execution_mode == EXECUTION_MODE_PROCESS
+            else None
+        )
 
     def create_queue(self):
         raise NotImplementedError()
@@ -107,10 +158,47 @@ class TaskManager:
         return outcome
 
     def execute_task(self, func: Callable, *args: Any, **kwargs: Any):
-        thread = threading.Thread(
-            target=self.run_task, args=(func, *args), kwargs=kwargs
-        )
-        thread.start()
+        if self.execution_mode != EXECUTION_MODE_PROCESS:
+            thread = threading.Thread(
+                target=self.run_task, args=(func, *args), kwargs=kwargs
+            )
+            thread.start()
+            return
+
+        # 进程模式：任务函数和参数整体序列化到 worker 进程。self 不参与序列化
+        # （它持有 Redis 客户端、队列和锁，都不可 pickle），名额释放改由父进程
+        # 的 Future 回调完成。
+        # submit 抛出的异常必须原样上抛：add_task / check_queue 依赖它回滚已经
+        # 预占的并发名额。
+        future = self._process_executor.submit(func, args, kwargs)
+        future.add_done_callback(self._on_process_task_finished)
+
+    def _on_process_task_finished(self, future) -> None:
+        """
+        worker 进程结束后释放并发名额。
+
+        回调在进程池的管理线程里执行，异常不会传给任何调用方，因此这里既要
+        记录 worker 侧的失败，也要保证 task_done 一定被调用——否则一次失败就
+        会永久占用一个并发额度，队列最终完全停摆。
+        """
+        try:
+            if future.cancelled():
+                logger.warning("process task was cancelled before it started")
+            else:
+                error = future.exception()
+                if error is not None:
+                    logger.error(
+                        f"process task failed: {type(error).__name__}: {error}"
+                    )
+        except Exception as exc:
+            logger.exception(f"failed to inspect finished process task: {exc}")
+        finally:
+            self.task_done()
+
+    def shutdown(self) -> None:
+        """释放进程执行器；线程模式没有需要清理的后台资源。"""
+        if self._process_executor is not None:
+            self._process_executor.shutdown()
 
     def run_task(self, func: Callable, *args: Any, **kwargs: Any):
         try:

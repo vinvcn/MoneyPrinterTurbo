@@ -16,7 +16,11 @@ from loguru import logger
 
 from app.config import config
 from app.controllers import base
-from app.controllers.manager.base_manager import TaskQueueFullError
+from app.controllers.manager.base_manager import (
+    EXECUTION_MODE_THREAD,
+    TaskQueueFullError,
+    resolve_execution_mode,
+)
 from app.controllers.manager.memory_manager import InMemoryTaskManager
 from app.controllers.manager.redis_manager import RedisTaskManager
 from app.controllers.v1.base import new_router
@@ -39,6 +43,7 @@ from app.models.schema import (
 from app.services import bgm as bgm_service
 from app.services import state as sm
 from app.services import task as tm
+from app.services import video as video_service
 from app.utils import file_security, utils
 
 
@@ -56,6 +61,7 @@ def _sanitize_for_log(task: dict) -> dict:
             params.sample_audio_base64 = val[:60] + f"...[{len(val)} chars]"
     return sanitized
 
+
 # 认证依赖项
 # router = new_router(dependencies=[Depends(base.verify_token)])
 router = new_router()
@@ -67,6 +73,12 @@ _redis_db = config.app.get("redis_db", 0)
 _redis_password = config.app.get("redis_password", None)
 _max_concurrent_tasks = config.app.get("max_concurrent_tasks", 5)
 _max_queued_tasks = config.app.get("max_queued_tasks", 100)
+# 任务执行模式：thread（默认，单解释器内的线程）或 process（每个任务独立进程，
+# 绕开 GIL）。不安全的组合会被 resolve_execution_mode 强制降级为 thread。
+task_execution_mode = resolve_execution_mode(
+    config.app.get("task_execution_mode", EXECUTION_MODE_THREAD),
+    redis_enabled=_enable_redis,
+)
 
 redis_url = f"redis://:{_redis_password}@{_redis_host}:{_redis_port}/{_redis_db}"
 # 根据配置选择合适的任务管理器
@@ -75,12 +87,29 @@ if _enable_redis:
         max_concurrent_tasks=_max_concurrent_tasks,
         redis_url=redis_url,
         max_queued_tasks=_max_queued_tasks,
+        execution_mode=task_execution_mode,
     )
 else:
     task_manager = InMemoryTaskManager(
         max_concurrent_tasks=_max_concurrent_tasks,
         max_queued_tasks=_max_queued_tasks,
+        execution_mode=task_execution_mode,
     )
+
+# 渲染器开关（ADR-0013）：显式且穷尽，未知取值在进程启动（模块导入）时
+# 直接抛错，绝不静默回退。最终成片和素材拼接各自独立。
+final_render_mode, combine_render_mode = video_service.validate_render_modes(
+    config.app
+)
+
+logger.info(
+    f"task execution mode: {task_execution_mode} "
+    f"(max_concurrent_tasks={_max_concurrent_tasks})"
+)
+logger.info(
+    f"render modes: final_render_mode={final_render_mode}, "
+    f"combine_render_mode={combine_render_mode}"
+)
 
 
 def _sanitize_upload_filename(filename: str, request_id: str) -> str:

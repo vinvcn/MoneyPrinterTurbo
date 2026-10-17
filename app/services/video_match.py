@@ -16,6 +16,7 @@ llm.generate_response 调用同时产出三类查询；响应无法解析出 JSO
 import json
 import random
 import re
+from collections.abc import MutableMapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +26,7 @@ from loguru import logger
 
 from app.config import config
 from app.models.schema import MaterialInfo
-from app.services import image_embedding
+from app.services import image_embedding, user_materials
 from app.services import image_gen
 from app.services import llm
 from app.services import material_rerank
@@ -455,6 +456,31 @@ def _ensure_data_uri(candidate: dict) -> str:
     return str(candidate.get("data_uri") or "")
 
 
+def _premise_candidate_from_item(item: MaterialInfo, term: str) -> dict:
+    """premise:// MaterialInfo → 粗排候选 dict（与 _candidate_from_item 同契约）。
+
+    唯一差异：data_uri 从本地素材目录的首帧 jpg 读出（Go 侧派生，Metis #10
+    绝不为 premise 字节走 HTTP）；缩略图缺失/素材未 ready 时按既有的空
+    data_uri 契约沉底。url 原样保留 = 向量缓存的键身份（todo 6 契约）。
+    """
+    source = item.source_info if isinstance(item.source_info, dict) else {}
+    data_uri = ""
+    resolved = user_materials.resolve_premise_url(str(item.url or ""))
+    if resolved is not None:
+        row = resolved[2]
+        try:
+            data_uri = user_materials.read_thumb_b64(row["owner"], row["material_id"], row["idx"])
+        except ValueError:
+            data_uri = ""
+    return {
+        "asset_id": str(source.get("asset_id") or ""),
+        "url": str(item.url or ""),
+        "data_uri": data_uri,
+        "term": term,
+        "item": item,
+    }
+
+
 def _candidate_from_item(item: MaterialInfo, term: str) -> dict:
     """MaterialInfo → 粗排候选 dict。
 
@@ -500,6 +526,9 @@ def match_segments(
     judge_candidate: Callable[..., dict] | None = None,
     embedding_gate: image_embedding.EmbeddingGate | None = None,
     generate_image: Callable[..., tuple[str, dict]] | None = None,
+    vector_cache: MutableMapping[str, list[float]] | None = None,
+    source: str = "",
+    premise_pool: Callable[[], list[MaterialInfo]] | None = None,
 ) -> list[SegmentMaterials]:
     """
     三段漏斗素材匹配主编排：粗排（embedding 召回）→ 精排（VL 重排）→
@@ -608,7 +637,8 @@ def match_segments(
     # 任务级 url->向量缓存：粗排与查重门共享同一份 dict。task.py 构造
     # gate 时注入 vector_cache，这里取回同一份（私有访问先例与
     # material_rerank._walk_limit 相同）；gate 缺席时退化为局部缓存。
-    vector_cache: dict[str, list[float]] = {}
+    if vector_cache is None:
+        vector_cache = {}
     if embedding_gate is not None:
         shared = getattr(embedding_gate, "_shared_cache", None)
         if isinstance(shared, dict):
@@ -682,6 +712,38 @@ def match_segments(
             raw_seen = 0
             dedup_dropped = 0
             used_dropped = 0
+
+            # premise/mixed：用户素材池优先（任务级一次读取，见 main 侧
+            # todo 8 契约）。premise 单遍只用池内候选（零 stock 调用、不打乱）；
+            # mixed 把池内候选前置，stock 搜索继续兜底。池读取失败 fail-open。
+            premise_mode = str(source or "").startswith(("premise", "mixed"))
+            if premise_mode and premise_pool is not None:
+                try:
+                    premise_items = list(premise_pool())
+                except Exception as exc:
+                    logger.warning(
+                        "video match: premise pool read failed, fail-open: "
+                        f"error={type(exc).__name__}, detail={exc}"
+                    )
+                    premise_items = []
+                for item in premise_items:
+                    url = str(item.url or "")
+                    if not url or url in pool_urls:
+                        continue
+                    if url in used_urls:
+                        used_dropped += 1
+                        continue
+                    pool_urls.add(url)
+                    pool.append(_premise_candidate_from_item(item, ""))
+                logger.info(
+                    "premise pool assembled: "
+                    f"segment={segment_index}, kept={len(pool)}, "
+                    f"used_dropped={used_dropped}"
+                )
+                if str(source) == "premise":
+                    # premise 单遍：池即全部候选，不进 stock 搜索。
+                    active_terms = []
+
             for page in range(1, search_pages + 1):
                 if not active_terms:
                     break
@@ -704,7 +766,12 @@ def match_segments(
                             dedup_dropped += 1
                             continue
                         pool_urls.add(url)
-                        pool.append(_candidate_from_item(item, term))
+                        if url.startswith("premise://"):
+                            # premise 候选首帧是本地文件（Metis #10），
+                            # 绝不为其走 HTTP 取图。
+                            pool.append(_premise_candidate_from_item(item, term))
+                        else:
+                            pool.append(_candidate_from_item(item, term))
                 active_terms = still_active
             logger.info(
                 "candidate pool assembled: "
@@ -713,9 +780,9 @@ def match_segments(
             )
 
             # 多供应商合并后池序带固定拼接偏差（供应商声明序 × 词条序 × 页序），
-            # 粗排前打乱消除拼接偏差；测试用 random.seed 固定。库优先模式
-            # 不打乱——池序就是库的排序，打乱会直接抹掉它。
-            if not _library_first():
+            # 粗排前打乱消除拼接偏差；测试用 random.seed 固定。库优先模式与
+            # premise/mixed 不打乱——前者池序即库序，后者用户素材天然前置。
+            if not _library_first() and not premise_mode:
                 random.shuffle(pool)
 
             # 3. 选材：库优先 = 池序即库序，查重门按序走查到 top-30（门内
@@ -728,6 +795,12 @@ def match_segments(
                 top30, _dup_skips = coarse_rank(
                     pool, queries.coarse_query, vector_cache, embedding_gate
                 )
+
+            # 持久向量缓存（main 侧 user_material_vectors.PersistentVectorCache）：
+            # 段级选材完成即把新学到的向量落库；普通 dict 无 flush，跳过。
+            _flush = getattr(vector_cache, "flush", None)
+            if callable(_flush):
+                _flush()
 
             # 4. 精排：fine_query 全量降序重排；开关关闭 → 粗排序 + 独立
             #    日志行；调用本身抛异常 → 粗排序兜底（重排模块内部已

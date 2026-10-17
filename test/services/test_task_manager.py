@@ -1,12 +1,17 @@
 import json
+import threading
 import unittest
+from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
-from app.controllers.manager.base_manager import TaskQueueFullError
+from app.controllers.manager.base_manager import (
+    EXECUTION_MODE_PROCESS,
+    TaskQueueFullError,
+)
 from app.controllers.manager.memory_manager import InMemoryTaskManager
 from app.controllers.manager.redis_manager import RedisTaskManager
 from app.models import const
-from app.models.schema import VideoParams
+from app.models.schema import TaskVideoRequest, VideoParams
 from app.services import task as task_service
 
 
@@ -137,6 +142,168 @@ class TestInMemoryTaskManager(unittest.TestCase):
             kwargs={},
         )
         fake_thread.start.assert_called_once_with()
+
+
+class TestProcessModeExecution(unittest.TestCase):
+    """进程模式的调度与名额释放：与线程模式共享同一套并发记账。"""
+
+    @staticmethod
+    def _manager(max_concurrent_tasks=1, max_queued_tasks=1):
+        manager = InMemoryTaskManager(
+            max_concurrent_tasks=max_concurrent_tasks,
+            max_queued_tasks=max_queued_tasks,
+            execution_mode=EXECUTION_MODE_PROCESS,
+        )
+        manager._process_executor = MagicMock()
+        return manager
+
+    def test_execute_task_submits_payload_to_process_executor(self):
+        """任务必须以 (func, args, kwargs) 的形式提交，并挂上完成回调。"""
+        manager = self._manager()
+        future = MagicMock()
+        manager._process_executor.submit.return_value = future
+
+        manager.execute_task(len, [1, 2], extra=None)
+
+        manager._process_executor.submit.assert_called_once_with(
+            len, ([1, 2],), {"extra": None}
+        )
+        future.add_done_callback.assert_called_once_with(
+            manager._on_process_task_finished
+        )
+
+    def test_callback_releases_slot_after_success(self):
+        """worker 正常返回后必须释放并发名额，否则队列会在一次任务后卡死。"""
+        manager = self._manager()
+        manager.current_tasks = 1
+        future = Future()
+        future.set_result(None)
+
+        with patch.object(manager, "task_done") as task_done:
+            manager._on_process_task_finished(future)
+
+        task_done.assert_called_once_with()
+
+    def test_callback_releases_slot_after_worker_failure(self):
+        """
+        worker 抛异常时同样要释放名额，并且必须留下日志：
+        回调在父进程的线程池管理线程里执行，异常不会传给任何调用方。
+        """
+        manager = self._manager()
+        manager.current_tasks = 1
+        future = Future()
+        future.set_exception(RuntimeError("worker blew up"))
+
+        with patch.object(manager, "task_done") as task_done, patch(
+            "app.controllers.manager.base_manager.logger"
+        ) as logger:
+            manager._on_process_task_finished(future)
+
+        task_done.assert_called_once_with()
+        self.assertTrue(logger.error.called)
+
+    def test_callback_releases_slot_after_cancellation(self):
+        """被取消的 Future 没有结果，回调不能在 future.exception() 上崩溃。"""
+        manager = self._manager()
+        manager.current_tasks = 1
+        future = Future()
+
+        self.assertTrue(future.cancel())
+
+        with patch.object(manager, "task_done") as task_done:
+            manager._on_process_task_finished(future)
+
+        task_done.assert_called_once_with()
+
+    def test_callback_releases_slot_even_if_logging_fails(self):
+        """日志失败也不能吞掉名额释放，否则并发额度会永久泄漏。"""
+        manager = self._manager()
+        manager.current_tasks = 1
+        future = Future()
+        future.set_exception(RuntimeError("worker blew up"))
+
+        with patch.object(manager, "task_done") as task_done, patch(
+            "app.controllers.manager.base_manager.logger"
+        ) as logger:
+            logger.error.side_effect = RuntimeError("logger down")
+            manager._on_process_task_finished(future)
+
+        task_done.assert_called_once_with()
+
+    def test_inline_completion_does_not_deadlock_slot_accounting(self):
+        """
+        Future 在注册回调时若已完成，回调会在当前线程内联执行，而该线程正
+        持有 self.lock。锁不可重入时 add_task 会自死锁并永久挂起。用带超时
+        的线程断言，避免回归时把整个测试套件挂死。
+        """
+        manager = self._manager()
+        completed = Future()
+        completed.set_result(None)
+        manager._process_executor.submit.return_value = completed
+        outcome = {}
+
+        def run():
+            try:
+                manager.add_task(len, [1])
+            except Exception as exc:  # pragma: no cover - 只为保留意外异常信息
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive(), "add_task deadlocked on the manager lock")
+        self.assertNotIn("error", outcome)
+        # 内联回调必须已经释放名额，否则一次瞬时完成会凭空占用一个槽位。
+        self.assertEqual(manager.current_tasks, 0)
+
+    def test_inline_completion_drains_queue_without_deadlock(self):
+        """
+        内联完成会走 task_done -> check_queue -> execute_task 的重入链：名额一释放，
+        队列里的任务会在这条链上被继续派发。用已完成的 Future 连续触发，断言整条
+        链能跑完、队列排空、名额全部释放。
+        """
+        manager = InMemoryTaskManager(
+            max_concurrent_tasks=1,
+            max_queued_tasks=3,
+            execution_mode=EXECUTION_MODE_PROCESS,
+        )
+        manager._process_executor = MagicMock()
+        completed = Future()
+        completed.set_result(None)
+        manager._process_executor.submit.return_value = completed
+        manager.enqueue({"func": len, "args": ([1],), "kwargs": {}})
+        manager.enqueue({"func": len, "args": ([1, 2],), "kwargs": {}})
+        outcome = {}
+
+        def run():
+            try:
+                manager.add_task(len, [1, 2, 3])
+            except Exception as exc:  # pragma: no cover - 只为保留意外异常信息
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+
+        self.assertFalse(
+            worker.is_alive(), "re-entrant dispatch chain deadlocked"
+        )
+        self.assertNotIn("error", outcome)
+        self.assertEqual(manager.current_tasks, 0)
+        self.assertTrue(manager.is_queue_empty())
+        # 新提交的任务 + 队列里排队的两条，都必须真的派发出去。
+        self.assertEqual(manager._process_executor.submit.call_count, 3)
+
+    def test_shutdown_closes_process_executor(self):
+        """shutdown 必须把关闭动作转发给进程执行器，线程模式下则是空操作。"""
+        manager = self._manager()
+        thread_manager = InMemoryTaskManager(max_concurrent_tasks=1)
+
+        manager.shutdown()
+        thread_manager.shutdown()
+
+        manager._process_executor.shutdown.assert_called_once_with()
 
 
 class TestRedisTaskManager(unittest.TestCase):
@@ -316,6 +483,114 @@ class TestRedisTaskManager(unittest.TestCase):
         self.assertIsNone(result)
         state.patch_task.assert_called_once()
         state.update_task.assert_not_called()
+
+
+class TestRedisQueueOwnerIdRoundTrip(unittest.TestCase):
+    """BUG-1（T12 QA）：redis 队列的 serialize→dequeue 往返不得丢 owner_id。
+
+    dequeue 历史上把 params 重建为 VideoParams 基类，而 owner_id 声明在请求
+    子类 TaskVideoRequest 上——pydantic 静默丢弃额外键，enable_redis=true 的
+    每个 premise/mixed 任务都会在素材阶段死于 owner_id_required。本类锁定
+    往返保真、legacy 队列条目兼容、以及 _require_owner_id 契约链。
+    """
+
+    def setUp(self):
+        self.redis_client = MagicMock()
+        patcher = patch(
+            "app.controllers.manager.redis_manager.redis.Redis.from_url",
+            return_value=self.redis_client,
+        )
+        self.addCleanup(patcher.stop)
+        patcher.start()
+        self.manager = RedisTaskManager(
+            max_concurrent_tasks=1,
+            redis_url="redis://localhost:6379/0",
+            max_queued_tasks=3,
+        )
+
+    @staticmethod
+    def _premise_params():
+        return TaskVideoRequest(
+            video_subject="Coffee", video_source="premise", owner_id="u42"
+        )
+
+    def test_enqueue_serialization_keeps_owner_id_in_queue_json(self):
+        """入队侧本就正确：子类 model_dump 必须把 owner_id 写进队列 JSON。"""
+        task = {
+            "func": task_service.start,
+            "args": (),
+            "kwargs": {"task_id": "task-p1", "params": self._premise_params()},
+        }
+
+        self.manager.enqueue(task)
+
+        payload = json.loads(self.redis_client.rpush.call_args.args[1])
+        self.assertEqual(payload["kwargs"]["params"]["owner_id"], "u42")
+        self.assertEqual(payload["kwargs"]["params"]["video_source"], "premise")
+
+    def test_round_trip_dequeue_restores_owner_id_and_consumer_contract(self):
+        """真实往返（enqueue 序列化 → dequeue 重建）：owner_id 保真，且仍是
+        VideoParams 实例（全部既有消费者与 isinstance 检查不受影响）。"""
+        task = {
+            "func": task_service.start,
+            "args": (),
+            "kwargs": {"task_id": "task-p2", "params": self._premise_params()},
+        }
+        self.manager.enqueue(task)
+        queue_name, payload = self.redis_client.rpush.call_args.args
+        self.redis_client.lpop.return_value = payload
+
+        restored = self.manager.dequeue()
+        params = restored["kwargs"]["params"]
+
+        self.assertIsInstance(params, VideoParams)
+        self.assertEqual(params.owner_id, "u42")
+        self.assertEqual(params.video_source, "premise")
+        # 契约链：dequeue 还原的对象直接喂给素材层守卫必须放行并返回租户键。
+        self.assertEqual(task_service._require_owner_id(params), "u42")
+
+    def test_legacy_plain_video_params_entry_dequeues_with_owner_id_none(self):
+        """特性上线前入队的队列条目（纯 VideoParams dict，无 owner_id 键）：
+        重建照常成功，owner_id 取默认 None——重建模型不得更严格。"""
+        payload = {
+            "func": "start",
+            "args": [],
+            "kwargs": {
+                "task_id": "task-legacy",
+                "params": VideoParams(video_subject="Tea").model_dump(warnings=False),
+            },
+        }
+        self.assertNotIn("owner_id", payload["kwargs"]["params"])
+        self.redis_client.lpop.return_value = json.dumps(payload)
+
+        params = self.manager.dequeue()["kwargs"]["params"]
+
+        self.assertIsInstance(params, VideoParams)
+        self.assertIsNone(params.owner_id)
+        self.assertEqual(params.video_subject, "Tea")
+
+    def test_owner_id_required_guard_still_honest_after_rebuild(self):
+        """回归护栏：被剥掉 owner_id 的 premise 条目（模拟修复前丢键）重建后
+        仍必须在守卫处抛 owner_id_required——修复不得把守卫洗软。"""
+        payload = {
+            "func": "start",
+            "args": [],
+            "kwargs": {
+                "task_id": "task-stripped",
+                "params": {
+                    **VideoParams(video_subject="Coffee").model_dump(warnings=False),
+                    "video_source": "premise",
+                },
+            },
+        }
+        self.redis_client.lpop.return_value = json.dumps(payload)
+
+        params = self.manager.dequeue()["kwargs"]["params"]
+
+        with self.assertRaises(ValueError) as ctx:
+            task_service._require_owner_id(params)
+        self.assertIn("owner_id_required", str(ctx.exception))
+
 
 
 if __name__ == "__main__":
