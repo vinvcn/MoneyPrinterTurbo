@@ -20,3 +20,5 @@ socksio==1.0.0
 pydub==0.25.1
 audioop-lts==0.2.2; python_version >= "3.13"
 litellm==1.86.2
+# BYOM footage KB: scene-cut boundary detection (ADR-0023 decision 3)
+scenedetect[opencv-headless]==0.6.7
