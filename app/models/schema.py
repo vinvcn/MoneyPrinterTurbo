@@ -550,3 +550,25 @@ class UserMaterialCompleteResponse(BaseModel):
     rev: int
     footage_count: int
     total_bytes: int
+
+
+# --- scene_cut（BYOM footage KB，ADR-0023 决策 3） ---
+
+
+class SceneCutRequest(BaseModel):
+    """场景切分请求：调用方（VBL worker）置于共享交换卷 /shared 的视频绝对路径。"""
+
+    input_path: str = Field(description="video absolute path on the shared exchange volume")
+
+
+class SceneBoundary(BaseModel):
+    """一个场景的时间区间（秒，闭开区间）。"""
+
+    t_start_s: float = Field(description="scene start in seconds")
+    t_end_s: float = Field(description="scene end in seconds")
+
+
+class SceneCutResponse(BaseModel):
+    """场景切分响应：按时间排序的场景区间（只含秒边界，绝不含字节）。"""
+
+    scenes: list[SceneBoundary]
