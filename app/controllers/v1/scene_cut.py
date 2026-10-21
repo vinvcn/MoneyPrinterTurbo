@@ -2,8 +2,8 @@
 
 POST /api/v1/scene_cut {"input_path": "..."} -> {"scenes": [{"t_start_s","t_end_s"}]}
 
-鉴权：无 —— 与 user_materials / video_materials 同一内部信任模型（VBL worker
-是唯一调用方，经 docker 网络直达）。绝不经由 HTTP 返回文件字节（ADR-0023 决策 3）。
+鉴权：无 —— 与 video_materials 同一内部信任模型（VBL worker 是唯一调用方，
+经 docker 网络直达）。绝不经由 HTTP 返回文件字节（ADR-0023 决策 3）。
 """
 
 from __future__ import annotations

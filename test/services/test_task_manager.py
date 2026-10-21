@@ -593,5 +593,141 @@ class TestRedisQueueOwnerIdRoundTrip(unittest.TestCase):
 
 
 
+class TestRedisQueueKBWireRoundTrip(unittest.TestCase):
+    """BYOM wire regression guard (T7, ADR-0023 decision 9 / MUL-306 lesson).
+
+    The premise payload rides on TWO request fields — kb_scope + footage_map —
+    and dequeue rebuilds params from queue JSON. A field the rebuilt class does
+    not declare is dropped silently by pydantic (the MUL-306 owner_id class of
+    bug), which would leave every premise job with an empty pool and a video
+    filled by image-gen backfill instead of the user's own footage. These tests
+    pin both fields surviving enqueue -> dequeue, and pin that the wire shape
+    carries no third field.
+    """
+
+    def setUp(self):
+        self.redis_client = MagicMock()
+        patcher = patch(
+            "app.controllers.manager.redis_manager.redis.Redis.from_url",
+            return_value=self.redis_client,
+        )
+        self.addCleanup(patcher.stop)
+        patcher.start()
+        self.manager = RedisTaskManager(
+            max_concurrent_tasks=1,
+            redis_url="redis://localhost:6379/0",
+            max_queued_tasks=3,
+        )
+
+    @staticmethod
+    def _premise_params():
+        return TaskVideoRequest(
+            video_subject="Coffee",
+            video_source="premise",
+            owner_id="u42",
+            kb_scope={"owner_id": "u42", "collection_ids": ["c1", "c2"]},
+            footage_map={
+                "f1": {
+                    "duration_s": 4.5,
+                    "t_start_ms": 0,
+                    "t_end_ms": 4500,
+                    "clip_path": "/shared/cache/m1/f1/clip.mp4",
+                    "thumb_path": "/shared/cache/m1/f1/thumb.jpg",
+                },
+                "f2": {
+                    "duration_s": 6,
+                    "t_start_ms": 5000,
+                    "t_end_ms": 11000,
+                    "clip_path": "/shared/cache/m1/f2/clip.mp4",
+                    "thumb_path": "/shared/cache/m1/f2/thumb.jpg",
+                },
+            },
+        )
+
+    def test_enqueue_serializes_kb_scope_and_footage_map_into_queue_json(self):
+        """入队侧：子类 model_dump 必须把两个 wire 字段原样写进队列 JSON。"""
+        task = {
+            "func": task_service.start,
+            "args": (),
+            "kwargs": {"task_id": "task-kb1", "params": self._premise_params()},
+        }
+
+        self.manager.enqueue(task)
+
+        payload = json.loads(self.redis_client.rpush.call_args.args[1])
+        self.assertEqual(
+            payload["kwargs"]["params"]["kb_scope"],
+            {"owner_id": "u42", "collection_ids": ["c1", "c2"]},
+        )
+        self.assertEqual(
+            payload["kwargs"]["params"]["footage_map"]["f1"],
+            {
+                "duration_s": 4.5,
+                "t_start_ms": 0,
+                "t_end_ms": 4500,
+                "clip_path": "/shared/cache/m1/f1/clip.mp4",
+                "thumb_path": "/shared/cache/m1/f1/thumb.jpg",
+            },
+        )
+        self.assertNotIn(
+            "kb_collection_ids",
+            payload["kwargs"]["params"],
+            "kb_collection_ids 是 VBL 侧 JobParams 字段，绝不出现在 MPT wire 上",
+        )
+
+    def test_round_trip_dequeue_restores_kb_scope_and_footage_map(self):
+        """真实往返（enqueue 序列化 -> dequeue 重建）：两个 wire 字段全部保真。"""
+        task = {
+            "func": task_service.start,
+            "args": (),
+            "kwargs": {"task_id": "task-kb2", "params": self._premise_params()},
+        }
+        self.manager.enqueue(task)
+        queue_name, payload = self.redis_client.rpush.call_args.args
+        self.redis_client.lpop.return_value = payload
+
+        restored = self.manager.dequeue()
+        params = restored["kwargs"]["params"]
+
+        self.assertIsInstance(params, VideoParams)
+        self.assertIsNotNone(params.kb_scope)
+        self.assertEqual(params.kb_scope.owner_id, "u42")
+        self.assertEqual(params.kb_scope.collection_ids, ["c1", "c2"])
+        self.assertEqual(
+            sorted(params.footage_map), ["f1", "f2"], "footage_map 的键（footage id）不得丢失"
+        )
+        entry = params.footage_map["f2"]
+        self.assertEqual(entry.duration_s, 6.0)
+        self.assertEqual(entry.t_start_ms, 5000)
+        self.assertEqual(entry.t_end_ms, 11000)
+        self.assertEqual(entry.clip_path, "/shared/cache/m1/f2/clip.mp4")
+        self.assertEqual(entry.thumb_path, "/shared/cache/m1/f2/thumb.jpg")
+        # 契约链：往返后的参数直接喂 premise 池构建器，必须拿到完整载荷。
+        pool_cb = task_service._make_premise_pool(params)
+        self.assertTrue(callable(pool_cb))
+
+    def test_legacy_plain_video_params_entry_dequeues_without_kb_payload(self):
+        """特性上线前入队的队列条目（无 kb_scope/footage_map 键）：重建照常
+        成功，两个字段取默认 None——重建模型不得更严格。"""
+        payload = {
+            "func": "start",
+            "args": [],
+            "kwargs": {
+                "task_id": "task-legacy-kb",
+                "params": VideoParams(video_subject="Tea").model_dump(warnings=False),
+            },
+        }
+        self.assertNotIn("kb_scope", payload["kwargs"]["params"])
+        self.assertNotIn("footage_map", payload["kwargs"]["params"])
+        self.redis_client.lpop.return_value = json.dumps(payload)
+
+        params = self.manager.dequeue()["kwargs"]["params"]
+
+        self.assertIsInstance(params, VideoParams)
+        self.assertIsNone(params.kb_scope)
+        self.assertIsNone(params.footage_map)
+        self.assertEqual(params.video_subject, "Tea")
+
+
 if __name__ == "__main__":
     unittest.main()
