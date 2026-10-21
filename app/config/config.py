@@ -593,14 +593,18 @@ library = _SynchronizedConfig(
         },
     )
 )
-user_materials = _SynchronizedConfig(
+index = _SynchronizedConfig(
     _cfg.get(
-        "user_materials",
+        "index",
         {
-            # [user_materials] 段缺失时用保守默认：本地素材镜像 TTL 15 天、
-            # 粗排候选池上限 500（plan Metis #9/#15），与 Go 侧清扫参数一致。
-            "max_age_days": 15,
-            "max_candidates": 500,
+            # [index] 段缺失（或 base_url 留空）时视为未部署索引服务：BYOM
+            # premise 检索不可用，每段候选池为空并降级到 image-gen 回填
+            # （fail-open，绝不回退 stock）。部署时把它指向 VPC 索引服务——
+            # 与 [library] 同一个服务（如 http://vpc-retrieval:8787）。
+            "base_url": "",
+            "timeout": 30,
+            # 单段检索的帧命中上限 k（VPC MAX_K=200）。
+            "search_k": 50,
         },
     )
 )

@@ -103,8 +103,10 @@ class VideoParams(BaseModel):
 
     # 素材来源。segment-first 接受值：
     #   stock（= 供应商池，等价 pexels|pixabay|coverr 的现行多供应商搜索）、
-    #   premise（仅用户素材库，需 owner_id）、mixed（premise+stock，todo 8
-    #   两遍序）；legacy 值 pexels|pixabay|coverr|local 行为不变。
+    #   premise（仅用户素材 KB，需 owner_id + kb_scope + footage_map——v1 唯一
+    #   的 BYOM 模式）、mixed（混合模式 v1 不实现：VBL 不为 mixed 快照
+    #   footage_map，MPT 侧 mixed 只有 stock 兜底）；legacy 值
+    #   pexels|pixabay|coverr|local 行为不变。
     # 有意保持自由字符串（不做枚举）：未知值走现行 stock 路径，向后兼容。
     # 这里是**请求默认值**：请求显式给值时以请求为准；省略或传空值时回落到
     # config.toml 的 [app] video_source（见 configured_video_source）。
@@ -239,6 +241,37 @@ class VideoSocialMetadataParams:
     platform: Optional[str] = Field(default="tiktok", max_length=64)
 
 
+# --- BYOM footage KB（ADR-0023 决策 5/9）：TaskVideoRequest 的 premise 载荷 ---
+
+
+class KBScope(BaseModel):
+    """premise 生成的素材知识库范围（ADR-0023 决策 9）。
+
+    owner_id 是 namespace（VPC 索引的租户键），collection_ids 是 dispatch 时
+    选中的素材集——VBL 据此快照 footage_map。填空对象表示请求不携带范围。
+    """
+
+    owner_id: str = Field(default="", description="tenancy key = VPC namespace")
+    collection_ids: List[str] = Field(
+        default_factory=list, description="selected collection ids of this generation"
+    )
+
+
+class FootageMapEntry(BaseModel):
+    """dispatch 时快照的一个 READY footage（ADR-0023 决策 9）。
+
+    clip_path / thumb_path 是共享交换卷 /shared 上的 cache 路径（决策 2 的
+    路径寻址）：字节不走 HTTP，MPT 直接从挂载点读取。时长与场景区间随快照
+    一起下发，MPT 不再自持任何素材台账。
+    """
+
+    duration_s: float = Field(default=0.0, ge=0, description="clip duration in seconds")
+    t_start_ms: int = Field(default=0, ge=0, description="scene start in the source, ms")
+    t_end_ms: int = Field(default=0, ge=0, description="scene end in the source, ms")
+    clip_path: str = Field(default="", description="/shared cache clip path")
+    thumb_path: str = Field(default="", description="/shared cache thumb path")
+
+
 class BaseResponse(BaseModel):
     status: int = 200
     message: Optional[str] = "success"
@@ -256,8 +289,24 @@ class TaskVideoRequest(VideoParams, BaseModel):
     owner_id: Optional[str] = Field(
         default=None,
         description=(
-            "Tenancy key of the user-material (premise) registry. Required "
+            "Tenancy key of the premise footage knowledge base. Required "
             "when video_source is 'premise' or 'mixed'; ignored otherwise."
+        ),
+    )
+    # BYOM premise 载荷（ADR-0023 决策 9，T6 的线上形状）：kb_scope 是范围，
+    # footage_map 是 dispatch 时选中素材集 READY footage 的快照。两者随 redis
+    # 队列往返必须保真（MUL-306 子类字段静默丢失的教训），缺一即 premise 生成
+    # 退化为 image-gen 回填。线路上绝无第三个字段（kb_collection_ids 是 VBL
+    # 侧 JobParams 字段，不是 MPT 的 wire 字段）。
+    kb_scope: Optional[KBScope] = Field(
+        default=None,
+        description="Premise footage-KB scope: owner id plus selected collections.",
+    )
+    footage_map: Optional[dict[str, FootageMapEntry]] = Field(
+        default=None,
+        description=(
+            "Dispatch-time snapshot of the selected collections' READY footages, "
+            "keyed by footage id; paths are /shared exchange volume cache paths."
         ),
     )
 
@@ -511,45 +560,6 @@ class VideoMaterialUploadResponse(BaseResponse):
                 },
             },
         }
-
-
-class UserMaterialFootageTiming(BaseModel):
-    idx: int = Field(..., ge=0, description="0-based footage index")
-    t_start: float = Field(..., ge=0, description="footage start seconds in the source")
-    t_end: float = Field(..., ge=0, description="footage end seconds in the source")
-    duration: float = Field(..., ge=0, description="clip duration seconds")
-
-
-class UserMaterialCompleteRequest(BaseModel):
-    rev: int = Field(..., ge=0, description="push revision being finalized")
-    footages: List[UserMaterialFootageTiming] = Field(
-        ..., min_length=1, description="manifest; every idx must have clip+thumb staged"
-    )
-
-
-class UserMaterialEntry(BaseModel):
-    material_id: str
-    rev: int
-    footage_count: int
-    total_bytes: int
-
-
-class UserMaterialListResponse(BaseModel):
-    materials: List[UserMaterialEntry]
-
-
-class UserMaterialFilePushResponse(BaseModel):
-    idx: int
-    kind: str
-    rev: int
-    bytes_written: int
-
-
-class UserMaterialCompleteResponse(BaseModel):
-    material_id: str
-    rev: int
-    footage_count: int
-    total_bytes: int
 
 
 # --- scene_cut（BYOM footage KB，ADR-0023 决策 3） ---

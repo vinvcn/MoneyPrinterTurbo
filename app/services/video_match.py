@@ -26,8 +26,9 @@ from loguru import logger
 
 from app.config import config
 from app.models.schema import MaterialInfo
-from app.services import image_embedding, user_materials
+from app.services import image_embedding
 from app.services import image_gen
+from app.services import kb_footage
 from app.services import llm
 from app.services import material_rerank
 from app.services.segment_material import (
@@ -455,25 +456,18 @@ def _ensure_data_uri(candidate: dict) -> str:
 
 
 def _premise_candidate_from_item(item: MaterialInfo, term: str) -> dict:
-    """premise:// MaterialInfo → 粗排候选 dict（与 _candidate_from_item 同契约）。
+    """BYOM footage MaterialInfo → 粗排候选 dict（与 _candidate_from_item 同契约）。
 
-    唯一差异：data_uri 从本地素材目录的首帧 jpg 读出（Go 侧派生，Metis #10
-    绝不为 premise 字节走 HTTP）；缩略图缺失/素材未 ready 时按既有的空
-    data_uri 契约沉底。url 原样保留 = 向量缓存的键身份（todo 6 契约）。
+    唯一差异：data_uri 从 footage_map 快照的 /shared thumb 路径直读（业务层
+    派生，路径寻址——绝不为 BYOM 字节走 HTTP，ADR-0023 决策 2）；缩略图缺失
+    时按既有的空 data_uri 契约沉底。url 原样保留 = clip 路径，即向量缓存与
+    跨段已用集合的键身份。
     """
     source = item.source_info if isinstance(item.source_info, dict) else {}
-    data_uri = ""
-    resolved = user_materials.resolve_premise_url(str(item.url or ""))
-    if resolved is not None:
-        row = resolved[2]
-        try:
-            data_uri = user_materials.read_thumb_b64(row["owner"], row["material_id"], row["idx"])
-        except ValueError:
-            data_uri = ""
     return {
         "asset_id": str(source.get("asset_id") or ""),
         "url": str(item.url or ""),
-        "data_uri": data_uri,
+        "data_uri": kb_footage.thumb_data_uri(str(source.get("thumb_path") or "")),
         "term": term,
         "item": item,
     }
@@ -526,7 +520,7 @@ def match_segments(
     generate_image: Callable[..., tuple[str, dict]] | None = None,
     vector_cache: MutableMapping[str, list[float]] | None = None,
     source: str = "",
-    premise_pool: Callable[[], list[MaterialInfo]] | None = None,
+    premise_pool: Callable[[str], list[MaterialInfo]] | None = None,
 ) -> list[SegmentMaterials]:
     """
     三段漏斗素材匹配主编排：粗排（embedding 召回）→ 精排（VL 重排）→
@@ -572,20 +566,22 @@ def match_segments(
             回调缺失或单窗口失败时该窗口记入 holes（尾部计划窗口，装配层
             黑场占位），绝不阻塞流水线。
         vector_cache: 任务级 url->向量缓存（粗排与查重门共享）。显式传入
-            优先于 embedding_gate._shared_cache（main 侧 PersistentVectorCache
-            契约：调用方显式传参时不得被改写；task.py 接线两者本就是同一
-            对象）；未显式传入时取回 gate 注入的同一份。段级选材完成后若
-            缓存带 flush 则落库一次（持久缓存持久化，普通 dict 跳过）。
-        source: video_source 源路由（plan todo 7/8，单遍实现）："premise"
-            仅用户素材池——零 stock 调用、不打乱（shuffle 只消多供应商
-            拼接偏差，premise 池没有该偏差，池序即 registry 序）；"mixed"
-            池内候选前置入池，stock 搜索同遍继续兜底（两遍序 pass A/B 是
-            main 侧 todo 8 的后续，本线暂缓）。其余值（""/stock/legacy）
+            优先于 embedding_gate._shared_cache（调用方显式传参时不得被
+            改写；task.py 接线两者本就是同一对象）；未显式传入时取回 gate
+            注入的同一份。段级选材完成后若缓存带 flush 则落库一次（带持久化
+            的缓存持久化，普通 dict 跳过）。
+        source: video_source 源路由（ADR-0023 决策 5，单遍实现）："premise"
+            仅 BYOM 候选池——零 stock 调用、不打乱（shuffle 只消多供应商
+            拼接偏差，BYOM 池没有该偏差，池序即 VPC 相似度序）；"mixed"
+            池内候选前置入池，stock 搜索同遍继续兜底（v1 不实现：VBL 不为
+            mixed 快照 footage_map，池恒空）。其余值（""/stock/legacy）
             单遍 stock 行为不变。
-        premise_pool: 用户素材池读取回调（registry 派生 MaterialInfo），
-            仅 source ∈ {premise, mixed} 且注入时生效；每段读取一次，失败
-            fail-open（warn + 空池，绝不回退 stock）。premise:// 候选首帧
-            从本地素材目录直读（Metis #10，绝不走 HTTP）。
+        premise_pool: BYOM 候选池读取回调（kb_footage.build_pool 派生
+            MaterialInfo），签名 premise_pool(query_text) —— 每段查询包
+            生成后调用一次，参数为该段 coarse_query；仅 source ∈
+            {premise, mixed} 且注入时生效，失败 fail-open（warn + 空池，
+            绝不回退 stock）。BYOM 候选首帧从 /shared 快照 thumb 路径直读
+            （路径寻址，绝不走 HTTP）。
 
     Returns:
         与输入等长的 SegmentMaterials 列表（字段与旧实现一致）。
@@ -649,9 +645,8 @@ def match_segments(
 
     # 任务级 url->向量缓存：粗排与查重门共享同一份 dict。task.py 构造
     # gate 时注入 vector_cache，这里取回同一份（私有访问先例与
-    # material_rerank._walk_limit 相同）。显式传入优先（main 侧
-    # PersistentVectorCache 契约：调用方显式传参时不得被改写）；未显式传入
-    # 时回落 gate 的共享缓存，gate 缺席再退化为局部缓存。
+    # material_rerank._walk_limit 相同）。显式传入的缓存不得被 gate 的共享
+    # 缓存改写；未显式传入时回落 gate 的共享缓存，gate 缺席再退化为局部缓存。
     if vector_cache is None and embedding_gate is not None:
         shared = getattr(embedding_gate, "_shared_cache", None)
         if isinstance(shared, dict):
@@ -728,13 +723,14 @@ def match_segments(
             dedup_dropped = 0
             used_dropped = 0
 
-            # premise/mixed：用户素材池优先（任务级一次读取，见 main 侧
-            # todo 8 契约）。premise 单遍只用池内候选（零 stock 调用、不打乱）；
-            # mixed 把池内候选前置，stock 搜索继续兜底。池读取失败 fail-open。
+            # premise/mixed：BYOM 候选池优先（每段查询包生成后按 coarse_query
+            # 检索一次，见 match_segments premise_pool 契约）。premise 单遍只用
+            # 池内候选（零 stock 调用、不打乱）；mixed 把池内候选前置，stock
+            # 搜索继续兜底（v1 无 footage_map，池恒空）。池读取失败 fail-open。
             premise_pool_mode = str(source or "") in ("premise", "mixed")
             if premise_pool_mode and premise_pool is not None:
                 try:
-                    premise_items = list(premise_pool())
+                    premise_items = list(premise_pool(queries.coarse_query or ""))
                 except Exception as exc:
                     logger.warning(
                         "video match: premise pool read failed, fail-open: "
@@ -781,12 +777,9 @@ def match_segments(
                             dedup_dropped += 1
                             continue
                         pool_urls.add(url)
-                        if url.startswith("premise://"):
-                            # premise 候选首帧是本地文件（Metis #10），
-                            # 绝不为其走 HTTP 取图。
-                            pool.append(_premise_candidate_from_item(item, term))
-                        else:
-                            pool.append(_candidate_from_item(item, term))
+                        # BYOM footage 候选只经 premise_pool 入池（每段一次
+                        # VPC 检索），stock 搜索回调不会返回它们的 clip 路径。
+                        pool.append(_candidate_from_item(item, term))
                 active_terms = still_active
             logger.info(
                 "candidate pool assembled: "
@@ -796,7 +789,7 @@ def match_segments(
 
             # 多供应商合并后池序带固定拼接偏差（供应商声明序 × 词条序 × 页序），
             # 粗排前打乱消除拼接偏差；测试用 random.seed 固定。库优先模式与
-            # premise/mixed 不打乱——前者池序即库序，后者用户素材天然前置。
+            # premise/mixed 不打乱——前者池序即库序，后者池序即 VPC 相似度序。
             if not _library_first() and not premise_pool_mode:
                 random.shuffle(pool)
 
@@ -811,8 +804,8 @@ def match_segments(
                     pool, queries.coarse_query, vector_cache, embedding_gate
                 )
 
-            # 持久向量缓存（main 侧 user_material_vectors.PersistentVectorCache）：
-            # 段级选材完成即把新学到的向量落库；普通 dict 无 flush，跳过。
+            # 带持久化的向量缓存（如有 flush 钩子）：段级选材完成即把新学到
+            # 的向量落库；普通 dict 无 flush，跳过。
             _flush = getattr(vector_cache, "flush", None)
             if callable(_flush):
                 _flush()

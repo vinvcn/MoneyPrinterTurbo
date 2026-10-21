@@ -29,7 +29,7 @@ import requests
 from loguru import logger
 
 from app.config import config
-from app.services import image_embedding, user_materials
+from app.services import image_embedding, kb_footage
 from app.utils import utils
 
 # allow: SIZE_OK — 判定回调/图像获取/VLM 客户端同域内聚，拆分归 F4 评审。
@@ -386,22 +386,17 @@ def extract_first_frame_jpeg(video_path: str) -> bytes:
             pass
 
 
-def premise_local_first_frame_data_uri(url: str) -> str:
-    """premise:// 候选首帧：Go 侧派生的本地 jpeg 直读（Metis #10，绝不 HTTP）。
+def footage_thumb_data_uri(item: Any) -> str:
+    """BYOM footage 候选缩略图：footage_map 快照的 /shared thumb 路径直读。
 
-    非 premise 协议 / 素材未 ready / 文件缺失 -> ''（调用方走既有降级链）。
+    路径寻址（ADR-0023 决策 2）：字节在共享交换卷上，绝不为此走 HTTP。非
+    BYOM 候选（source_info 无 thumb_path）/ 文件缺失 -> ''（调用方走既有降级
+    链，下载临时文件提首帧）。
     """
-    if not str(url or "").startswith("premise://"):
+    source = getattr(item, "source_info", None)
+    if not isinstance(source, dict):
         return ""
-    resolved = user_materials.resolve_premise_url(str(url))
-    if resolved is None:
-        return ""
-    try:
-        with open(resolved[1], "rb") as f:
-            payload = f.read()
-    except OSError:
-        return ""
-    return to_data_uri(payload)
+    return kb_footage.thumb_data_uri(str(source.get("thumb_path") or ""))
 
 
 def make_default_judge(embedding_gate: Any = None):
@@ -459,14 +454,12 @@ def make_default_judge(embedding_gate: Any = None):
                     f"asset_id={asset_id}, error={type(exc).__name__}"
                 )
 
-        # 路径 1.5：premise:// 候选的首帧本就是本地文件（todo-2 registry），
-        # 直接读入，跳过下面任何网络下载（Metis #10）。
+        # 路径 1.5：BYOM footage 候选的缩略图本就是 /shared 上的本地文件
+        # （dispatch 快照），直接读入，跳过下面任何网络下载（路径寻址）。
         if not image_data_uri:
-            image_data_uri = premise_local_first_frame_data_uri(
-                str(getattr(item, "url", "") or "")
-            )
+            image_data_uri = footage_thumb_data_uri(item)
             if image_data_uri:
-                image_source = "premise_local"
+                image_source = "footage_thumb"
 
         # 路径 2：mp4 首帧。过滤发生在下载前，这里只对缩略图缺失/不达标的
         # 候选临时下载，拒收后立即删除临时文件。

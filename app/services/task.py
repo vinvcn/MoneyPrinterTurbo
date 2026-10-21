@@ -8,6 +8,7 @@ import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from functools import partial
 from os import path
+from pathlib import Path
 from uuid import uuid4
 
 from loguru import logger
@@ -29,11 +30,10 @@ from app.services import (
 )
 from app.services import upload_post
 from app.services import state as sm
-from app.services import user_materials
-from app.services import user_material_vectors
 from app.services import (
     image_embedding,
     image_gen,
+    kb_footage,
     segment_audio,
     segment_material,
     segment_subtitle,
@@ -1114,10 +1114,11 @@ def _schedule_cross_post(
 
 
 # ---------------------------------------------------------------------------
-# video_source 源路由（plan todo 7）：stock 等价现行多供应商搜索；premise 仅
-# 用户素材池（关键词被忽略，检索=全量返回，Metis #4：匹配交给粗排嵌入）；
-# mixed 的 premise+stock 两遍序属 todo 8，在此之前等同 stock（仅 owner_id
-# 校验不同）。legacy 值 pexels|pixabay|coverr|local 行为逐字节不变。
+# video_source 源路由（ADR-0023 决策 1/5）：stock 等价现行多供应商搜索；
+# premise 仅用户素材 KB——每段查询词经 VPC 索引检索（kb_footage.build_pool），
+# 命中 footage 的字节在 /shared 交换卷上（决策 2）；mixed 的 premise+stock
+# 两遍序 v1 不实现（VBL 不为 mixed 快照 footage_map），等同 stock 兜底。
+# legacy 值 pexels|pixabay|coverr|local 行为逐字节不变。
 # ---------------------------------------------------------------------------
 
 _OWNER_ID_REQUIRED = "owner_id_required"
@@ -1132,48 +1133,42 @@ def _require_owner_id(params) -> str:
     return owner_id
 
 
-def premise_pool_materials(owner_id: str) -> list[MaterialInfo]:
-    """ready 素材池 -> 漏斗候选 MaterialInfo 列表；cap 读 [user_materials].max_candidates。
+def _premise_kb_scope(params):
+    """请求的 premise 范围；仅当 owner 与 kb_scope.owner_id 一致时返回它。
 
-    stock 的每供应商 20-cap 与缓存层完全不参与（plan scope）；文件缺失不在
-    此判定——builder 的 data_uri 与 save 的拷贝各自降级。
+    不一致 = 载荷的范围不属于本任务的租户（或请求被拼错）：返回 None，候选
+    池为空——绝不拿别人的 namespace 去检索（owner scope 的第一道闸）。
     """
-    section = getattr(config, "user_materials", None) or {}
-    try:
-        cap = max(1, int(section.get("max_candidates", 500)))
-    except (TypeError, ValueError):
-        cap = 500
-    items: list[MaterialInfo] = []
-    for row in user_materials.pool(owner_id, cap=cap):
-        asset = f"{row['material_id']}/{row['idx']}"
-        items.append(
-            MaterialInfo(
-                provider="user_material",
-                url=row["url"],
-                duration=int(round(row["t_end"] - row["t_start"])),
-                source_info={
-                    "provider": "user_material",
-                    "asset_id": asset,
-                    "search_term": "",
-                    "thumbnail_url": "",
-                    "rendition": {
-                        "id": asset,
-                        "material_id": row["material_id"],
-                        "idx": row["idx"],
-                        "rev": row["rev"],
-                        "t_start": row["t_start"],
-                        "t_end": row["t_end"],
-                    },
-                },
-            )
+    kb_scope = getattr(params, "kb_scope", None)
+    if kb_scope is None:
+        return None
+    owner_id = str(getattr(params, "owner_id", "") or "").strip()
+    scope_owner = str(getattr(kb_scope, "owner_id", "") or "").strip()
+    if not scope_owner or scope_owner != owner_id:
+        logger.warning(
+            "premise kb scope rejected: owner_id and kb_scope.owner_id "
+            f"disagree ({owner_id!r} vs {scope_owner!r}), no footage searched"
         )
-    return items
+        return None
+    return kb_scope
+
+
+def _footage_clip_paths(params) -> set[str]:
+    """footage_map 快照的 /shared clip 路径集合：save_video 判定“本地字节”的凭据。"""
+    footage_map = getattr(params, "footage_map", None) or {}
+    paths: set[str] = set()
+    for entry in footage_map.values():
+        clip_path = str(getattr(entry, "clip_path", "") or "")
+        if clip_path:
+            paths.add(clip_path)
+    return paths
 
 
 def _make_search_videos(params):
-    """构建 match_segments 的搜索回调（premise 直读本地 registry，其余走多供应商）。"""
+    """构建 match_segments 的搜索回调（premise 走 kb 候选池，其余走多供应商）。"""
     source = str(getattr(params, "video_source", "") or "")
-    owner_id = _require_owner_id(params)
+    # premise/mixed 的 owner_id 守卫：缺失时构建期即失败（不等到素材阶段）。
+    _require_owner_id(params)
 
     def search_videos(
         search_term: str,
@@ -1182,10 +1177,10 @@ def _make_search_videos(params):
         page: int = 1,
     ) -> list[MaterialInfo]:
         if source == "premise":
-            # registry 一次给全（"return all"）；翻页语义返回空。
-            if max(1, int(page or 1)) > 1:
-                return []
-            return premise_pool_materials(owner_id)
+            # BYOM 候选池由 premise_pool（每段一次 VPC 检索）供给，stock
+            # 搜索回调在 premise 单遍下不会被调用；这里显式返回空，任何
+            # 误入都只会得到空结果而不是一次错误的供应商请求。
+            return []
         if source == "library":
             # 库优先选材：本地素材库是唯一来源；整句/词条/页码原样透传，
             # 命中与翻页由服务端 RRF + exclude_urls 承接。
@@ -1226,35 +1221,44 @@ def _preflight_search_provider(params) -> None:
 
 
 def _make_premise_pool(params):
-    """premise/mixed 的用户素材池回调；非 premise/mixed 返回 None。
+    """premise/mixed 的 BYOM 候选池回调；非 premise/mixed 返回 None。
 
-    单遍实现（todo 8）：source="premise" 时 match_segments 只用池内候选
-    （零 stock 调用、不打乱）；"mixed" 时池内候选前置，stock 搜索回调
-    （_make_search_videos）同遍继续兜底。每段读取一次，池失败 fail-open。
+    source="premise" 时 match_segments 只用池内候选（零 stock 调用、不打乱）；
+    "mixed" 时池内候选前置，stock 搜索回调（_make_search_videos）同遍继续兜底
+    ——但 v1 的 mixed 不实现（VBL 不为 mixed 快照 footage_map），因此 mixed 的
+    池恒为空、实际只有 stock 兜底。每段查询包生成后回调一次，参数为该段的
+    coarse_query；池失败 fail-open（kb_footage.build_pool 内部已保证不抛）。
     """
     source = str(getattr(params, "video_source", "") or "")
     if source not in _PREMISE_SOURCES:
         return None
-    owner_id = _require_owner_id(params)
+    _require_owner_id(params)
+    kb_scope = _premise_kb_scope(params)
+    footage_map = dict(getattr(params, "footage_map", None) or {})
 
-    def premise_pool() -> list[MaterialInfo]:
-        return premise_pool_materials(owner_id)
+    def premise_pool(query_text: str = "") -> list[MaterialInfo]:
+        if kb_scope is None:
+            return []
+        return kb_footage.build_pool(kb_scope, footage_map, query_text)
 
     return premise_pool
 
 
 def _make_save_video(params, task_material_dir: str):
-    """构建 save_video 回调：premise:// 从本地素材目录拷贝，其余走 material.save_video。"""
+    """构建 save_video 回调：footage_map 的 /shared clip 本地拷贝，其余走 material.save_video。"""
+
+    clip_paths = _footage_clip_paths(params)
 
     def save_video(video_url: str, save_dir: str = "") -> str:
         url = str(video_url or "")
-        if url.startswith("premise://"):
-            resolved = user_materials.resolve_premise_url(url)
-            if resolved is None:
-                raise FileNotFoundError(f"premise material unavailable: {url}")
-            identity = url[len("premise://") :].replace("/", "-")
-            target = os.path.join(task_material_dir, f"premise-{identity}.mp4")
-            shutil.copyfile(resolved[0], target)
+        if url in clip_paths:
+            # BYOM footage：字节在共享交换卷上（决策 2），拷进任务素材目录即
+            # 可；文件缺失（cache 丢失）抛 FileNotFoundError —— 响亮失败并留
+            # 下手动 re-index 的原因，绝不静默改走 stock 下载。
+            target = os.path.join(
+                task_material_dir, f"footage-{Path(url).parent.name}.mp4"
+            )
+            shutil.copyfile(url, target)
             return target
         return material.save_video(video_url=url, save_dir=task_material_dir)
 
@@ -1395,10 +1399,10 @@ def _run_segment_first_pipeline(
     # 注册表，跨段重复画面在 VLM 之前被拒收。
     embedding_gate = None
     duplicate_gate_on = image_embedding.is_duplicate_gate_enabled()
-    # 持久向量缓存提到查重门之上、无条件构造（gate-off 时粗排的 premise://
-    # 向量同样经 match_segments 段末 flush 落库跨任务复用）；gate-on 时注入
-    # 同一实例，粗排预热与门走查共享（同一 URL 全链路只嵌入一次）。
-    vector_cache = user_material_vectors.PersistentVectorCache()
+    # 任务级 url->向量缓存：粗排预热与查重门走查共享同一份（同一 URL 全链路
+    # 只嵌入一次）。原宿主侧 PersistentVectorCache 随 user_material_vectors
+    # 一起删除（ADR-0023 决策 1）：向量检索已归 VPC，MPT 不再自持向量存储。
+    vector_cache: dict = {}
     if duplicate_gate_on:
         embedding_gate = image_embedding.make_default_gate(vector_cache=vector_cache)
         logger.info(
@@ -1414,13 +1418,13 @@ def _run_segment_first_pipeline(
 
     task_material_dir = utils.task_dir(task_id)
 
-    # 页感知搜索/保存回调工厂：stock 透传多供应商，premise 直读本地 registry
+    # 页感知搜索/保存回调工厂：stock 透传多供应商，premise 走 BYOM 候选池
     # （见 _make_search_videos / _make_save_video；(词条, 页) 级备忘由
     # match_segments 自持）。
     search_videos = _make_search_videos(params)
     save_video = _make_save_video(params, task_material_dir)
-    # premise/mixed 的用户素材池回调（todo 8 单遍实现）：premise 只用
-    # 池内候选（零 stock 调用），mixed 池前置 + stock 同遍兜底。
+    # premise/mixed 的 BYOM 候选池回调（每段一次 VPC 检索）：premise 只用
+    # 池内候选（零 stock 调用），mixed v1 无快照故只有 stock 同遍兜底。
     premise_pool = _make_premise_pool(params)
 
     def generate_image(
@@ -1441,8 +1445,7 @@ def _run_segment_first_pipeline(
 
     # VLM-on 才会搜索素材：零 key 在搜索开始前快速失败并给出可操作提示；
     # VLM-off 时整段走 image-gen 回填，不触在线供应商，预检跳过。
-    # premise/mixed 同样跳过（用户素材路径不依赖在线供应商，Metis #5 的
-    # 零 key mixed 降级由 todo 8 两遍序承接）。
+    # premise/mixed 同样跳过（BYOM 检索走 VPC 索引服务，不依赖在线供应商）。
     _preflight_search_provider(params)
 
     materials = video_match.match_segments(
