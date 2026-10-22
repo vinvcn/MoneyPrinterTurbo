@@ -15,6 +15,7 @@ from app.models import const
 from app.models.exception import HttpException
 from app.models.schema import TaskListResponse, TaskQueryResponse
 from app.services import state as sm
+from app.services import task_artifacts
 from app.utils import utils
 
 
@@ -251,6 +252,62 @@ class TestVideoControllerTasks(unittest.TestCase):
             )
 
         self.assertEqual(response["data"], failed_task)
+
+    def test_task_query_exposes_persisted_segment_materials(self):
+        """BYOM 溯源：任务清单里的 segment_materials 必须透出给业务层。"""
+        task_id = "controller-segment-materials"
+        task_dir = utils.task_dir(task_id)
+        records = [
+            {
+                "index": 0,
+                "search_term": "rainy street",
+                "fallback_level": "",
+                "clip_sources": [
+                    {"url": "/shared/cache/m/f/clip.mp4", "local_file": "clip.mp4"}
+                ],
+            }
+        ]
+        task = {
+            "task_id": task_id,
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+        }
+        task_artifacts.write_script_data(task_id, {"script": "s"})
+        task_artifacts.patch_script_data(task_id, segment_materials=records)
+
+        try:
+            with patch.object(
+                video_controller.sm.state, "get_task", return_value=task
+            ):
+                response = video_controller.get_task(
+                    self._request(), task_id=task_id, query=MagicMock()
+                )
+
+            self.assertEqual(response["data"]["segment_materials"], records)
+        finally:
+            shutil.rmtree(task_dir, ignore_errors=True)
+
+    def test_task_query_omits_segment_materials_without_manifest(self):
+        """没有溯源清单（早期任务 / 未到素材阶段）时不附该字段。"""
+        task = {
+            "task_id": "controller-no-manifest",
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+        }
+
+        with patch.object(
+            video_controller.sm.state, "get_task", return_value=task
+        ), patch.object(
+            task_artifacts,
+            "read_segment_materials",
+            return_value=[],
+        ) as read_records:
+            response = video_controller.get_task(
+                self._request(), task_id="controller-no-manifest", query=MagicMock()
+            )
+
+        self.assertNotIn("segment_materials", response["data"])
+        read_records.assert_called_once_with("controller-no-manifest")
 
     def test_task_query_schema_documents_success_and_failure_states(self):
         """OpenAPI 模型示例必须覆盖发布成功和生成失败两种状态。"""

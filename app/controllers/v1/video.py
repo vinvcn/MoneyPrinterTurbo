@@ -43,6 +43,7 @@ from app.models.schema import (
 from app.services import bgm as bgm_service
 from app.services import state as sm
 from app.services import task as tm
+from app.services import task_artifacts
 from app.services import video as video_service
 from app.utils import file_security, utils
 
@@ -476,6 +477,14 @@ def get_task(
                 _task_file_to_uri(v, endpoint, task_dir, request_id)
                 for v in task["combined_videos"]
             ]
+        # BYOM 溯源（issue #370）：素材匹配结束后 persist_segment_material_sources
+        # 把每段 clip_sources / fallback_level 写进任务清单，这里在任务查询时
+        # 原样透出，业务层据此解析"这次生成用了我的哪些 KB 片段"。清单缺失
+        # （任务未到素材阶段或历史任务）时读函数返回空列表，不附字段——响应
+        # 形状对存量客户端保持不变。
+        segment_materials = task_artifacts.read_segment_materials(task_id)
+        if segment_materials:
+            response_task["segment_materials"] = segment_materials
         return utils.get_response(200, response_task)
 
     raise HttpException(
