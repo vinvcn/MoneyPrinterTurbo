@@ -61,6 +61,40 @@ def write_script_data(task_id: str, payload: Mapping[str, Any]) -> None:
     _write_json_atomic(_script_file(task_id), payload)
 
 
+def read_segment_materials(task_id: str) -> list[dict[str, Any]]:
+    """
+    读取任务清单里的 ``segment_materials`` 溯源记录，缺失时返回空列表。
+
+    BYOM（issue #370）溯源需要它：``persist_segment_material_sources`` 在素材
+    匹配结束后把每段的 ``clip_sources``/``fallback_level`` 补写进任务清单，
+    任务查询接口再原样透出，业务层据此解析"这次生成用了我的哪些 KB 片段"
+    （KB 候选的 ``url`` 即 /shared 交换卷上的 cache clip 路径）。
+
+    清单不存在（任务还没到素材匹配阶段，或早于该字段的历史任务）、字段缺失
+    或类型不符、文件损坏——一律返回 ``[]``：溯源是辅助信息，读取失败绝不能
+    让任务查询本身失败。首次落盘仍走 ``write_script_data``。
+    """
+    try:
+        target = _script_file(task_id)
+        with target.open("r", encoding="utf-8") as script_file:
+            payload = json.load(script_file)
+    except FileNotFoundError:
+        # 尚未写入清单是正常场景（任务早期阶段、未落盘任务）。
+        return []
+    except Exception as exc:
+        logger.warning(
+            "failed to read task script data for segment materials: "
+            f"task_id={task_id}, error={type(exc).__name__}, detail={exc}"
+        )
+        return []
+    if not isinstance(payload, dict):
+        return []
+    records = payload.get("segment_materials")
+    if not isinstance(records, list):
+        return []
+    return records
+
+
 def patch_script_data(task_id: str, **updates: Any) -> bool:
     """
     在保留原有字段的前提下补充任务清单，失败时返回 ``False``。

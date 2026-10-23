@@ -96,6 +96,57 @@ class TestTaskArtifacts(unittest.TestCase):
         self.assertEqual(target.read_text(encoding="utf-8"), "{invalid-json")
         self.assertTrue(warning.called)
 
+    def test_read_segment_materials_returns_persisted_records(self):
+        """persist_segment_material_sources 补写的每段溯源必须原样读回。"""
+        task_artifacts.write_script_data("task-seg", {"script": "s"})
+        task_artifacts.patch_script_data(
+            "task-seg",
+            segment_materials=[
+                {
+                    "index": 0,
+                    "clip_sources": [
+                        {"url": "/shared/cache/m/f/clip.mp4", "local_file": "clip.mp4"}
+                    ],
+                    "fallback_level": "",
+                }
+            ],
+        )
+
+        records = task_artifacts.read_segment_materials("task-seg")
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["index"], 0)
+        self.assertEqual(
+            records[0]["clip_sources"][0]["url"],
+            "/shared/cache/m/f/clip.mp4",
+        )
+
+    def test_read_segment_materials_missing_manifest_is_empty(self):
+        """任务还没落清单时读取是空列表，不是异常。"""
+        self.assertEqual(task_artifacts.read_segment_materials("never-written"), [])
+
+    def test_read_segment_materials_absent_field_is_empty(self):
+        """早于溯源字段的历史清单没有该键，同样返回空列表。"""
+        task_artifacts.write_script_data("task-old", {"script": "legacy"})
+
+        self.assertEqual(task_artifacts.read_segment_materials("task-old"), [])
+
+    def test_read_segment_materials_invalid_payload_degrades(self):
+        """清单损坏或字段类型不符时降级为空列表，绝不让任务查询失败。"""
+        task_artifacts.write_script_data("task-bad", {"script": "s"})
+        task_artifacts.patch_script_data(
+            "task-bad", segment_materials="not-a-list"
+        )
+        broken = self.task_dir / "script.json"
+        self.assertEqual(task_artifacts.read_segment_materials("task-bad"), [])
+
+        broken.write_text("{invalid-json", encoding="utf-8")
+        with patch.object(task_artifacts.logger, "warning") as warning:
+            self.assertEqual(task_artifacts.read_segment_materials("task-bad"), [])
+        # 读取失败只告警不抛；原文件不被改写。
+        self.assertEqual(broken.read_text(encoding="utf-8"), "{invalid-json")
+        self.assertTrue(warning.called)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -364,6 +364,12 @@ class TaskStatusData(BaseModel):
     ] = None
     cross_post_results: Optional[List[dict[str, Any]]] = None
     cross_post_error: Optional[str] = None
+    # BYOM 溯源（issue #370）：每段素材的来源记录（segment_material
+    # 的 clip_sources / fallback_level / search_attempts），取自任务清单
+    # 的 segment_materials 字段。None = 该任务没有这份记录（未到素材匹配
+    # 阶段或历史任务）；KB 候选的 clip_sources[].url 即 /shared 交换卷上的
+    # cache clip 路径，业务层据此解析 footage id。
+    segment_materials: Optional[List[dict[str, Any]]] = None
 
 
 class TaskListData(BaseModel):
